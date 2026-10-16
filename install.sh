@@ -12,7 +12,7 @@ if [ -z "${BASH_VERSION:-}" ]; then
             if [ "$bootstrap_skip_value" = 1 ]; then bootstrap_skip_value=0; continue; fi
             case "$bootstrap_arg" in
                 doctor|status|logs) echo '[错误] 只读查看需要 Bash 4 或更高版本，请先自行安装 Bash。' >&2; exit 3 ;;
-                --protocol|--tag|--port|--uuid|--password|--password-file|--tunnel-token-file|--cf-token-file|--cert|--method|--sni|--domain|--version|--validation|--address|--edge|--strategy|--firewall|--lines|--source) bootstrap_skip_value=1 ;;
+                --protocol|--tag|--port|--uuid|--password|--password-file|--tunnel-token-file|--cf-token-file|--cert|--method|--sni|--sni-region|--sni-category|--sni-hosts|--sni-jobs|--sni-samples|--sni-timeout|--domain|--version|--validation|--address|--edge|--strategy|--firewall|--lines|--source) bootstrap_skip_value=1 ;;
                 -*) ;;
                 *) break ;;
             esac
@@ -60,6 +60,7 @@ declare -a SB_OWNED_TEMP_FILES=()
 declare -a SB_OWNED_TEMP_DIRS=()
 
 SB_PROGRESS_PID=""
+SB_SNI_PID=""
 stop_progress() {
     if [ -n "${SB_PROGRESS_PID:-}" ]; then
         kill "$SB_PROGRESS_PID" 2>/dev/null || :
@@ -104,6 +105,7 @@ run_step() {
 
 cleanup_on_exit() {
     stop_progress
+    stop_sni_selection
     if [ -n "${CONFIG_TX_DIR:-}" ] && [ "${CONFIG_TX_RECOVERING:-0}" != 1 ]; then
         CONFIG_TX_RECOVERING=1
         restore_config_and_service || printf '事务恢复失败，备份保留: %s\n' "$CONFIG_TX_DIR" >&2
@@ -1279,96 +1281,435 @@ get_domain() {
     printf '%s\n' "$val"
 }
 
+reality_sni_catalog() {
+    # Candidate metadata adapted from chnnic/Reality-SNI-Check (MIT):
+    # https://github.com/chnnic/Reality-SNI-Check
+    # Upstream snapshot df1369dc080470d2; all 98 candidates except 4 Apple hosts.
+    # Columns: category, affiliation region (not IP geolocation), hostname.
+    # Korea additionally tags Samsung and LG; all other tags follow upstream.
+    cat <<'EOF'
+cdn global www.cloudflare.com
+cdn global www.amazon.com
+cdn global addons.mozilla.org
+cdn global www.python.org
+cdn global www.fastly.com
+cloud global aws.amazon.com
+cloud global azure.microsoft.com
+cloud global www.digitalocean.com
+cloud global gitlab.com
+cloud global registry.npmjs.org
+cloud global www.jsdelivr.com
+cloud global www.vercel.com
+cloud global www.netlify.com
+cloud global www.oracle.com
+cloud global www.ibm.com
+tech global www.amd.com
+tech global www.intel.com
+tech global www.nvidia.com
+tech global www.qualcomm.com
+tech global www.arm.com
+tech global www.tesla.com
+tech kr www.samsung.com
+tech global www.sony.com
+tech kr www.lg.com
+tech global www.dell.com
+tech global www.hp.com
+tech global www.lenovo.com
+tech global www.cisco.com
+tech global www.adobe.com
+fin global www.paypal.com
+fin global www.visa.com
+fin global www.mastercard.com
+fin global www.americanexpress.com
+fin global www.stripe.com
+fin global www.jpmorgan.com
+fin global www.goldmansachs.com
+fin global www.hsbc.com
+fin global www.citi.com
+fin global www.blackrock.com
+edu us www.mit.edu
+edu us www.stanford.edu
+edu us www.harvard.edu
+edu us www.berkeley.edu
+edu us www.cornell.edu
+edu us www.princeton.edu
+edu us www.yale.edu
+edu us www.columbia.edu
+edu eu www.ox.ac.uk
+edu eu www.cam.ac.uk
+edu eu www.imperial.ac.uk
+edu eu www.ethz.ch
+edu eu www.epfl.ch
+edu jp www.u-tokyo.ac.jp
+edu jp www.kyoto-u.ac.jp
+edu sg www.nus.edu.sg
+edu sg www.ntu.edu.sg
+edu hk www.hku.hk
+edu hk www.hkust.edu.hk
+edu cn www.tsinghua.edu.cn
+edu cn www.pku.edu.cn
+edu au www.unimelb.edu.au
+edu us www.utoronto.ca
+media global www.imdb.com
+social global www.wordpress.com
+social global www.snapchat.com
+gaming global www.epicgames.com
+gaming global www.riotgames.com
+gaming global www.ea.com
+gaming global www.ubisoft.com
+gaming global www.playstation.com
+gaming global www.nintendo.com
+gaming global www.xbox.com
+gaming global www.blizzard.com
+ecom global www.ebay.com
+ecom global www.walmart.com
+ecom global www.target.com
+ecom global www.bestbuy.com
+ecom global www.shopify.com
+ecom cn www.alibaba.com
+ecom eu www.ikea.com
+ecom global www.nike.com
+ecom eu www.adidas.com
+ecom eu www.zara.com
+region jp www.lovelive-anime.jp
+region jp www.yahoo.co.jp
+region jp www.ana.co.jp
+region eu www.mercedes-benz.com
+region eu www.bmw.com
+region eu www.audi.com
+region eu www.lufthansa.com
+region sg www.singaporeair.com
+region hk www.cathaypacific.com
+region au www.qantas.com
+region global www.salesforce.com
+EOF
+}
+
+reality_sni_categories() {
+    cat <<'EOF'
+cdn 全球CDN/anycast
+cloud 云/开发基础设施
+tech 科技/半导体大厂
+fin 金融/支付/银行
+edu 大学/教育机构
+media 流媒体/内容
+social 社交平台
+gaming 游戏平台
+ecom 电商/零售/品牌
+region 区域锚点
+EOF
+}
+
+reality_sni_regions() {
+    cat <<'EOF'
+global 全球通用/CDN
+us 美国/北美
+eu 欧洲
+jp 日本
+hk 香港
+sg 东南亚/新加坡
+cn 中国大陆
+au 澳洲
+kr 韩国
+EOF
+}
+
+valid_reality_sni_region() {
+    case "$1" in all|global|us|eu|jp|hk|sg|cn|au|kr) return 0 ;; *) return 1 ;; esac
+}
+
+valid_reality_sni_categories() {
+    local key input="${1//,/ }"
+    local -a keys=()
+    input="${input//$'\n'/ }"
+    read -r -a keys <<< "$input"
+    [ "${#keys[@]}" -gt 0 ] || return 1
+    for key in "${keys[@]}"; do
+        case "$key" in all|cdn|cloud|tech|fin|edu|media|social|gaming|ecom|region) ;; *) return 1 ;; esac
+    done
+}
+
+reality_sni_allowed_host() {
+    valid_host "$1" || return 1
+    case "${1,,}" in
+        apple.com|*.apple.com|icloud.com|*.icloud.com|mzstatic.com|*.mzstatic.com) return 1 ;;
+    esac
+}
+
+normalize_reality_sni_hosts() {
+    local input="${1//,/ }" host
+    local -a entries=()
+    local -A normalized_sni_seen=()
+    input="${input//$'\n'/ }"
+    read -r -a entries <<< "$input"
+    [ "${#entries[@]}" -gt 0 ] && [ "${#entries[@]}" -le 256 ] || {
+        printf '[错误] 自定义列表需要 1–256 个域名。\n' >&2; return 1;
+    }
+    for host in "${entries[@]}"; do
+        host="${host,,}"
+        host="${host#https://}"; host="${host#http://}"
+        host="${host%%[/?#]*}"; host="${host%:443}"; host="${host%.}"
+        reality_sni_allowed_host "$host" || {
+            printf '[错误] SNI 格式无效或属于已排除的 Apple 域名：%s\n' "$host" >&2; return 1;
+        }
+        if [ -z "${normalized_sni_seen[$host]:-}" ]; then printf '%s\n' "$host"; normalized_sni_seen[$host]=1; fi
+    done
+}
+
+reality_sni_candidates() {
+    local area="${1:-all}" categories="${2:-all}" custom="${3:-}"
+    valid_reality_sni_region "$area" && valid_reality_sni_categories "$categories" || return 1
+    if [ -n "$custom" ]; then normalize_reality_sni_hosts "$custom"; return $?; fi
+    reality_sni_catalog | awk -v area="$area" -v cats="${categories//,/ }" '
+      BEGIN {n=split(cats, keys, /[[:space:]]+/); for(i=1;i<=n;i++) selected[keys[i]]=1}
+      (area=="all" || $2=="global" || $2==area) && (selected["all"] || selected[$1]) && !seen[$3]++ {print $3}'
+}
+
+manual_reality_sni() {
+    local manual_host
+    if [ "$NON_INTERACTIVE" = 1 ]; then
+        reality_sni_allowed_host "${CLI_SNI:-}" || return 1
+        printf '%s\n' "$CLI_SNI"; return 0
+    fi
+    while true; do
+        # Read in the selector itself so TERM can interrupt an idle prompt.
+        ask '请输入伪装域名 [默认: www.cloudflare.com]: ' manual_host
+        manual_host="${manual_host:-www.cloudflare.com}"
+        if reality_sni_allowed_host "$manual_host"; then printf '%s\n' "$manual_host"; return 0; fi
+        printf '[错误] 域名格式无效或属于已排除的 Apple 域名，请重新输入。\n' >&2
+    done
+}
+
+prompt_sni_integer() {
+    local prompt="$1" default="$2" maximum="$3" destination="$4" number
+    while true; do
+        ask "$prompt [默认: $default]: " number
+        number="${number:-$default}"
+        if [[ "$number" =~ ^[1-9][0-9]?$ ]] && [ "$number" -le "$maximum" ]; then
+            printf -v "$destination" '%s' "$number"; return 0
+        fi
+        printf '[提示] 请输入 1–%s 的整数。\n' "$maximum" >&2
+    done
+}
+
+configure_reality_sni_scan() {
+    # These sni_* variables belong to run_reality_sni_selection (Bash dynamic scope).
+    local mode selection key label count item categories candidate_text
+    local -a keys=() entries=()
+    while true; do
+        printf '\nSNI 检测范围：\n 1) 快速检测（CDN、云、科技）\n 2) 全部候选（默认）\n 3) 按分类检测（可多选）\n 4) 按地区推荐\n 5) 自定义域名/网址列表\n 6) 检测设置（次数=%s，超时=%ss，并发=%s）\n 0) 手动填写 SNI\n' "$sni_samples" "$sni_timeout" "$sni_jobs" >&2
+        ask '请选择 [0-6，默认: 2]: ' mode
+        case "${mode:-2}" in
+            0) return 2 ;;
+            1) sni_region=all; sni_categories=cdn,cloud,tech; sni_hosts=""; return 0 ;;
+            2) sni_region=all; sni_categories=all; sni_hosts=""; return 0 ;;
+            3)
+                keys=()
+                while read -r key label; do
+                    keys+=("$key")
+                    candidate_text=$(reality_sni_candidates all "$key") || return 1
+                    count=$(printf '%s\n' "$candidate_text" | awk 'NF {n++} END {print n+0}')
+                    printf ' %s) %s [%s]（%s 站）\n' "${#keys[@]}" "$label" "$key" "$count" >&2
+                done <<< "$(reality_sni_categories)"
+                ask '输入分类编号或键，多个用空格/逗号分隔；a 全选，0 返回: ' selection
+                [ "$selection" != 0 ] || continue
+                selection="${selection//,/ }"; categories=""; entries=()
+                read -r -a entries <<< "$selection"
+                for item in "${entries[@]}"; do
+                    if [ "$item" = a ] || [ "$item" = all ]; then categories=all; break; fi
+                    if [[ "$item" =~ ^[1-9][0-9]?$ ]] && [ "$item" -le "${#keys[@]}" ]; then item="${keys[item-1]}"; fi
+                    categories+="${categories:+,}$item"
+                done
+                if valid_reality_sni_categories "$categories"; then
+                    sni_region=all; sni_categories="$categories"; sni_hosts=""; return 0
+                fi
+                printf '[提示] 分类无效，请重新选择。\n' >&2 ;;
+            4)
+                keys=()
+                printf '地区为静态归属标签；检测该区站点＋全球通用站，不进行 IP 地理定位。\n' >&2
+                while read -r key label; do
+                    keys+=("$key")
+                    candidate_text=$(reality_sni_candidates "$key") || return 1
+                    count=$(printf '%s\n' "$candidate_text" | awk 'NF {n++} END {print n+0}')
+                    printf ' %s) %s [%s]（%s 站）\n' "${#keys[@]}" "$label" "$key" "$count" >&2
+                done <<< "$(reality_sni_regions)"
+                ask '输入地区编号或键（0 返回）: ' selection
+                [ "$selection" != 0 ] || continue
+                if [[ "$selection" =~ ^[1-9]$ ]]; then selection="${keys[selection-1]}"; fi
+                if valid_reality_sni_region "$selection"; then
+                    sni_region="$selection"; sni_categories=all; sni_hosts=""; return 0
+                fi
+                printf '[提示] 地区无效，请重新选择。\n' >&2 ;;
+            5)
+                ask '输入域名/HTTPS 网址，多个用空格或逗号分隔（0 返回）: ' selection
+                [ "$selection" != 0 ] || continue
+                if candidate_text=$(normalize_reality_sni_hosts "$selection"); then
+                    sni_region=all; sni_categories=all; sni_hosts="$candidate_text"; return 0
+                fi ;;
+            6)
+                prompt_sni_integer '每站测速次数（1–5，取最小值）' "$sni_samples" 5 sni_samples || return 1
+                prompt_sni_integer '单次请求超时秒数（1–15）' "$sni_timeout" 15 sni_timeout || return 1
+                prompt_sni_integer '并发检测数（1–16）' "$sni_jobs" 16 sni_jobs || return 1 ;;
+            *) printf '[提示] 请输入有效编号。\n' >&2 ;;
+        esac
+    done
+}
+
 probe_reality_sni() {
-    local host="$1" handshake elapsed ms=2147483647
-    valid_host "$host" || return 1
-    # Verify the real host from this server, with no proxy and no insecure TLS
-    # fallback. A timeout or handshake error is never a passing result.
-    handshake=$(LC_ALL=C timeout -k 1 4 openssl s_client -connect "$host:443" \
-        -servername "$host" -verify_hostname "$host" -verify_return_error \
+    local host="$1" samples="${2:-3}" limit="${3:-5}" handshake elapsed current chain round ms=2147483647
+    reality_sni_allowed_host "$host" || return 1
+    handshake=$(LC_ALL=C timeout -k 1 "$limit" openssl s_client -connect "$host:443" \
+        -servername "$host" -verify_hostname "$host" -verify_return_error -showcerts \
         -tls1_3 -groups X25519 -alpn h2 -no_ign_eof </dev/null 2>&1) || return 1
     printf '%s\n' "$handshake" | grep -q 'ALPN protocol: h2' || return 1
     printf '%s\n' "$handshake" | grep -Eq 'Verify return code: 0 \(ok\)|Verification: OK' || return 1
-    if elapsed=$(timeout -k 1 3 curl -q --noproxy '*' -sS --connect-timeout 2 --max-time 2 \
-        --http1.1 --output /dev/null --write-out '%{time_appconnect}' "https://$host/" 2>/dev/null) &&
-       [[ "$elapsed" =~ ^[0-9]+([.][0-9]+)?$ ]] &&
-       LC_ALL=C awk -v t="$elapsed" 'BEGIN {exit !(t > 0)}'; then
-        ms=$(LC_ALL=C awk -v t="$elapsed" 'BEGIN {printf "%.0f", t * 1000}')
-    fi
-    printf '%s\n' "$ms"
+    chain=$(printf '%s\n' "$handshake" | grep -c -- '-----BEGIN CERTIFICATE-----')
+    [ "$chain" -gt 0 ] || return 1
+    for ((round=0; round<samples; round++)); do
+        if elapsed=$(timeout -k 1 "$((limit+1))" curl -q --noproxy '*' -sS --connect-timeout "$limit" --max-time "$limit" \
+            --http1.1 --output /dev/null --write-out '%{time_appconnect}' "https://$host/" 2>/dev/null) &&
+           [[ "$elapsed" =~ ^[0-9]+([.][0-9]+)?$ ]] &&
+           LC_ALL=C awk -v t="$elapsed" 'BEGIN {exit !(t > 0)}'; then
+            current=$(LC_ALL=C awk -v t="$elapsed" 'BEGIN {printf "%.0f", t * 1000}')
+            [ "$current" -ge "$ms" ] || ms="$current"
+        fi
+    done
+    printf '%s\t%s\n' "$ms" "$chain"
 }
 
-choose_reality_sni() {
-    local auto_sni answer host score ranked index=0
-    local -a candidates=(www.cloudflare.com www.apple.com www.bing.com addons.mozilla.org www.amazon.com www.samsung.com)
-    local -a matches=() hosts=()
-    if [ "$NON_INTERACTIVE" = 1 ] && [ -n "$CLI_SNI" ]; then
-        get_domain '请输入伪装域名' apple.com
-        return $?
-    fi
+cleanup_reality_sni_workers() {
+    local worker
+    for worker in "${sni_pids[@]}"; do [ -z "$worker" ] || kill "$worker" 2>/dev/null || :; done
+    for worker in "${sni_pids[@]}"; do [ -z "$worker" ] || wait "$worker" 2>/dev/null || :; done
+    [ -z "$sni_work_dir" ] || rm -rf -- "$sni_work_dir"
+    return 0
+}
+
+run_reality_sni_selection() {
+    # Own only scan resources; never inherit the caller's configuration rollback trap.
+    trap - EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    local auto_sni answer host score chain ranked index=0 slot batch_start=0 position completed=0 tier result scan_rc probe_rc
+    local sni_region="${CLI_SNI_REGION:-all}" sni_categories="${CLI_SNI_CATEGORIES:-all}" sni_hosts="${CLI_SNI_HOSTS:-}"
+    local sni_samples="${CLI_SNI_SAMPLES:-3}" sni_timeout="${CLI_SNI_TIMEOUT:-5}" sni_jobs="${CLI_SNI_JOBS:-8}"
+    local -a candidates=() matches=() hosts=()
+    # Persist in this isolated shell until its EXIT trap runs after function return.
+    sni_work_dir=""; sni_pids=()
+    trap cleanup_reality_sni_workers EXIT
+    if [ "$NON_INTERACTIVE" = 1 ] && [ -n "${CLI_SNI:-}" ]; then manual_reality_sni; return $?; fi
     if [ "$NON_INTERACTIVE" = 0 ]; then
         while true; do
             ask '是否自动检测并推荐 SNI？(y/n) [默认: y]: ' auto_sni
             case "${auto_sni:-y}" in
                 y|Y) break ;;
-                n|N) get_domain '请输入伪装域名' apple.com; return $? ;;
+                n|N) manual_reality_sni; return $? ;;
                 *) printf '[提示] 请输入 y 或 n。\n' >&2 ;;
             esac
         done
+        configure_reality_sni_scan; scan_rc=$?
+        if [ "$scan_rc" = 2 ]; then manual_reality_sni; return $?; fi
+        [ "$scan_rc" = 0 ] || return "$scan_rc"
     fi
+    result=$(reality_sni_candidates "$sni_region" "$sni_categories" "$sni_hosts") || return 1
+    [ -n "$result" ] || { printf '[错误] 所选地区与分类没有候选，请调整筛选条件。\n' >&2; return 1; }
+    mapfile -t candidates <<< "$result"
     if ! ensure_deps openssl curl timeout; then
         if [ "$NON_INTERACTIVE" = 1 ]; then printf '[错误] 无法准备 SNI 检测依赖。\n' >&2; return 1; fi
         printf '[提示] 检测依赖不可用，改为手动输入 SNI。\n' >&2
-        get_domain '请输入伪装域名' apple.com
-        return $?
+        manual_reality_sni; return $?
     fi
-    printf '检测 6 个候选站点：TLS 1.3、X25519、证书主机名及 h2；每站有超时上限。\n' >&2
-    for host in "${candidates[@]}"; do
-        printf '  检测 %s ... ' "$host" >&2
-        if score=$(probe_reality_sni "$host"); then
-            matches+=("$score"$'\t'"$host")
-            printf '通过\n' >&2
-        else
-            printf '未通过或超时\n' >&2
-        fi
+    sni_work_dir=$(mktemp -d "${TMPDIR:-/tmp}/onebox-sni.XXXXXX") || return 1
+    printf '检测 %s 个候选（地区=%s，分类=%s）：TLS 1.3、X25519、证书主机名、h2 和证书链。\n并发 %s，每站测速 %s 次取最小值，单次超时 %s 秒。\n' \
+        "${#candidates[@]}" "$sni_region" "$sni_categories" "$sni_jobs" "$sni_samples" "$sni_timeout" >&2
+    while [ "$batch_start" -lt "${#candidates[@]}" ]; do
+        sni_pids=()
+        for ((slot=0; slot<sni_jobs && batch_start+slot<${#candidates[@]}; slot++)); do
+            position=$((batch_start+slot))
+            (
+                trap - EXIT
+                trap 'exit 130' INT
+                trap 'exit 143' TERM
+                probe_reality_sni "${candidates[position]}" "$sni_samples" "$sni_timeout"
+            ) >"$sni_work_dir/result-$position" 2>/dev/null < /dev/null &
+            sni_pids+=("$!")
+        done
+        for ((slot=0; slot<${#sni_pids[@]}; slot++)); do
+            position=$((batch_start+slot)); host="${candidates[position]}"
+            probe_rc=0
+            wait "${sni_pids[slot]}" || probe_rc=$?
+            sni_pids[slot]=""
+            completed=$((completed+1))
+            score=""; chain=""
+            IFS=$'\t' read -r score chain < "$sni_work_dir/result-$position" || :
+            if [ "$probe_rc" = 0 ] && [[ "$score" =~ ^[0-9]+$ && "$chain" =~ ^[1-9][0-9]*$ ]]; then
+                tier=0; [ "$chain" -le 3 ] || tier=1
+                matches+=("$tier"$'\t'"$score"$'\t'"$chain"$'\t'"$host")
+                printf ' [%s/%s] %s：通过（证书链 %s 层）\n' "$completed" "${#candidates[@]}" "$host" "$chain" >&2
+            else
+                printf ' [%s/%s] %s：未通过或超时\n' "$completed" "${#candidates[@]}" "$host" >&2
+            fi
+        done
+        batch_start=$((batch_start+sni_jobs))
     done
+    sni_pids=()
     if [ "${#matches[@]}" = 0 ]; then
         if [ "$NON_INTERACTIVE" = 1 ]; then
-            printf '[错误] 没有通过 SNI 检测的候选；请检查服务器出站网络，或用 --sni 显式指定域名。\n' >&2
-            return 1
+            printf '[错误] 没有通过 SNI 检测的候选；请检查出站网络、调整筛选条件，或用 --sni 显式指定域名。\n' >&2; return 1
         fi
-        printf '[提示] 本次没有通过全部检测的候选，请手动填写；检测结果只代表本机当前网络。\n' >&2
-        get_domain '请输入伪装域名' apple.com
-        return $?
+        printf '[提示] 没有候选通过全部检测，改为手动输入。\n' >&2
+        manual_reality_sni; return $?
     fi
-    ranked=$(printf '%s\n' "${matches[@]}" | LC_ALL=C sort -n -k1,1) || return 1
-    printf '\n候选 SNI（按建立 TLS 连接耗时排序）：\n' >&2
-    while IFS=$'\t' read -r score host; do
-        hosts+=("$host")
-        index=$((index + 1))
-        if [ "$score" = 2147483647 ]; then
-            printf ' %s) %s（已通过 TLS 检查，耗时未测得）\n' "$index" "$host" >&2
-        else
-            printf ' %s) %s（约 %s ms）\n' "$index" "$host" "$score" >&2
-        fi
+    ranked=$(printf '%s\n' "${matches[@]}" | LC_ALL=C sort -k1,1n -k2,2n -k4,4) || return 1
+    printf '\n候选 SNI（短证书链优先，同组按多次 TCP/TLS 建连最小耗时排序；通过 %s/%s）：\n' "${#matches[@]}" "${#candidates[@]}" >&2
+    while IFS=$'\t' read -r tier score chain host; do
+        hosts+=("$host"); index=$((index+1))
+        result="约 $score ms"; [ "$score" != 2147483647 ] || result='耗时未测得'
+        answer='短链'; [ "$tier" = 0 ] || answer='长链备选，需验证兼容性'
+        printf ' %s) %s（%s，链 %s 层，%s）\n' "$index" "$host" "$result" "$chain" "$answer" >&2
     done <<< "$ranked"
     if [ "$NON_INTERACTIVE" = 1 ]; then
-        printf '[完成] 自动选择排名第一的 SNI：%s。检测无法保证所有客户端网络可用。\n' "${hosts[0]}" >&2
-        printf '%s\n' "${hosts[0]}"
-        return 0
+        printf '[完成] 自动选择排名第一的 SNI：%s。检测仅代表本机当前网络。\n' "${hosts[0]}" >&2
+        printf '%s\n' "${hosts[0]}"; return 0
     fi
     printf ' 0) 手动输入\n检测无法保证所有客户端网络可用。\n' >&2
     while true; do
         ask "请选择 [0-$index，默认: 1]: " answer
         answer="${answer:-1}"
-        if [ "$answer" = 0 ]; then get_domain '请输入伪装域名' apple.com; return $?; fi
-        if [[ "$answer" =~ ^[1-9][0-9]?$ ]] && [ "$answer" -le "$index" ]; then
-            printf '%s\n' "${hosts[answer - 1]}"
-            return 0
+        if [ "$answer" = 0 ]; then manual_reality_sni; return $?; fi
+        if [[ "$answer" =~ ^[1-9][0-9]{0,2}$ ]] && [ "$answer" -le "$index" ]; then
+            printf '%s\n' "${hosts[answer-1]}"; return 0
         fi
         printf '[提示] 请输入有效编号。\n' >&2
     done
 }
+
+choose_reality_sni() (run_reality_sni_selection)
+
+stop_sni_selection() {
+    if [ -n "${SB_SNI_PID:-}" ]; then
+        kill "$SB_SNI_PID" 2>/dev/null || :
+        wait "$SB_SNI_PID" 2>/dev/null || :
+        SB_SNI_PID=""
+    fi
+}
+
+resolve_reality_sni() {
+    local destination="$1" selection_file sni_resolution_value rc=0
+    selection_file=$(mktemp "${TMPDIR:-/tmp}/onebox-sni-choice.XXXXXX") || return 1
+    SB_OWNED_TEMP_FILES+=("$selection_file")
+    # One explicit subshell: $! must identify the shell owning the cleanup trap.
+    (run_reality_sni_selection) >"$selection_file" <&0 &
+    SB_SNI_PID=$!
+    wait "$SB_SNI_PID" || rc=$?
+    SB_SNI_PID=""
+    sni_resolution_value=$(cat "$selection_file")
+    rm -f -- "$selection_file"
+    [ "$rc" = 0 ] || return "$rc"
+    reality_sni_allowed_host "$sni_resolution_value" || return 1
+    printf -v "$destination" '%s' "$sni_resolution_value"
+}
+
 
 confirm_http01_ready() {
     local confirmed=""
@@ -2244,7 +2585,7 @@ add_config() {
                 local UUID
                 UUID=$(get_uuid) || return 1
                 local SNI
-                SNI=$(choose_reality_sni) || { restore_config_and_service || return 1; return 1; }
+                resolve_reality_sni SNI || { restore_config_and_service || return 1; return 1; }
                 local KEYS
                 KEYS=$(/usr/local/lib/onebox/sing-box generate reality-keypair) || return 1
                 local PK
@@ -2728,7 +3069,7 @@ modify_config() {
 
             elif [ "$action" == "sni" ]; then
                 local NEW_SNI
-                NEW_SNI=$(get_domain "请输入新的伪装域名" "apple.com") || exit 1
+                resolve_reality_sni NEW_SNI || { restore_config_and_service || return 1; return 1; }
 
                 if ! apply_jq_config '(.inbounds[] | select(.tag==$tag) | .tls.server_name) = $sni | (.inbounds[] | select(.tag==$tag) | .tls.reality.handshake.server) = $sni' \
                 --arg tag "$TAG" --arg sni "$NEW_SNI"; then
@@ -3954,6 +4295,17 @@ add 选项:
   --password-file PATH（或环境变量 SB_PASSWORD）
   --sni DOMAIN                 指定 Reality 伪装域名；省略则自动检测选第一名
                                自签证书域名默认 bing.com
+Reality SNI 自动检测选项（仅 add --protocol reality）:
+  --sni-region all|global|us|eu|jp|hk|sg|cn|au|kr（默认 all）
+  --sni-category all|cdn,cloud,tech,fin,edu,media,social,gaming,ecom,region
+                               默认 all；与地区筛选取交集，地区包含全球通用站
+  --sni-hosts 'HOST URL ...'    自定义列表替代内置列表，空格/逗号分隔
+                               不与地区/分类筛选混用；排除 Apple 旗下域名
+  --sni-jobs 1..16             并发数，默认 8
+  --sni-samples 1..5           每站测速次数，默认 3，取最小值
+  --sni-timeout 1..15          每次请求超时秒数，默认 5
+                               短证书链优先、同组按耗时排名；--sni 跳过检测
+其他 add 选项:
   --cert self|real             默认 self
   --method METHOD              SS 默认 aes-128-gcm
   --firewall auto|skip         默认 auto
@@ -3976,6 +4328,8 @@ parse_cli() {
     CLI_COMMAND="" CLI_PROTOCOL="" CLI_TAG="" CLI_PORT="" CLI_UUID=""
     CLI_PASSWORD="${SB_PASSWORD:-}" CLI_TUNNEL_TOKEN="${SB_TUNNEL_TOKEN:-}"
     CLI_CERT=self CLI_METHOD=aes-128-gcm CLI_SNI="" CLI_DOMAIN=""
+    CLI_SNI_REGION=all CLI_SNI_CATEGORIES=all CLI_SNI_HOSTS=""
+    CLI_SNI_JOBS=8 CLI_SNI_SAMPLES=3 CLI_SNI_TIMEOUT=5
     CLI_VERSION=latest CLI_VALIDATION=dns CLI_HTTP01_READY=0 CLI_ADDRESS=""
     CLI_FIREWALL=y CLI_EDGE="" CLI_STRATEGY="" CLI_RESTORE_BBR=1
     CLI_LINES=80 CLI_LOG_SOURCE=service
@@ -3989,7 +4343,7 @@ parse_cli() {
             -y|--yes) ASSUME_YES=1 ;;
             --http01-ready) CLI_HTTP01_READY=1; used_options+=("$option") ;;
             --keep-bbr) CLI_RESTORE_BBR=0; used_options+=("$option") ;;
-            --protocol|--tag|--port|--uuid|--password|--password-file|--tunnel-token-file|--cf-token-file|--cert|--method|--sni|--domain|--version|--validation|--address|--edge|--strategy|--firewall|--lines|--source)
+            --protocol|--tag|--port|--uuid|--password|--password-file|--tunnel-token-file|--cf-token-file|--cert|--method|--sni|--sni-region|--sni-category|--sni-hosts|--sni-jobs|--sni-samples|--sni-timeout|--domain|--version|--validation|--address|--edge|--strategy|--firewall|--lines|--source)
                 [ "$#" -gt 0 ] && [[ "$1" != --* ]] || die "选项 $option 缺少值。" 2
                 value="$1"; shift
                 [ -n "$value" ] || die "选项 $option 不能为空。" 2
@@ -4006,6 +4360,12 @@ parse_cli() {
                     --cert) CLI_CERT="$value" ;;
                     --method) CLI_METHOD="$value" ;;
                     --sni) CLI_SNI="$value" ;;
+                    --sni-region) CLI_SNI_REGION="$value" ;;
+                    --sni-category) CLI_SNI_CATEGORIES="$value" ;;
+                    --sni-hosts) CLI_SNI_HOSTS="$value" ;;
+                    --sni-jobs) CLI_SNI_JOBS="$value" ;;
+                    --sni-samples) CLI_SNI_SAMPLES="$value" ;;
+                    --sni-timeout) CLI_SNI_TIMEOUT="$value" ;;
                     --domain) CLI_DOMAIN="$value" ;;
                     --version) CLI_VERSION="${value#v}" ;;
                     --validation) CLI_VALIDATION="$value" ;;
@@ -4039,6 +4399,7 @@ parse_cli() {
         case "$CLI_COMMAND:$option" in
             add:--protocol|add:--tag|add:--port|add:--uuid|add:--password|add:--password-file|add:--tunnel-token-file|add:--cf-token-file|add:--cert|add:--method|add:--sni|add:--domain|add:--version|add:--validation|add:--address|add:--edge|add:--http01-ready|add:--firewall|install:--version|update:--version|delete:--tag|list:--tag|links:--tag|links:--address|cert:--cert|cert:--sni|cert:--domain|cert:--validation|cert:--cf-token-file|cert:--http01-ready|outbound:--strategy|uninstall:--keep-bbr) ;;
             logs:--lines|logs:--source|logs:--tag) ;;
+            add:--sni-region|add:--sni-category|add:--sni-hosts|add:--sni-jobs|add:--sni-samples|add:--sni-timeout) ;;
             *) die "命令 $CLI_COMMAND 不接受选项 $option。" 2 ;;
         esac
     done
@@ -4058,6 +4419,15 @@ parse_cli() {
     local host
     for host in "$CLI_SNI" "$CLI_DOMAIN"; do [ -z "$host" ] || valid_host "$host" || die "域名格式错误：$host" 2; done
     for host in "$CLI_ADDRESS" "$CLI_EDGE"; do [ -z "$host" ] || valid_host "$host" true || die "地址格式错误：$host" 2; done
+    valid_reality_sni_region "$CLI_SNI_REGION" || die '--sni-region 必须是 all/global/us/eu/jp/hk/sg/cn/au/kr。' 2
+    valid_reality_sni_categories "$CLI_SNI_CATEGORIES" || die '--sni-category 含未知分类，请查看 --help。' 2
+    [[ "$CLI_SNI_JOBS" =~ ^[1-9][0-9]?$ ]] && [ "$CLI_SNI_JOBS" -le 16 ] || die '--sni-jobs 必须为 1–16 的整数。' 2
+    [[ "$CLI_SNI_SAMPLES" =~ ^[1-5]$ ]] || die '--sni-samples 必须为 1–5 的整数。' 2
+    [[ "$CLI_SNI_TIMEOUT" =~ ^[1-9][0-9]?$ ]] && [ "$CLI_SNI_TIMEOUT" -le 15 ] || die '--sni-timeout 必须为 1–15 的整数。' 2
+    if [ -n "$CLI_SNI_HOSTS" ]; then
+        [ "$CLI_SNI_REGION" = all ] && [ "$CLI_SNI_CATEGORIES" = all ] || die '--sni-hosts 不与地区/分类筛选混用。' 2
+        CLI_SNI_HOSTS=$(normalize_reality_sni_hosts "$CLI_SNI_HOSTS") || die '--sni-hosts 列表无效。' 2
+    fi
     if [ "$CLI_COMMAND" = delete ] || [ "$CLI_COMMAND" = uninstall ]; then
         [ "$ASSUME_YES" = 1 ] || die "$CLI_COMMAND 必须显式指定 --yes。" 2
     fi
@@ -4077,6 +4447,12 @@ parse_cli() {
             shadowsocks|ss) CLI_PROTOCOL_INDEX=6 ;;
             *) die 'add 需要 --protocol reality|hysteria2|tuic|anytls|argo|shadowsocks。' 2 ;;
         esac
+        for option in "${used_options[@]}"; do
+            case "$option" in --sni-*) [ "$CLI_PROTOCOL_INDEX" = 1 ] || die "$option 仅适用于 Reality。" 2 ;; esac
+        done
+        if [ "$CLI_PROTOCOL_INDEX" = 1 ] && [ -n "$CLI_SNI" ]; then
+            reality_sni_allowed_host "$CLI_SNI" || die 'Reality SNI 已排除 Apple 旗下域名，请使用其他域名。' 2
+        fi
         if [ "$CLI_PROTOCOL_INDEX" = 6 ] && [ -n "$CLI_PASSWORD" ]; then
             # base64 is a base dependency on all supported distributions (including BusyBox).
             get_ss_pass_valid "$CLI_METHOD" "$CLI_PASSWORD" || die 'Shadowsocks 密码不符合所选加密方式。' 2

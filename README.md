@@ -64,18 +64,52 @@ sh install.sh install --version 1.14.3
 
 安装完成后使用 `onebox <命令>`。再次直接执行 `onebox` 可进入交互菜单，其中包含卸载选项。
 
-交互式添加 `VLESS-REALITY` 时，会询问“是否自动检测并推荐 SNI”。选择 `y` 会从当前服务器检测 6 个内置候选的 TLS 1.3、X25519、证书主机名及 HTTP/2（h2），再按建立 TLS 连接的耗时排序，供你选用；选择 `n` 或结果中的 `0` 可手动输入。请求均有超时，未找到候选时回到手动输入，所需依赖自动安装。
+### Reality SNI 自动检测
 
-无交互模式省略 `--sni` 时自动检测并选择第一名，不等待输入；全部检测失败则报错退出并恢复本次配置事务。显式指定 `--sni apple.com` 等域名可跳过自动检测。
+交互式添加 `VLESS-REALITY` 时，会询问“是否自动检测并推荐 SNI”。选择 `y` 后可选快速检测、全部候选、分类多选、地区推荐或自定义域名/网址列表，也可调整测速次数、单次超时和并发数；默认检测全部候选。选择 `n` 或结果中的 `0` 可手动输入，默认值为 `www.cloudflare.com`。请求均有超时，未找到候选时回到手动输入，所需依赖自动安装。
 
-检测思路参考 [Reality-SNI-Check](https://github.com/chnnic/Reality-SNI-Check)，由 onebox 内置实现。结果只代表服务器当前的可达性和 TLS 特性，不能保证所有客户端网络可用；h2 是自动推荐的筛选条件。
+候选库完整引入 [Reality-SNI-Check](https://github.com/chnnic/Reality-SNI-Check) 的 98 个站点，按要求移除 4 个 Apple 旗下站点，保留 **94 个候选、10 类分类、9 个地区**。域名、分类和地区集中维护在 `install.sh` 的 `reality_sni_catalog()`，运行时无需下载或执行外部检测脚本。内置列表、自定义列表和 Reality 手动 SNI 均排除 `apple.com`、`icloud.com`、`mzstatic.com` 及其子域名。
+
+| 分类键 | 分类 | 数量 |
+| --- | --- | --- |
+| `cdn` | 全球 CDN / anycast | 5 |
+| `cloud` | 云 / 开发基础设施 | 10 |
+| `tech` | 科技 / 半导体大厂 | 14 |
+| `fin` | 金融 / 支付 / 银行 | 10 |
+| `edu` | 大学 / 教育机构 | 23 |
+| `media` | 流媒体 / 内容 | 1 |
+| `social` | 社交平台 | 2 |
+| `gaming` | 游戏平台 | 8 |
+| `ecom` | 电商 / 零售 / 品牌 | 10 |
+| `region` | 区域锚点 | 11 |
+
+快速检测取 `cdn,cloud,tech`，共 29 个站点。地区键为 `global`（全球通用）、`us`（美国/北美）、`eu`（欧洲）、`jp`（日本）、`hk`（香港）、`sg`（东南亚/新加坡）、`cn`（中国大陆）、`au`（澳洲）、`kr`（韩国）。选择某地区会检测该区站点加全球通用站；`global` 只测全球通用站，`all` 不限制地区。地区标签沿用参考项目，并为韩国补充 Samsung、LG 的归属；标签不是站点 IP 地理定位，也不保证请求实际落在该地区。
+
+每站检查 TLS 1.3、X25519、证书主机名/信任及 HTTP/2（h2），统计服务端提供的证书链长度。默认 8 个并发、单次请求超时 5 秒、测速 3 次取最小值；界面显示完成进度。通过检查的短链站点（不超过 3 层）优先，同组按 TCP/TLS 建连耗时排序；长链站点标为备选，测速未取得结果的排在同组末尾。耗时使用 `curl time_appconnect`，包含 DNS、TCP 和 TLS，不是纯 TLS 用时。短链优先和 h2 是推荐筛选策略，检测结果只代表服务器当前网络，不能保证所有客户端可用。
+
+无交互模式省略 `--sni` 时自动检测 **全部 94 个候选**并选择排名第一的站点，不等待输入；全部检测失败则报错退出并恢复本次配置事务。显式指定 `--sni www.cloudflare.com` 可跳过自动检测。
+
+```sh
+# 日本地区站点＋全球通用站，自动选择第一名
+onebox add --protocol reality --port 443 --sni-region jp
+
+# 只测教育、科技分类；可与地区取交集
+onebox add --protocol reality --port 443 --sni-category edu,tech --sni-region sg
+
+# 用自定义列表替代内置候选，自动规范化网址、去重
+onebox add --protocol reality --port 443 \
+  --sni-hosts 'https://www.cloudflare.com/ www.nus.edu.sg,www.amd.com' \
+  --sni-jobs 4 --sni-samples 3 --sni-timeout 5
+```
+
+自动检测参数只适用于 `add --protocol reality`。`--sni-region` 默认 `all`，`--sni-category` 默认 `all`；两者可组合。`--sni-hosts` 支持 1–256 个域名或 HTTP(S) 网址，以空格或逗号分隔，替换内置列表，不与地区/分类筛选混用；仅探测 HTTPS 443。`--sni-jobs` 范围 `1–16`，`--sni-samples` 范围 `1–5`，`--sni-timeout` 范围 `1–15` 秒。显式 `--sni` 优先，跳过所有检测步骤。
 
 ## 添加节点
 
 以下命令一次添加一个节点，完成后退出。`add` 也会自动安装内核、依赖和固定入口。已有同名节点或端口冲突时返回失败。
 
 ```sh
-onebox add --protocol reality --tag reality-1 --port 443 --sni apple.com
+onebox add --protocol reality --tag reality-1 --port 443 --sni www.cloudflare.com
 onebox add --protocol hysteria2 --tag hy2-1 --port 8443 --cert self
 onebox add --protocol tuic --tag tuic-1 --port 9443 --cert self
 onebox add --protocol anytls --tag anytls-1 --port 10443 --cert self
