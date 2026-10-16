@@ -1041,6 +1041,8 @@ ensure_deps() {
             ss) case "$PACKAGE_MANAGER" in dnf|yum|zypper) pkg=iproute2; [ "$PACKAGE_MANAGER" = zypper ] || pkg=iproute ;; *) pkg=iproute2 ;; esac ;;
             crontab) case "$PACKAGE_MANAGER" in apk) pkg=dcron ;; apt-get) pkg=cron ;; *) pkg=cronie ;; esac ;;
             flock) [ "$PACKAGE_MANAGER" = apk ] && pkg=flock || pkg=util-linux ;;
+            setsid) [ "$PACKAGE_MANAGER" = apk ] && pkg=util-linux-misc || pkg=util-linux ;;
+            mkfifo) pkg=coreutils ;;
             sha256sum|base64|timeout|date|mv) pkg=coreutils ;;
             sysctl|ps) case "$PACKAGE_MANAGER" in apk|pacman) pkg=procps-ng ;; apt-get) pkg=procps ;; *) pkg=procps-ng ;; esac ;;
             modprobe) pkg=kmod ;;
@@ -1549,38 +1551,190 @@ configure_reality_sni_scan() {
             6)
                 prompt_sni_integer '每站测速次数（1–5，取最小值）' "$sni_samples" 5 sni_samples || return 1
                 prompt_sni_integer '单次请求超时秒数（1–15）' "$sni_timeout" 15 sni_timeout || return 1
-                prompt_sni_integer '并发检测数（1–16）' "$sni_jobs" 16 sni_jobs || return 1 ;;
+                prompt_sni_integer '并发检测上限（1–16，按 PID 额度下调）' "$sni_jobs" 16 sni_jobs || return 1 ;;
             *) printf '[提示] 请输入有效编号。\n' >&2 ;;
         esac
     done
 }
 
-probe_reality_sni() {
-    local host="$1" samples="${2:-3}" limit="${3:-5}" handshake elapsed current chain round ms=2147483647
-    reality_sni_allowed_host "$host" || return 1
-    handshake=$(LC_ALL=C timeout -k 1 "$limit" openssl s_client -connect "$host:443" \
-        -servername "$host" -verify_hostname "$host" -verify_return_error -showcerts \
-        -tls1_3 -groups X25519 -alpn h2 -no_ign_eof </dev/null 2>&1) || return 1
-    printf '%s\n' "$handshake" | grep -q 'ALPN protocol: h2' || return 1
-    printf '%s\n' "$handshake" | grep -Eq 'Verify return code: 0 \(ok\)|Verification: OK' || return 1
-    chain=$(printf '%s\n' "$handshake" | grep -c -- '-----BEGIN CERTIFICATE-----')
-    [ "$chain" -gt 0 ] || return 1
-    for ((round=0; round<samples; round++)); do
-        if elapsed=$(timeout -k 1 "$((limit+1))" curl -q --noproxy '*' -sS --connect-timeout "$limit" --max-time "$limit" \
-            --http1.1 --output /dev/null --write-out '%{time_appconnect}' "https://$host/" 2>/dev/null) &&
-           [[ "$elapsed" =~ ^[0-9]+([.][0-9]+)?$ ]] &&
-           LC_ALL=C awk -v t="$elapsed" 'BEGIN {exit !(t > 0)}'; then
-            current=$(LC_ALL=C awk -v t="$elapsed" 'BEGIN {printf "%.0f", t * 1000}')
-            [ "$current" -ge "$ms" ] || ms="$current"
+# Read task limits with Bash builtins: the measurement must not need a spare PID.
+onebox_probe_pids_budget() {
+    local proc_root="${1:-/proc}" id controllers path v2_path='' v1_path='' line left
+    local mount_root mount_dir directory relative ceiling current free soft key a b rest status uid threads used=0
+    sni_pid_headroom=-1
+    sni_pid_source='未发现可见的进程限制'
+    if [ -r "$proc_root/self/cgroup" ] && [ -r "$proc_root/self/mountinfo" ]; then
+        while IFS=: read -r id controllers path; do
+            if [ "$id" = 0 ] && [ -z "$controllers" ]; then v2_path="$path"; fi
+            case ",$controllers," in *,pids,*) v1_path="$path" ;; esac
+        done < "$proc_root/self/cgroup"
+        while IFS= read -r line; do
+            case "$line" in
+                *' - cgroup2 '*) path="$v2_path" ;;
+                *' - cgroup '*) case "${line#* - cgroup }" in *,pids|*,pids,*|*' pids '*) path="$v1_path" ;; *) continue ;; esac ;;
+                *) continue ;;
+            esac
+            [ -n "$path" ] || continue
+            left="${line%% - *}"
+            read -r id a b mount_root mount_dir rest <<< "$left"
+            # mountinfo escapes whitespace and backslashes in paths.
+            printf -v mount_root '%b' "$mount_root"
+            printf -v mount_dir '%b' "$mount_dir"
+            case "$path" in
+                "$mount_root") relative='' ;;
+                "$mount_root"/*) relative="${path#"$mount_root"}" ;;
+                *) relative="$path" ;;
+            esac
+            directory="${mount_dir%/}/${relative#/}"; directory="${directory%/}"
+            while :; do
+                if [ -r "$directory/pids.max" ] && [ -r "$directory/pids.current" ]; then
+                    read -r ceiling < "$directory/pids.max"
+                    read -r current < "$directory/pids.current"
+                    if [[ "$ceiling" =~ ^[0-9]+$ && "$current" =~ ^[0-9]+$ ]]; then
+                        free=$((ceiling-current)); [ "$free" -ge 0 ] || free=0
+                        if [ "$sni_pid_headroom" -lt 0 ] || [ "$free" -lt "$sni_pid_headroom" ]; then
+                            sni_pid_headroom="$free"; sni_pid_source="$directory ($current/$ceiling)"
+                        fi
+                    fi
+                fi
+                [ "$directory" != "$mount_dir" ] && [[ "$directory" == "$mount_dir"/* ]] || break
+                directory="${directory%/*}"
+            done
+        done < "$proc_root/self/mountinfo"
+    fi
+    # RLIMIT_NPROC counts threads of the real UID; it does not apply to root.
+    if [ "$UID" != 0 ] && [ -r "$proc_root/self/limits" ]; then
+        soft=''
+        while read -r key a b rest; do
+            if [ "$key $a" = 'Max processes' ]; then soft="$b"; break; fi
+        done < "$proc_root/self/limits"
+        if [[ "$soft" =~ ^[0-9]+$ ]]; then
+            for status in "$proc_root"/[0-9]*/status; do
+                [ -r "$status" ] || continue
+                uid=''; threads=1
+                while read -r key a rest; do
+                    case "$key" in Uid:) uid="$a" ;; Threads:) threads="$a"; break ;; esac
+                done < "$status"
+                if [ "$uid" = "$UID" ] && [[ "$threads" =~ ^[0-9]+$ ]]; then used=$((used+threads)); fi
+            done
+            free=$((soft-used)); [ "$free" -ge 0 ] || free=0
+            if [ "$sni_pid_headroom" -lt 0 ] || [ "$free" -lt "$sni_pid_headroom" ]; then
+                sni_pid_headroom="$free"; sni_pid_source="ulimit -u ($used/$soft，可见 UID 线程)"
+            fi
         fi
+    fi
+}
+
+onebox_safe_sni_jobs() {
+    onebox_probe_pids_budget
+    sni_effective_jobs="$1"
+    # Each worker: Bash + curl + one resolver thread; leave four tasks for control/cleanup.
+    if [ "$sni_pid_headroom" -ge 0 ]; then
+        local available=$(((sni_pid_headroom-4)/3))
+        [ "$available" -ge 0 ] || available=0
+        [ "$available" -ge "$sni_effective_jobs" ] || sni_effective_jobs="$available"
+    fi
+    [ "$sni_effective_jobs" -gt 0 ]
+}
+
+check_reality_sni_curl() {
+    local line version major minor tls_major tls_minor tls_patch features='' backend=''
+    sni_curl_certinfo=0
+    CURL_SSL_BACKEND=openssl curl -q --version > "$sni_work_dir/curl-version" || return 1
+    while IFS= read -r line; do
+        case "$line" in
+            curl\ *) read -r backend version _ <<< "$line"; backend="$line" ;;
+            Features:*) features="$line" ;;
+        esac
+    done < "$sni_work_dir/curl-version"
+    IFS=. read -r major minor _ <<< "$version"
+    if ! [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ ]] ||
+       ! { [ "$major" -gt 7 ] || { [ "$major" = 7 ] && [ "$minor" -ge 73 ]; }; } ||
+       [[ "$backend" != *' OpenSSL/'* || " $features " != *' HTTP2 '* ]]; then
+        printf '[错误] 自动检测需要 curl ≥ 7.73、OpenSSL TLS 后端和 HTTP2 支持；请通过系统软件源升级 curl，或用 --sni 显式指定域名。\n' >&2
+        return 1
+    fi
+    if [[ "$backend" =~ [[:space:]]OpenSSL/([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+        tls_major="${BASH_REMATCH[1]}"; tls_minor="${BASH_REMATCH[2]}"; tls_patch="${BASH_REMATCH[3]}"
+        if [ "$tls_major" -lt 1 ] || { [ "$tls_major" = 1 ] && { [ "$tls_minor" -lt 1 ] || { [ "$tls_minor" = 1 ] && [ "$tls_patch" -lt 1 ]; }; }; }; then
+            printf '[错误] 自动检测需要支持 TLS 1.3 的 OpenSSL ≥ 1.1.1；请升级系统 curl 或显式指定 --sni。\n' >&2
+            return 1
+        fi
+    else
+        printf '[错误] 无法确认 curl 的 OpenSSL 版本；请升级系统 curl 或显式指定 --sni。\n' >&2
+        return 1
+    fi
+    if [ "$major" -gt 7 ] || [ "$minor" -ge 88 ]; then sni_curl_certinfo=1; fi
+    if [ "$sni_curl_certinfo" = 0 ]; then
+        printf '[提示] 当前 curl 不支持证书链计数，将标为链长度未知并列在已知链之后。\n' >&2
+    fi
+}
+
+probe_reality_sni() {
+    local host="$1" samples="${2:-3}" limit="${3:-5}" payload verify http elapsed chain
+    local round whole fraction current best_chain=0 ms=2147483647 format
+    reality_sni_allowed_host "$host" || return 1
+    format='%{ssl_verify_result}\t%{http_version}\t%{time_appconnect}\t0'
+    [ "${sni_curl_certinfo:-0}" != 1 ] || format='%{ssl_verify_result}\t%{http_version}\t%{time_appconnect}\t%{num_certs}'
+    for ((round=0; round<samples; round++)); do
+        # exec replaces the command-substitution shell; no openssl/timeout/pipeline workers.
+        if ! payload=$(LC_ALL=C CURL_SSL_BACKEND=openssl exec curl -q --noproxy '*' -sS --connect-timeout "$limit" --max-time "$limit" \
+            --http2 --tlsv1.3 --tls-max 1.3 --curves X25519 --head \
+            --output /dev/null --write-out "$format" "https://$host/"); then
+            [ "$round" -gt 0 ] || return 1
+            continue
+        fi
+        IFS=$'\t' read -r verify http elapsed chain <<< "$payload"
+        if [ "$verify" != 0 ] || [ "$http" != 2 ] || ! [[ "$elapsed" =~ ^[0-9]+\.[0-9]+$ && "$chain" =~ ^[0-9]+$ ]] ||
+           { [ "${sni_curl_certinfo:-0}" = 1 ] && [ "$chain" = 0 ]; }; then
+            [ "$round" -gt 0 ] || return 1
+            continue
+        fi
+        whole="${elapsed%%.*}"; fraction="${elapsed#*.}0000"
+        current=$((10#$whole*1000 + 10#${fraction:0:3} + (10#${fraction:3:1} >= 5)))
+        [ "$current" -gt 0 ] || current=1
+        [ "$current" -ge "$ms" ] || ms="$current"
+        [ "$chain" -le "$best_chain" ] || best_chain="$chain"
     done
-    printf '%s\t%s\n' "$ms" "$chain"
+    [ "$ms" != 2147483647 ] || return 1
+    printf '%s\t%s\n' "$ms" "$best_chain"
+}
+
+reality_sni_worker_exited() {
+    local worker="$1" stat state
+    kill -0 "$worker" 2>/dev/null || return 0
+    if [ -r "/proc/$worker/stat" ]; then
+        IFS= read -r stat < "/proc/$worker/stat" || return 1
+        state="${stat##*) }"; state="${state%% *}"
+        # During an EXIT trap Bash may defer reaping; wait is safe once the child is a zombie.
+        if [ "$state" = Z ] || [ "$state" = X ]; then return 0; fi
+    fi
+    return 1
+}
+
+stop_reality_sni_worker() {
+    local worker="$1" tick
+    # Kill the session, including curl and its resolver, even if the worker shell is waiting.
+    kill -TERM -- "-$worker" "$worker" 2>/dev/null || :
+    for ((tick=0; tick<3; tick++)); do
+        reality_sni_worker_exited "$worker" && break
+        IFS= read -r -t 0.1 -u 9 _ || :
+    done
+    kill -KILL -- "-$worker" "$worker" 2>/dev/null || :
+    for ((tick=0; tick<10; tick++)); do
+        if reality_sni_worker_exited "$worker"; then wait "$worker" 2>/dev/null || :; return 0; fi
+        IFS= read -r -t 0.1 -u 9 _ || :
+    done
+    printf '[错误] 检测任务 %s 在强制终止后仍未退出；停止扫描，请检查主机内核/容器状态。\n' "$worker" >&2
+    return 1
 }
 
 cleanup_reality_sni_workers() {
     local worker
-    for worker in "${sni_pids[@]}"; do [ -z "$worker" ] || kill "$worker" 2>/dev/null || :; done
-    for worker in "${sni_pids[@]}"; do [ -z "$worker" ] || wait "$worker" 2>/dev/null || :; done
+    for worker in "${sni_pids[@]}"; do
+        [ -z "$worker" ] || stop_reality_sni_worker "$worker" || :
+    done
+    if [ "${sni_poll_open:-0}" = 1 ]; then exec 9>&-; sni_poll_open=0; fi
     [ -z "$sni_work_dir" ] || rm -rf -- "$sni_work_dir"
     return 0
 }
@@ -1591,11 +1745,13 @@ run_reality_sni_selection() {
     trap 'exit 130' INT
     trap 'exit 143' TERM
     local auto_sni answer host score chain ranked index=0 slot batch_start=0 position completed=0 tier result scan_rc probe_rc
+    local sni_effective_jobs sni_pid_headroom sni_pid_source sni_curl_certinfo worker launched pending last_jobs=0 sni_launch_abort=0
+    local -a deadlines=()
     local sni_region="${CLI_SNI_REGION:-all}" sni_categories="${CLI_SNI_CATEGORIES:-all}" sni_hosts="${CLI_SNI_HOSTS:-}"
     local sni_samples="${CLI_SNI_SAMPLES:-3}" sni_timeout="${CLI_SNI_TIMEOUT:-5}" sni_jobs="${CLI_SNI_JOBS:-8}"
     local -a candidates=() matches=() hosts=()
     # Persist in this isolated shell until its EXIT trap runs after function return.
-    sni_work_dir=""; sni_pids=()
+    sni_work_dir=""; sni_pids=(); sni_poll_open=0
     trap cleanup_reality_sni_workers EXIT
     if [ "$NON_INTERACTIVE" = 1 ] && [ -n "${CLI_SNI:-}" ]; then manual_reality_sni; return $?; fi
     if [ "$NON_INTERACTIVE" = 0 ]; then
@@ -1611,46 +1767,101 @@ run_reality_sni_selection() {
         if [ "$scan_rc" = 2 ]; then manual_reality_sni; return $?; fi
         [ "$scan_rc" = 0 ] || return "$scan_rc"
     fi
-    result=$(reality_sni_candidates "$sni_region" "$sni_categories" "$sni_hosts") || return 1
-    [ -n "$result" ] || { printf '[错误] 所选地区与分类没有候选，请调整筛选条件。\n' >&2; return 1; }
-    mapfile -t candidates <<< "$result"
-    if ! ensure_deps openssl curl timeout; then
+    # Check before dependency/candidate subprocesses, then recalculate for every batch.
+    if ! onebox_safe_sni_jobs "$sni_jobs"; then
+        printf '[错误] 剩余进程额度不足，无法安全启动 SNI 检测：%s。请释放资源或显式指定 --sni。\n' "$sni_pid_source" >&2
+        if [ "$NON_INTERACTIVE" = 0 ]; then manual_reality_sni; return $?; fi
+        return 1
+    fi
+    if ! ensure_deps curl setsid mkfifo; then
         if [ "$NON_INTERACTIVE" = 1 ]; then printf '[错误] 无法准备 SNI 检测依赖。\n' >&2; return 1; fi
         printf '[提示] 检测依赖不可用，改为手动输入 SNI。\n' >&2
         manual_reality_sni; return $?
     fi
     sni_work_dir=$(mktemp -d "${TMPDIR:-/tmp}/onebox-sni.XXXXXX") || return 1
-    printf '检测 %s 个候选（地区=%s，分类=%s）：TLS 1.3、X25519、证书主机名、h2 和证书链。\n并发 %s，每站测速 %s 次取最小值，单次超时 %s 秒。\n' \
+    if ! check_reality_sni_curl; then
+        if [ "$NON_INTERACTIVE" = 0 ]; then manual_reality_sni; return $?; fi
+        return 1
+    fi
+    result=$(reality_sni_candidates "$sni_region" "$sni_categories" "$sni_hosts") || return 1
+    [ -n "$result" ] || { printf '[错误] 所选地区与分类没有候选，请调整筛选条件。\n' >&2; return 1; }
+    mapfile -t candidates <<< "$result"
+    mkfifo "$sni_work_dir/poll" || return 1
+    exec 9<>"$sni_work_dir/poll" || return 1
+    sni_poll_open=1
+    # A private worker session makes the parent watchdog independent of the TLS client.
+    {
+        printf '%s\n' '#!/bin/bash' 'set +m' 'marker="$4"; sni_curl_certinfo="$5"' \
+            'trap '\''printf "%s\n" "$?" > "$marker"'\'' EXIT'
+        declare -f valid_host reality_sni_allowed_host probe_reality_sni
+        printf '%s\n' 'probe_reality_sni "$1" "$2" "$3"'
+    } > "$sni_work_dir/worker.sh" || return 1
+    set +m
+    printf '检测 %s 个候选（地区=%s，分类=%s）：TLS 1.3、X25519、证书主机名、h2 和证书链。\n并发上限 %s，每站测速 %s 次取最小值，单次超时 %s 秒。\n' \
         "${#candidates[@]}" "$sni_region" "$sni_categories" "$sni_jobs" "$sni_samples" "$sni_timeout" >&2
     while [ "$batch_start" -lt "${#candidates[@]}" ]; do
-        sni_pids=()
-        for ((slot=0; slot<sni_jobs && batch_start+slot<${#candidates[@]}; slot++)); do
-            position=$((batch_start+slot))
-            (
-                trap - EXIT
-                trap 'exit 130' INT
-                trap 'exit 143' TERM
-                probe_reality_sni "${candidates[position]}" "$sni_samples" "$sni_timeout"
-            ) >"$sni_work_dir/result-$position" 2>/dev/null < /dev/null &
-            sni_pids+=("$!")
-        done
-        for ((slot=0; slot<${#sni_pids[@]}; slot++)); do
-            position=$((batch_start+slot)); host="${candidates[position]}"
-            probe_rc=0
-            wait "${sni_pids[slot]}" || probe_rc=$?
-            sni_pids[slot]=""
-            completed=$((completed+1))
-            score=""; chain=""
-            IFS=$'\t' read -r score chain < "$sni_work_dir/result-$position" || :
-            if [ "$probe_rc" = 0 ] && [[ "$score" =~ ^[0-9]+$ && "$chain" =~ ^[1-9][0-9]*$ ]]; then
-                tier=0; [ "$chain" -le 3 ] || tier=1
-                matches+=("$tier"$'\t'"$score"$'\t'"$chain"$'\t'"$host")
-                printf ' [%s/%s] %s：通过（证书链 %s 层）\n' "$completed" "${#candidates[@]}" "$host" "$chain" >&2
-            else
-                printf ' [%s/%s] %s：未通过或超时\n' "$completed" "${#candidates[@]}" "$host" >&2
+        if ! onebox_safe_sni_jobs "$sni_jobs"; then
+            printf '[错误] 剩余进程额度不足，停止扫描：%s。请释放资源或显式指定 --sni。\n' "$sni_pid_source" >&2
+            return 1
+        fi
+        if [ "$sni_effective_jobs" != "$last_jobs" ]; then
+            if [ "$sni_effective_jobs" -lt "$sni_jobs" ]; then
+                printf '[提示] 根据剩余 PID 额度将并发从 %s 降至 %s：%s；为控制和清理保留余量。\n' "$sni_jobs" "$sni_effective_jobs" "$sni_pid_source" >&2
             fi
+            last_jobs="$sni_effective_jobs"
+        fi
+        sni_pids=(); deadlines=(); sni_launch_abort=0
+        # Defer exit until $! is recorded, so a signal during launch cannot orphan a worker.
+        trap 'sni_launch_abort=130' INT
+        trap 'sni_launch_abort=143' TERM
+        for ((slot=0; slot<sni_effective_jobs && batch_start+slot<${#candidates[@]}; slot++)); do
+            position=$((batch_start+slot))
+            # With job control disabled, setsid execs Bash and $! is also the process group ID.
+            setsid bash "$sni_work_dir/worker.sh" "${candidates[position]}" "$sni_samples" "$sni_timeout" \
+                "$sni_work_dir/done-$position" "$sni_curl_certinfo" \
+                >"$sni_work_dir/result-$position" 2>"$sni_work_dir/error-$position" < /dev/null 9>&- &
+            sni_pids+=("$!")
+            deadlines+=("$((SECONDS+sni_samples*sni_timeout+3))")
+            [ "$sni_launch_abort" = 0 ] || break
         done
-        batch_start=$((batch_start+sni_jobs))
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        [ "$sni_launch_abort" = 0 ] || return "$sni_launch_abort"
+        launched="${#sni_pids[@]}"; pending="$launched"
+        while [ "$pending" -gt 0 ]; do
+            for ((slot=0; slot<launched; slot++)); do
+                worker="${sni_pids[slot]}"; [ -n "$worker" ] || continue
+                position=$((batch_start+slot)); host="${candidates[position]}"; probe_rc=1
+                if [ -s "$sni_work_dir/done-$position" ]; then
+                    read -r probe_rc < "$sni_work_dir/done-$position" || :
+                elif ! kill -0 "$worker" 2>/dev/null; then
+                    probe_rc=1
+                elif [ "$SECONDS" -lt "${deadlines[slot]}" ]; then
+                    continue
+                else
+                    printf ' [超时] %s：父进程终止整组检测任务。\n' "$host" >&2
+                fi
+                stop_reality_sni_worker "$worker" || return 1
+                sni_pids[slot]=''; pending=$((pending-1)); completed=$((completed+1))
+                score=''; chain=''
+                IFS=$'\t' read -r score chain < "$sni_work_dir/result-$position" || :
+                if [ "$probe_rc" = 0 ] && [[ "$score" =~ ^[0-9]+$ && "$chain" =~ ^[0-9]+$ ]]; then
+                    tier=0; [ "$chain" -le 3 ] || tier=1
+                    [ "$chain" != 0 ] || tier=2
+                    matches+=("$tier"$'\t'"$score"$'\t'"$chain"$'\t'"$host")
+                    result="$chain 层"; [ "$chain" != 0 ] || result=未知
+                    printf ' [%s/%s] %s：通过（证书链 %s）\n' "$completed" "${#candidates[@]}" "$host" "$result" >&2
+                else
+                    printf ' [%s/%s] %s：未通过或超时\n' "$completed" "${#candidates[@]}" "$host" >&2
+                    if [ -s "$sni_work_dir/error-$position" ]; then
+                        IFS= read -r result < "$sni_work_dir/error-$position" || :
+                        printf '   %.240s\n' "$result" >&2
+                    fi
+                fi
+            done
+            if [ "$pending" -gt 0 ]; then IFS= read -r -t 0.1 -u 9 _ || :; fi
+        done
+        batch_start=$((batch_start+launched))
     done
     sni_pids=()
     if [ "${#matches[@]}" = 0 ]; then
@@ -1665,7 +1876,8 @@ run_reality_sni_selection() {
     while IFS=$'\t' read -r tier score chain host; do
         hosts+=("$host"); index=$((index+1))
         result="约 $score ms"; [ "$score" != 2147483647 ] || result='耗时未测得'
-        answer='短链'; [ "$tier" = 0 ] || answer='长链备选，需验证兼容性'
+        answer='短链'
+        case "$tier" in 1) answer='长链备选，需验证兼容性' ;; 2) answer='链长度未知，需验证兼容性'; chain='未知' ;; esac
         printf ' %s) %s（%s，链 %s 层，%s）\n' "$index" "$host" "$result" "$chain" "$answer" >&2
     done <<< "$ranked"
     if [ "$NON_INTERACTIVE" = 1 ]; then
@@ -1703,7 +1915,7 @@ resolve_reality_sni() {
     SB_SNI_PID=$!
     wait "$SB_SNI_PID" || rc=$?
     SB_SNI_PID=""
-    sni_resolution_value=$(cat "$selection_file")
+    IFS= read -r sni_resolution_value < "$selection_file" || :
     rm -f -- "$selection_file"
     [ "$rc" = 0 ] || return "$rc"
     reality_sni_allowed_host "$sni_resolution_value" || return 1
@@ -4301,7 +4513,7 @@ Reality SNI 自动检测选项（仅 add --protocol reality）:
                                默认 all；与地区筛选取交集，地区包含全球通用站
   --sni-hosts 'HOST URL ...'    自定义列表替代内置列表，空格/逗号分隔
                                不与地区/分类筛选混用；排除 Apple 旗下域名
-  --sni-jobs 1..16             并发数，默认 8
+  --sni-jobs 1..16             并发上限，默认 8；按剩余 PID 额度自动下调
   --sni-samples 1..5           每站测速次数，默认 3，取最小值
   --sni-timeout 1..15          每次请求超时秒数，默认 5
                                短证书链优先、同组按耗时排名；--sni 跳过检测
