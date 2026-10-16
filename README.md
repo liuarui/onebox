@@ -4,7 +4,7 @@
 
 本项目仅供学习与技术研究，请在获得授权的服务器和网络环境中使用。使用者应遵守所在地适用的法律法规，不得用于违法或未经授权的活动，并自行评估和承担使用产生的风险。本项目按 [LICENSE](LICENSE) 原样提供，不提供任何明示或默示担保；作者及贡献者在适用法律允许的范围内不对使用本项目造成的损失承担责任。
 
-以 root 运行。指定命令后自动进入无交互模式，也可附加 `--non-interactive`（`-n`）。脚本启动后会通过系统包管理器安装缺失依赖；下载到文件后用 `sh install.sh` 执行，还可自动安装 Bash。
+以 root 运行。指定命令后自动进入无交互模式，也可附加 `--non-interactive`（`-n`）。安装等操作会通过系统包管理器安装缺失依赖；下载到文件后用 `sh install.sh` 执行，还可自动安装 Bash。`status`、`doctor`、`logs` 为只读查看，缺少所需工具时会提示，不会安装依赖。
 
 支持使用 apt、apk、dnf/yum、zypper、pacman 的 Debian/Ubuntu、Alpine、RHEL/Rocky/AlmaLinux/Fedora、openSUSE、Arch 等常见 Linux。需要**正在运行的 systemd 或 OpenRC**；无 init 的 Docker/WSL、其他 init、未知包管理器或架构会报错退出。支持 x86_64、ARM64、x86、ARMv6/v7、riscv64、s390x、ppc64le；具体版本必须提供对应官方发行包，Argo 仅支持前五类架构。Alpine 优先使用官方 musl 包。
 
@@ -83,7 +83,7 @@ onebox add --protocol shadowsocks --tag ss-1 --port 11443 --method aes-128-gcm
 
 Shadowsocks 支持 `aes-128-gcm`、`aes-256-gcm`、`chacha20-ietf-poly1305`、`2022-blake3-aes-128-gcm`、`2022-blake3-aes-256-gcm`、`2022-blake3-chacha20-poly1305`。2022 方法不指定密码时自动生成所需长度的 Base64 密钥。
 
-自动放行仅处理本机已识别的防火墙，云安全组需要自行配置；裸 iptables 未配置持久化时，新增规则仅在当前运行期生效。
+自动放行仅处理本机已识别的防火墙，云安全组需要自行配置；裸 iptables 未配置持久化时，新增规则仅在当前运行期生效。firewalld 新规则会分别写入并核验永久与运行时状态，不会全局 reload；已有永久规则会补齐当前放行，已有临时规则则复用并提示自行持久化，卸载时保留这些已有规则。
 
 ## 证书
 
@@ -132,6 +132,11 @@ onebox links
 onebox links --tag reality-1 --address 203.0.113.10
 onebox check
 onebox status
+onebox doctor
+onebox logs                            # systemd 服务最近 80 行日志
+onebox logs --lines 200
+onebox logs --tag argo-1               # 已登记的 cloudflared 隧道
+onebox logs --source install          # 最近安装步骤日志（执行中或失败保留）
 onebox start
 onebox stop
 onebox restart
@@ -145,6 +150,10 @@ onebox --help
 ```
 
 `update-script` 从本仓库的 `main` 分支下载。`install` 重复运行会保留现有节点；指定版本不会替换已安装内核，替换请使用 `update --version`。
+
+`doctor` 汇总程序是否可运行、配置 JSON、主服务和登记隧道的状态，以及配置中引用的 onebox 证书有效期；7 天内到期会提醒。发现异常或缺少检查工具时返回 `1`，不会联网修复或安装依赖。内核完整配置校验仍使用 `onebox check`。`status` 会区分 `not-installed`、`inactive`/`stopped`、`failed`、`active` 等状态。
+
+`logs` 默认查看 systemd journal，`--lines` 范围为 `1–1000`。OpenRC 当前未配置服务运行日志落盘，查看运行日志会提示并返回 `3`；两种服务管理器都可用 `--source install` 查看最近安装步骤日志。成功步骤的日志会删除；安装进行时可能显示当前步骤，安装结束后保留的是失败步骤。日志可能包含网络地址等信息，分享前请检查内容。
 
 ## 卸载与清理
 

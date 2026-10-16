@@ -7,6 +7,16 @@ if [ -z "${BASH_VERSION:-}" ]; then
         case "${1:-}" in
             -h|--help|help) printf '%s\n' '用法: sh install.sh [install|add|delete|list|links|status|check|start|stop|restart|update|cert|outbound|bbr|uninstall] [选项]' '运行命令时会自动安装 Bash；完整参数说明见 README.md。'; exit 0 ;;
         esac
+        bootstrap_skip_value=0
+        for bootstrap_arg do
+            if [ "$bootstrap_skip_value" = 1 ]; then bootstrap_skip_value=0; continue; fi
+            case "$bootstrap_arg" in
+                doctor|status|logs) echo '[错误] 只读查看需要 Bash 4 或更高版本，请先自行安装 Bash。' >&2; exit 3 ;;
+                --protocol|--tag|--port|--uuid|--password|--password-file|--tunnel-token-file|--cf-token-file|--cert|--method|--sni|--domain|--version|--validation|--address|--edge|--strategy|--firewall|--lines|--source) bootstrap_skip_value=1 ;;
+                -*) ;;
+                *) break ;;
+            esac
+        done
         [ "$(uname -s)" = Linux ] || { echo '[错误] 仅支持 Linux。' >&2; exit 3; }
         [ "$(id -u)" = 0 ] || { echo '[错误] 安装 Bash 需要 root，请使用 sudo sh install.sh ...。' >&2; exit 3; }
         [ -f "$0" ] || { echo '[错误] 请先将脚本下载到文件，再用 sh install.sh 执行。' >&2; exit 2; }
@@ -603,6 +613,18 @@ cleanup_node_secrets() {
     return 0
 }
 
+record_fw_port() {
+    local port="$1" proto="$2" tmp_fw
+    tmp_fw=$(mktemp "${FW_PORTS_FILE}.tmp.XXXXXX") || return 1
+    SB_OWNED_TEMP_FILES+=("$tmp_fw")
+    if ! ( if [ -f "$FW_PORTS_FILE" ]; then cat "$FW_PORTS_FILE" || return 1; fi; printf '%s/%s\n' "$port" "$proto" ) > "$tmp_fw"; then
+        rm -f "$tmp_fw"; return 1
+    fi
+    if sort -u -o "$tmp_fw" "$tmp_fw" && chmod 600 "$tmp_fw" && mv -f "$tmp_fw" "$FW_PORTS_FILE"; then return 0; fi
+    rm -f "$tmp_fw"
+    return 1
+}
+
 open_fw_port() {
     local port=$1
     local proto=$2
@@ -622,10 +644,29 @@ open_fw_port() {
         fi
     elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
         fw_found=1
-        if firewall-cmd --query-port="${port}"/"${proto}" --permanent >/dev/null 2>&1 ||
-           firewall-cmd --query-port="${port}"/"${proto}" >/dev/null 2>&1; then return 0; fi
-        if firewall-cmd --add-port="${port}"/"${proto}" --permanent >/dev/null 2>&1 &&
-           firewall-cmd --reload >/dev/null 2>&1; then success=1; fi
+        local permanent_rc=0 runtime_rc=0
+        firewall-cmd --query-port="$port/$proto" --permanent >/dev/null 2>&1 || permanent_rc=$?
+        firewall-cmd --query-port="$port/$proto" >/dev/null 2>&1 || runtime_rc=$?
+        [ "$permanent_rc" -le 1 ] && [ "$runtime_rc" -le 1 ] || return 1
+        if [ "$permanent_rc" = 0 ]; then
+            # Keep pre-existing administrator rules; activate the saved rule
+            # directly without reloading unrelated firewalld runtime changes.
+            if [ "$runtime_rc" != 0 ]; then
+                firewall-cmd --add-port="$port/$proto" >/dev/null 2>&1 || return 1
+                firewall-cmd --query-port="$port/$proto" >/dev/null 2>&1 || return 1
+            fi
+            return 0
+        elif [ "$runtime_rc" = 0 ]; then
+            printf '[提示] 复用现有 firewalld 临时规则 %s/%s；重载或重启后可能失效，请自行持久化。\n' "$port" "$proto" >&2
+            return 0
+        fi
+        # Record ownership before changing either scope so partial failures
+        # remain recoverable by uninstall. Both scopes were absent above.
+        record_fw_port "$port" "$proto" || return 1
+        if firewall-cmd --add-port="$port/$proto" --permanent >/dev/null 2>&1 &&
+           firewall-cmd --add-port="$port/$proto" >/dev/null 2>&1 &&
+           firewall-cmd --query-port="$port/$proto" --permanent >/dev/null 2>&1 &&
+           firewall-cmd --query-port="$port/$proto" >/dev/null 2>&1; then success=1; fi
     elif command -v iptables >/dev/null 2>&1; then
         fw_found=1
         success=1
@@ -645,15 +686,7 @@ open_fw_port() {
     fi
 
     if [ "$fw_found" -eq 1 ] && [ "$success" -eq 1 ]; then
-        local tmp_fw
-        tmp_fw=$(mktemp "${FW_PORTS_FILE}.tmp.XXXXXX") || return 1
-        SB_OWNED_TEMP_FILES+=("$tmp_fw")
-        if ! ( if [ -f "$FW_PORTS_FILE" ]; then cat "$FW_PORTS_FILE" || return 1; fi; printf '%s/%s\n' "$port" "$proto" ) > "$tmp_fw"; then
-            rm -f "$tmp_fw"; return 1
-        fi
-        if ! sort -u -o "$tmp_fw" "$tmp_fw" || ! chmod 600 "$tmp_fw" || ! mv -f "$tmp_fw" "$FW_PORTS_FILE"; then
-            rm -f "$tmp_fw"; return 1
-        fi
+        record_fw_port "$port" "$proto" || return 1
         echo -e "${GREEN}[完成] 放行端口 ${port}/${proto} 成功${PLAIN}" >&2
     elif [ "$fw_found" -eq 0 ]; then
         echo -e "${YELLOW}[提示] 未检测到系统内置防火墙工具，请确保云服务商后台和本机系统放行了 ${port} 端口！${PLAIN}" >&2
@@ -684,10 +717,21 @@ close_fw_port() {
             printf '[提示] 未确认 ufw 规则归属，保留 %s/%s。\n' "$port" "$proto" >&2
         fi
     elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-        if firewall-cmd --query-port="${port}"/"${proto}" --permanent >/dev/null 2>&1; then
-            firewall-cmd --remove-port="${port}"/"${proto}" --permanent >/dev/null 2>&1 &&
-            firewall-cmd --reload >/dev/null 2>&1 || return 1
-        fi
+        local scope query_rc
+        for scope in permanent runtime; do
+            local -a scope_args=()
+            [ "$scope" != permanent ] || scope_args+=(--permanent)
+            query_rc=0
+            firewall-cmd --query-port="$port/$proto" "${scope_args[@]}" >/dev/null 2>&1 || query_rc=$?
+            case "$query_rc" in
+                0) firewall-cmd --remove-port="$port/$proto" "${scope_args[@]}" >/dev/null 2>&1 || return 1 ;;
+                1) ;;
+                *) return 1 ;;
+            esac
+            query_rc=0
+            firewall-cmd --query-port="$port/$proto" "${scope_args[@]}" >/dev/null 2>&1 || query_rc=$?
+            [ "$query_rc" = 1 ] || return 1
+        done
     elif command -v iptables >/dev/null 2>&1; then
         while iptables -C INPUT -p "${proto}" --dport "${port}" -m comment --comment "onebox" -j ACCEPT >/dev/null 2>&1; do
             iptables -D INPUT -p "${proto}" --dport "${port}" -m comment --comment "onebox" -j ACCEPT >/dev/null 2>&1 || return 1
@@ -2710,9 +2754,11 @@ run_manage() {
         echo -e " 1) 启动"
         echo -e " 2) 停止"
         echo -e " 3) 重启"
+        echo -e " 4) 只读体检"
+        echo -e " 5) 查看最近服务日志"
         echo -e " 0) 返回\n"
         while true; do
-            ask "请选择 [0-3]: " run_idx
+            ask "请选择 [0-5]: " run_idx
             case "$run_idx" in
                 1|3)
                    if [ "$run_idx" = 1 ] && service_is_active; then
@@ -2737,6 +2783,8 @@ run_manage() {
                        printf '%s\n' '停止服务失败，请检查服务状态。' >&2
                    fi
                    pause; break ;;
+                4) cli_doctor; pause; break ;;
+                5) CLI_LOG_SOURCE=service CLI_LINES=80 CLI_TAG="" cli_logs; pause; break ;;
                 0) return ;;
                 *) echo -e "${RED}[错误] 输入错误!${PLAIN}" ;;
             esac
@@ -3303,12 +3351,7 @@ menu() {
 
     while true; do
         ui_clear
-        if [ "$SERVICE_MANAGER" == openrc ]; then
-            SB_STATUS=$(rc-service onebox status 2>/dev/null | grep -o 'started')
-            [ "$SB_STATUS" == "started" ] && SB_STATUS="active" || SB_STATUS="stopped"
-        else
-            SB_STATUS=$(systemctl is-active onebox 2>/dev/null)
-        fi
+        SB_STATUS=$(managed_service_state onebox)
         [ "$SB_STATUS" == "active" ] && ST_COLOR=$GREEN || ST_COLOR=$RED
 
         VER=$( ( /usr/local/lib/onebox/sing-box version ) 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
@@ -3322,6 +3365,7 @@ menu() {
 
         echo -e "------------- onebox 管理脚本 -------------"
         printf '%s\n' '仅供学习与技术研究，请遵守适用法律法规，在获得授权的环境中使用。'
+        printf '系统: Linux %s | 包管理: %s | 服务管理: %s\n' "$ARCH" "$PACKAGE_MANAGER" "$SERVICE_MANAGER"
         echo -e "sing-box ${VER_SHOW}: ${ST_COLOR}${SB_STATUS}${PLAIN}\n"
         echo -e " 1) 添加节点"
         echo -e " 2) 更改节点"
@@ -3341,7 +3385,7 @@ menu() {
             3) require_config && del_config ;;
             4) require_config && view_config ;;
             5) mkdir -p "$CONFIG_DIR" "$CERT_DIR" && chmod 700 "$CONFIG_DIR" "$CERT_DIR" && cert_manage ;;
-            6) require_config && run_manage ;;
+            6) run_manage ;;
             7) init_base && update_manage ;;
             8) require_config && other_manage ;;
             9)
@@ -3712,6 +3756,8 @@ onebox 仅供学习与技术研究，请遵守适用法律法规，在获得授�
   delete           删除节点，需要 --tag NAME --yes
   list | links     节点列表 / 分享链接（--tag 可筛选）
   status | check   服务状态 / 配置检查
+  doctor           只读体检：程序、配置 JSON、服务、隧道和证书
+  logs             最近 80 行服务日志（systemd），--source install 查看安装步骤日志
   start | stop | restart
   update           更新 sing-box 内核（--version latest 或 x.y.z）
   update-script    从项目 GitHub main 分支更新管理脚本
@@ -3736,6 +3782,7 @@ argo 选项:
   --cf-token-file PATH（或环境变量 CF_Token；也支持 CF_Key + CF_Email）
   --validation http 必须同时指定 --http01-ready
 通用: --non-interactive/-n、--yes/-y、--help/-h
+日志: --lines 1..1000、--source service|install；--tag NAME 查看已登记隧道
 卸载: --keep-bbr 可保留网络参数和恢复记录
 退出码: 0 成功；1 操作失败/服务未运行；2 参数错误；3 环境不支持；75 另一个操作正在运行
 EOF
@@ -3747,6 +3794,7 @@ parse_cli() {
     CLI_CERT=self CLI_METHOD=aes-128-gcm CLI_SNI="" CLI_DOMAIN=""
     CLI_VERSION=latest CLI_VALIDATION=dns CLI_HTTP01_READY=0 CLI_ADDRESS=""
     CLI_FIREWALL=y CLI_EDGE=saas.sin.fan CLI_STRATEGY="" CLI_RESTORE_BBR=1
+    CLI_LINES=80 CLI_LOG_SOURCE=service
     local option value
     local -a used_options=()
     while [ "$#" -gt 0 ]; do
@@ -3757,7 +3805,7 @@ parse_cli() {
             -y|--yes) ASSUME_YES=1 ;;
             --http01-ready) CLI_HTTP01_READY=1; used_options+=("$option") ;;
             --keep-bbr) CLI_RESTORE_BBR=0; used_options+=("$option") ;;
-            --protocol|--tag|--port|--uuid|--password|--password-file|--tunnel-token-file|--cf-token-file|--cert|--method|--sni|--domain|--version|--validation|--address|--edge|--strategy|--firewall)
+            --protocol|--tag|--port|--uuid|--password|--password-file|--tunnel-token-file|--cf-token-file|--cert|--method|--sni|--domain|--version|--validation|--address|--edge|--strategy|--firewall|--lines|--source)
                 [ "$#" -gt 0 ] && [[ "$1" != --* ]] || die "选项 $option 缺少值。" 2
                 value="$1"; shift
                 [ -n "$value" ] || die "选项 $option 不能为空。" 2
@@ -3780,6 +3828,8 @@ parse_cli() {
                     --address) CLI_ADDRESS="$value" ;;
                     --edge) CLI_EDGE="$value" ;;
                     --strategy) CLI_STRATEGY="$value" ;;
+                    --lines) CLI_LINES="$value" ;;
+                    --source) CLI_LOG_SOURCE="$value" ;;
                     --firewall) case "$value" in auto) CLI_FIREWALL=y ;; skip) CLI_FIREWALL=n ;; *) die '--firewall 只能是 auto 或 skip。' 2 ;; esac ;;
                 esac ;;
             -*) die "未知选项：$option" 2 ;;
@@ -3799,15 +3849,19 @@ parse_cli() {
         [ "$NON_INTERACTIVE" = 0 ] && [ -t 0 ] || die '交互菜单需要终端；无交互默认安装请使用 onebox -n。' 2
     fi
     [ "$CLI_COMMAND" = menu ] || NON_INTERACTIVE=1
-    case "$CLI_COMMAND" in install|add|delete|list|links|status|check|start|stop|restart|update|update-script|cert|outbound|bbr|uninstall|menu) ;; *) die "未知命令：$CLI_COMMAND（使用 --help 查看用法）。" 2 ;; esac
+    case "$CLI_COMMAND" in install|add|delete|list|links|status|check|doctor|logs|start|stop|restart|update|update-script|cert|outbound|bbr|uninstall|menu) ;; *) die "未知命令：$CLI_COMMAND（使用 --help 查看用法）。" 2 ;; esac
     # Reject irrelevant options rather than silently ignoring a typo in automation.
     for option in "${used_options[@]}"; do
         case "$CLI_COMMAND:$option" in
             add:--protocol|add:--tag|add:--port|add:--uuid|add:--password|add:--password-file|add:--tunnel-token-file|add:--cf-token-file|add:--cert|add:--method|add:--sni|add:--domain|add:--version|add:--validation|add:--address|add:--edge|add:--http01-ready|add:--firewall|install:--version|update:--version|delete:--tag|list:--tag|links:--tag|links:--address|cert:--cert|cert:--sni|cert:--domain|cert:--validation|cert:--cf-token-file|cert:--http01-ready|outbound:--strategy|uninstall:--keep-bbr) ;;
+            logs:--lines|logs:--source|logs:--tag) ;;
             *) die "命令 $CLI_COMMAND 不接受选项 $option。" 2 ;;
         esac
     done
     [ -z "$CLI_TAG" ] || [[ "$CLI_TAG" =~ ^[A-Za-z0-9_-]+$ ]] || die '节点名称只能包含字母、数字、短横线和下划线。' 2
+    [[ "$CLI_LINES" =~ ^[1-9][0-9]{0,3}$ ]] && [ "$CLI_LINES" -le 1000 ] || die '--lines 必须为 1–1000 的整数。' 2
+    case "$CLI_LOG_SOURCE" in service|install) ;; *) die '--source 只能为 service 或 install。' 2 ;; esac
+    [ "$CLI_LOG_SOURCE" != install ] || [ -z "$CLI_TAG" ] || die '--source install 不支持 --tag。' 2
     [ -z "$CLI_PORT" ] || { [[ "$CLI_PORT" =~ ^[1-9][0-9]{0,4}$ ]] && [ "$CLI_PORT" -le 65535 ]; } || die '端口必须为 1–65535 的整数。' 2
     [ -z "$CLI_UUID" ] || [[ "$CLI_UUID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || die 'UUID 格式错误。' 2
     [[ "$CLI_PASSWORD" != *$'\n'* && "$CLI_PASSWORD" != *$'\r'* ]] || die '密码不能包含换行。' 2
@@ -3875,6 +3929,123 @@ cli_outbound() {
     restart_service && commit_config
 }
 
+managed_service_state() {
+    local svc="$1" state rc=0
+    [[ "$svc" == onebox || "$svc" =~ ^cloudflared-[A-Za-z0-9_-]+$ ]] || return 1
+    if [ "$SERVICE_MANAGER" = openrc ]; then
+        if [ ! -e "/etc/init.d/$svc" ] && [ ! -L "/etc/init.d/$svc" ]; then
+            printf 'not-installed\n'; return 0
+        fi
+        rc-service "$svc" status >/dev/null 2>&1 || rc=$?
+        case "$rc" in 0) state=active ;; 3) state=stopped ;; *) state=failed ;; esac
+    else
+        state=$(systemctl show "$svc" -p LoadState --value 2>/dev/null) || state=unknown
+        case "$state" in
+            not-found) printf 'not-installed\n'; return 0 ;;
+            masked) printf 'masked\n'; return 0 ;;
+            loaded) state=$(systemctl show "$svc" -p ActiveState --value 2>/dev/null) || state=unknown ;;
+            *) state=unknown ;;
+        esac
+        case "$state" in active|inactive|failed|activating|deactivating|reloading) ;; *) state=unknown ;; esac
+    fi
+    printf '%s\n' "$state"
+}
+
+cli_status() {
+    local state rc=0
+    printf 'system: Linux %s; package-manager: %s; init: %s\n' "$ARCH" "$PACKAGE_MANAGER" "$SERVICE_MANAGER"
+    if kernel_ok; then
+        /usr/local/lib/onebox/sing-box version | head -n 1
+    elif [ -e /usr/local/lib/onebox/sing-box ]; then
+        printf 'sing-box: 无法运行\n'; rc=1
+    else
+        printf 'sing-box: 未安装\n'; rc=1
+    fi
+    if [ -r "$CONFIG_FILE" ]; then printf 'config: present\n'
+    else printf 'config: missing-or-unreadable\n'; rc=1; fi
+    state=$(managed_service_state onebox)
+    printf 'service: %s\n' "$state"
+    [ "$state" = active ] || rc=1
+    return "$rc"
+}
+
+cli_doctor() {
+    local rc=0 count certs cert days svc state
+    local -a registered=()
+    printf 'onebox 只读体检（不会安装依赖、下载脚本或更改服务）\n'
+    cli_status || rc=1
+    if ! command -v jq >/dev/null 2>&1; then
+        printf '[待检查] 缺少 jq，无法检查配置 JSON 及引用证书；请安装 jq 后重试。\n'
+        rc=1
+    elif [ ! -r "$CONFIG_FILE" ] ||
+         ! count=$(jq -er 'if type == "object" and (.inbounds | type) == "array" then (.inbounds | length) else error("invalid inbounds") end' "$CONFIG_FILE" 2>/dev/null); then
+        printf '[异常] 配置 JSON 不可读或缺少 inbounds 数组。\n'
+        rc=1
+    else
+        printf '[正常] 配置 JSON，节点数: %s；内核配置校验请执行 onebox check。\n' "$count"
+        certs=$(jq -r --arg prefix "$CERT_DIR/" '[.inbounds[]?.tls.certificate_path? | select(type == "string") | select(startswith($prefix))] | unique[]' "$CONFIG_FILE" 2>/dev/null) || rc=1
+        if [ -n "$certs" ]; then
+            while IFS= read -r cert; do
+                if ! command -v openssl >/dev/null 2>&1; then
+                    printf '[待检查] 缺少 openssl，无法检查证书。\n'; rc=1; break
+                elif ! openssl x509 -in "$cert" -noout -checkend 0 >/dev/null 2>&1; then
+                    printf '[异常] 证书缺失、不可读或已过期: %s\n' "$cert"; rc=1
+                elif ! openssl x509 -in "$cert" -noout -checkend 604800 >/dev/null 2>&1; then
+                    printf '[提醒] 证书将在 7 天内过期: %s\n' "$cert"; rc=1
+                elif days=$(cert_remaining_days "$cert"); then
+                    printf '[正常] 证书剩余 %s 天: %s\n' "$days" "$cert"
+                else
+                    printf '[正常] 证书有效且超过 7 天: %s\n' "$cert"
+                fi
+            done <<< "$certs"
+        fi
+    fi
+    if ! load_secrets; then
+        printf '[异常] 无法读取隧道服务登记记录。\n'; rc=1
+    else
+        IFS=',' read -r -a registered <<< "${ARGO_SERVICES:-}"
+        for svc in "${registered[@]}"; do
+            [ -n "$svc" ] || continue
+            if [[ ! "$svc" =~ ^cloudflared-[A-Za-z0-9_-]+$ ]]; then
+                printf '[异常] 隧道服务登记记录格式错误。\n'; rc=1; continue
+            fi
+            state=$(managed_service_state "$svc")
+            printf 'tunnel %s: %s\n' "$svc" "$state"
+            [ "$state" = active ] || rc=1
+        done
+    fi
+    [ "$rc" = 0 ] || printf '[提示] 服务异常可执行 onebox logs；安装排障可执行 onebox logs --source install。\n'
+    return "$rc"
+}
+
+cli_logs() {
+    local svc=onebox file latest=""
+    if [ "$CLI_LOG_SOURCE" = install ]; then
+        for file in /var/log/onebox/step.*; do
+            [ -f "$file" ] && [ ! -L "$file" ] || continue
+            if [ -z "$latest" ] || [ "$file" -nt "$latest" ]; then latest="$file"; fi
+        done
+        [ -n "$latest" ] || { printf '[提示] 没有安装步骤日志。\n' >&2; return 1; }
+        printf '安装步骤日志（执行中或失败保留）: %s\n' "$latest"
+        tail -n "$CLI_LINES" -- "$latest"
+        return $?
+    fi
+    if [ -n "$CLI_TAG" ]; then
+        load_secrets || return 1
+        svc="cloudflared-$CLI_TAG"
+        case ",${ARGO_SERVICES:-}," in
+            *",$svc,"*) ;;
+            *) printf '[错误] 未登记此隧道服务: %s\n' "$CLI_TAG" >&2; return 1 ;;
+        esac
+    fi
+    if [ "$SERVICE_MANAGER" = openrc ]; then
+        printf '[提示] 当前 OpenRC 服务未配置运行日志落盘；可查看 onebox doctor 或 onebox logs --source install。\n' >&2
+        return 3
+    fi
+    command -v journalctl >/dev/null 2>&1 || { printf '[错误] 缺少 journalctl。\n' >&2; return 1; }
+    journalctl -u "$svc.service" --no-pager -n "$CLI_LINES"
+}
+
 cli_dispatch() {
     local version tag ip tags rc=0
     case "$CLI_COMMAND" in
@@ -3895,9 +4066,9 @@ cli_dispatch() {
             init_base || return 1
             fetch_script "$ONEBOX_SELF" || return 1
             add_config ;;
-        status)
-            if kernel_ok; then /usr/local/lib/onebox/sing-box version | head -n 1; else printf 'sing-box: 未安装\n'; fi
-            if service_is_active; then printf 'service: active\n'; else printf 'service: stopped\n'; return 1; fi ;;
+        status) cli_status ;;
+        doctor) cli_doctor ;;
+        logs) cli_logs ;;
         uninstall) ensure_deps jq sha256sum || return 1; uninstall_all ;;
         update-script) fetch_script && printf '[完成] 管理脚本已更新。\n' ;;
         bbr) ensure_deps sysctl modprobe || return 1; enable_bbr ;;
@@ -3942,6 +4113,11 @@ main() {
     parse_cli "$@"
     if [ "$CLI_COMMAND" = help ]; then cli_help; return 0; fi
     detect_environment
+    # Read-only inspection also works from a streamed script without fetching
+    # another copy, creating a lock or bootstrapping missing dependencies.
+    case "$CLI_COMMAND" in
+        status|doctor|logs) cli_dispatch; return $? ;;
+    esac
     trap cleanup_on_exit EXIT
     trap cleanup_on_interrupt INT
     trap 'exit 143' TERM
