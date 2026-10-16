@@ -33,7 +33,7 @@ sh install.sh menu
 
 ## 无交互安装
 
-适合自动化部署。默认 VLESS + Reality、TCP 443，自动生成 UUID、Reality 密钥和分享链接，伪装域名为 `apple.com`：
+适合自动化部署。默认 VLESS + Reality、TCP 443，自动生成 UUID、Reality 密钥和分享链接；自动检测 SNI 并选择排名第一的候选：
 
 ```bash
 bash <(curl -fsSL "https://raw.githubusercontent.com/liuarui/onebox/main/install.sh") add --protocol reality --port 443 --non-interactive
@@ -64,6 +64,12 @@ sh install.sh install --version 1.14.3
 
 安装完成后使用 `onebox <命令>`。再次直接执行 `onebox` 可进入交互菜单，其中包含卸载选项。
 
+交互式添加 `VLESS-REALITY` 时，会询问“是否自动检测并推荐 SNI”。选择 `y` 会从当前服务器检测 6 个内置候选的 TLS 1.3、X25519、证书主机名及 HTTP/2（h2），再按建立 TLS 连接的耗时排序，供你选用；选择 `n` 或结果中的 `0` 可手动输入。请求均有超时，未找到候选时回到手动输入，所需依赖自动安装。
+
+无交互模式省略 `--sni` 时自动检测并选择第一名，不等待输入；全部检测失败则报错退出并恢复本次配置事务。显式指定 `--sni apple.com` 等域名可跳过自动检测。
+
+检测思路参考 [Reality-SNI-Check](https://github.com/chnnic/Reality-SNI-Check)，由 onebox 内置实现。结果只代表服务器当前的可达性和 TLS 特性，不能保证所有客户端网络可用；h2 是自动推荐的筛选条件。
+
 ## 添加节点
 
 以下命令一次添加一个节点，完成后退出。`add` 也会自动安装内核、依赖和固定入口。已有同名节点或端口冲突时返回失败。
@@ -85,7 +91,7 @@ onebox add --protocol shadowsocks --tag ss-1 --port 11443 --method aes-128-gcm
 | `--uuid UUID` | Reality、TUIC、Argo 的 UUID；省略则随机生成 |
 | `--password-file PATH` | 从单行文件读取密码；也支持 `SB_PASSWORD` 环境变量和 `--password VALUE` |
 | `--cert self\|real` | Hysteria2/TUIC/AnyTLS 使用的证书；默认 `self` |
-| `--sni DOMAIN` | Reality 伪装域名默认 `apple.com`；新自签证书域名默认 `bing.com` |
+| `--sni DOMAIN` | 指定 Reality 伪装域名并跳过自动检测；省略时检测并选择第一名；新自签证书域名默认 `bing.com` |
 | `--address HOST_OR_IP` | 分享链接中的服务器地址；省略则查询公网 IP，IPv6 不加方括号 |
 | `--firewall auto\|skip` | 默认 `auto`，使用已有 ufw/firewalld/iptables 放行；`skip` 跳过 |
 | `--version VERSION` | 内核未安装时选择的版本；已有内核用 `update` 更新 |
@@ -177,6 +183,8 @@ onebox --help
 `update-script` 从本仓库的 `main` 分支下载。`install` 重复运行会保留现有节点；指定版本不会替换已安装内核，替换请使用 `update --version`。
 
 `doctor` 汇总程序是否可运行、配置 JSON、主服务和登记隧道的状态，以及配置中引用的 onebox 证书有效期；7 天内到期会提醒。发现异常或缺少检查工具时返回 `1`，不会联网修复或安装依赖。内核完整配置校验仍使用 `onebox check`。`status` 会区分 `not-installed`、`inactive`/`stopped`、`failed`、`active` 等状态。
+
+“查看节点”子菜单直接打开，不会先安装依赖。生成需要公网 IP 的链接时，会显示查询提示并限制单次请求时间；查询失败仍可查看节点参数，也可执行 `onebox links --address 你的公网IP`。Argo 和使用真实证书域名的节点无需查询公网 IP。
 
 `logs` 默认查看 systemd journal，`--lines` 范围为 `1–1000`。OpenRC 当前未配置服务运行日志落盘，查看运行日志会提示并返回 `3`；两种服务管理器都可用 `--source install` 查看最近安装步骤日志。成功步骤的日志会删除；安装进行时可能显示当前步骤，安装结束后保留的是失败步骤。日志可能包含网络地址等信息，分享前请检查内容。
 

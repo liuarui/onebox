@@ -212,6 +212,22 @@ pause() {
     ask "按回车键继续..." _PAUSE_DUMMY
 }
 
+lookup_public_ip_endpoint() {
+    # Viewing a node must not inherit wget retries or wait on a failing proxy.
+    # Prefer one downloader per endpoint and keep the entire request bounded.
+    if command -v curl >/dev/null 2>&1; then
+        if command -v timeout >/dev/null 2>&1; then
+            timeout -k 1 3 curl -q --noproxy '*' -fsS --connect-timeout 1 --max-time 2 --retry 0 "$1" 2>/dev/null
+        else
+            curl -q --noproxy '*' -fsS --connect-timeout 1 --max-time 2 --retry 0 "$1" 2>/dev/null
+        fi
+    elif command -v timeout >/dev/null 2>&1 && command -v wget >/dev/null 2>&1; then
+        timeout -k 1 3 wget -T 2 -qO - "$1" 2>/dev/null
+    else
+        return 1
+    fi
+}
+
 get_ip() {
     if [ -n "${CLI_ADDRESS:-}" ]; then printf '%s\n' "$CLI_ADDRESS"; return 0; fi
     if [ -z "$GLOBAL_IP" ]; then
@@ -222,7 +238,9 @@ get_ip() {
             local c_time c_ip
             c_time=$(head -n 1 "$IP_CACHE" 2>/dev/null)
             c_ip=$(tail -n 1 "$IP_CACHE" 2>/dev/null)
-            if [[ "$c_time" =~ ^[0-9]+$ ]] && [ $(( $(date +%s) - c_time )) -le $IP_TTL ] && [ -n "$c_ip" ]; then
+            if [[ "$c_time" =~ ^[0-9]+$ ]] && [ "$c_time" -le "$(date +%s)" ] &&
+               [ $(( $(date +%s) - c_time )) -le $IP_TTL ] &&
+               { [[ "$c_ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || [[ "$c_ip" == *:* && "$c_ip" =~ ^[0-9a-fA-F:]+$ ]]; }; then
                 GLOBAL_IP="$c_ip"
                 echo "$GLOBAL_IP"
                 return
@@ -230,11 +248,12 @@ get_ip() {
         fi
 
         local ip
-        ip=$(http_get https://ipv4.icanhazip.com)
+        printf '[信息] 正在查询公网地址（超时后可用 onebox links --address 手动指定）...\n' >&2
+        ip=$(lookup_public_ip_endpoint https://ipv4.icanhazip.com)
         if [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
             GLOBAL_IP="$ip"
         else
-            ip=$(http_get https://ipv6.icanhazip.com)
+            ip=$(lookup_public_ip_endpoint https://ipv6.icanhazip.com)
             if [[ "$ip" == *:* && "$ip" =~ ^[0-9a-fA-F:]+$ ]]; then
                 GLOBAL_IP="$ip"
             fi
@@ -245,6 +264,7 @@ get_ip() {
             chmod 600 "$IP_CACHE" 2>/dev/null
         fi
     fi
+    [ -n "$GLOBAL_IP" ] || { printf '[提示] 未查到公网 IP；节点配置仍可查看，分享链接请用 --address 指定。\n' >&2; return 1; }
     echo "$GLOBAL_IP"
 }
 
@@ -1225,8 +1245,6 @@ get_domain() {
     local prompt="$1"
     local default="$2"
     local allow_colon="${3:-false}"
-    local pattern='^[a-zA-Z0-9.-]+$'
-    [ "$allow_colon" == "true" ] && pattern='^[a-zA-Z0-9:.-]+$'
 
     local val
     if [ "$NON_INTERACTIVE" = 1 ]; then
@@ -1248,7 +1266,7 @@ get_domain() {
         else
             ask "$prompt: " val
         fi
-        if [[ "$val" =~ $pattern ]] && [[ "$val" =~ [a-zA-Z0-9] ]] && [[ "$val" != .* ]] && [[ "$val" != *..* ]]; then
+        if valid_host "$val" "$allow_colon"; then
             break
         else
             if [ "$allow_colon" == "true" ]; then
@@ -1259,6 +1277,97 @@ get_domain() {
         fi
     done
     printf '%s\n' "$val"
+}
+
+probe_reality_sni() {
+    local host="$1" handshake elapsed ms=2147483647
+    valid_host "$host" || return 1
+    # Verify the real host from this server, with no proxy and no insecure TLS
+    # fallback. A timeout or handshake error is never a passing result.
+    handshake=$(LC_ALL=C timeout -k 1 4 openssl s_client -connect "$host:443" \
+        -servername "$host" -verify_hostname "$host" -verify_return_error \
+        -tls1_3 -groups X25519 -alpn h2 -no_ign_eof </dev/null 2>&1) || return 1
+    printf '%s\n' "$handshake" | grep -q 'ALPN protocol: h2' || return 1
+    printf '%s\n' "$handshake" | grep -Eq 'Verify return code: 0 \(ok\)|Verification: OK' || return 1
+    if elapsed=$(timeout -k 1 3 curl -q --noproxy '*' -sS --connect-timeout 2 --max-time 2 \
+        --http1.1 --output /dev/null --write-out '%{time_appconnect}' "https://$host/" 2>/dev/null) &&
+       [[ "$elapsed" =~ ^[0-9]+([.][0-9]+)?$ ]] &&
+       LC_ALL=C awk -v t="$elapsed" 'BEGIN {exit !(t > 0)}'; then
+        ms=$(LC_ALL=C awk -v t="$elapsed" 'BEGIN {printf "%.0f", t * 1000}')
+    fi
+    printf '%s\n' "$ms"
+}
+
+choose_reality_sni() {
+    local auto_sni answer host score ranked index=0
+    local -a candidates=(www.cloudflare.com www.apple.com www.bing.com addons.mozilla.org www.amazon.com www.samsung.com)
+    local -a matches=() hosts=()
+    if [ "$NON_INTERACTIVE" = 1 ] && [ -n "$CLI_SNI" ]; then
+        get_domain '请输入伪装域名' apple.com
+        return $?
+    fi
+    if [ "$NON_INTERACTIVE" = 0 ]; then
+        while true; do
+            ask '是否自动检测并推荐 SNI？(y/n) [默认: y]: ' auto_sni
+            case "${auto_sni:-y}" in
+                y|Y) break ;;
+                n|N) get_domain '请输入伪装域名' apple.com; return $? ;;
+                *) printf '[提示] 请输入 y 或 n。\n' >&2 ;;
+            esac
+        done
+    fi
+    if ! ensure_deps openssl curl timeout; then
+        if [ "$NON_INTERACTIVE" = 1 ]; then printf '[错误] 无法准备 SNI 检测依赖。\n' >&2; return 1; fi
+        printf '[提示] 检测依赖不可用，改为手动输入 SNI。\n' >&2
+        get_domain '请输入伪装域名' apple.com
+        return $?
+    fi
+    printf '检测 6 个候选站点：TLS 1.3、X25519、证书主机名及 h2；每站有超时上限。\n' >&2
+    for host in "${candidates[@]}"; do
+        printf '  检测 %s ... ' "$host" >&2
+        if score=$(probe_reality_sni "$host"); then
+            matches+=("$score"$'\t'"$host")
+            printf '通过\n' >&2
+        else
+            printf '未通过或超时\n' >&2
+        fi
+    done
+    if [ "${#matches[@]}" = 0 ]; then
+        if [ "$NON_INTERACTIVE" = 1 ]; then
+            printf '[错误] 没有通过 SNI 检测的候选；请检查服务器出站网络，或用 --sni 显式指定域名。\n' >&2
+            return 1
+        fi
+        printf '[提示] 本次没有通过全部检测的候选，请手动填写；检测结果只代表本机当前网络。\n' >&2
+        get_domain '请输入伪装域名' apple.com
+        return $?
+    fi
+    ranked=$(printf '%s\n' "${matches[@]}" | LC_ALL=C sort -n -k1,1) || return 1
+    printf '\n候选 SNI（按建立 TLS 连接耗时排序）：\n' >&2
+    while IFS=$'\t' read -r score host; do
+        hosts+=("$host")
+        index=$((index + 1))
+        if [ "$score" = 2147483647 ]; then
+            printf ' %s) %s（已通过 TLS 检查，耗时未测得）\n' "$index" "$host" >&2
+        else
+            printf ' %s) %s（约 %s ms）\n' "$index" "$host" "$score" >&2
+        fi
+    done <<< "$ranked"
+    if [ "$NON_INTERACTIVE" = 1 ]; then
+        printf '[完成] 自动选择排名第一的 SNI：%s。检测无法保证所有客户端网络可用。\n' "${hosts[0]}" >&2
+        printf '%s\n' "${hosts[0]}"
+        return 0
+    fi
+    printf ' 0) 手动输入\n检测无法保证所有客户端网络可用。\n' >&2
+    while true; do
+        ask "请选择 [0-$index，默认: 1]: " answer
+        answer="${answer:-1}"
+        if [ "$answer" = 0 ]; then get_domain '请输入伪装域名' apple.com; return $?; fi
+        if [[ "$answer" =~ ^[1-9][0-9]?$ ]] && [ "$answer" -le "$index" ]; then
+            printf '%s\n' "${hosts[answer - 1]}"
+            return 0
+        fi
+        printf '[提示] 请输入有效编号。\n' >&2
+    done
 }
 
 confirm_http01_ready() {
@@ -1863,8 +1972,7 @@ build_share_url() {
 
 print_config_detail() {
     local TAG=$1
-    local IP
-    IP=$(get_ip)
+    local IP=""
     load_secrets
 
     local -a M=()
@@ -1872,6 +1980,8 @@ print_config_detail() {
     local TYPE=${M[0]} PORT=${M[1]} CERT_PATH=${M[2]}
     local N_UUID=${M[3]} N_PASS=${M[4]} SNI=${M[5]} SID=${M[6]}
     local IS_REALITY=${M[7]} IS_WS=${M[8]} SS_METHOD=${M[9]}
+
+    if [ "$IS_WS" != 1 ] && [[ "$CERT_PATH" != */real.cer ]]; then IP=$(get_ip); fi
 
     resolve_conn "$CERT_PATH" "$IP"
     local INSECURE_TEXT="true"
@@ -2134,7 +2244,7 @@ add_config() {
                 local UUID
                 UUID=$(get_uuid) || return 1
                 local SNI
-                SNI=$(get_domain "请输入伪装域名" "apple.com") || return 1
+                SNI=$(choose_reality_sni) || { restore_config_and_service || return 1; return 1; }
                 local KEYS
                 KEYS=$(/usr/local/lib/onebox/sing-box generate reality-keypair) || return 1
                 local PK
@@ -2715,16 +2825,25 @@ view_single_config() {
     while true; do
         ui_clear
         echo -e "选择: 单协议链接\n"
+        require_config readonly || { pause; return 1; }
         select_inbound || return
         print_config_detail "$TAG"
         pause
     done
 }
 
+nodes_need_public_ip() {
+    jq -e --arg tag "${1:-}" 'any(.inbounds[];
+      .tag != null and .tag != "dns-in" and
+      ($tag == "" or .tag == $tag) and .transport.type != "ws" and
+      ((.tls.certificate_path // "") | endswith("/real.cer") | not))' "$CONFIG_FILE" >/dev/null
+}
+
 show_all_links() {
     ui_clear
     echo -e "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
     echo -e "🚀【 聚合节点 】节点信息如下：\n"
+    require_config readonly || { pause; return 1; }
 
     local old_IFS=$IFS
     IFS=$'\n'
@@ -2734,7 +2853,8 @@ show_all_links() {
     if [ ${#TAGS[@]} -eq 0 ]; then
         echo -e "${RED}[错误] 未添加节点配置！${PLAIN}"
     else
-        IP=$(get_ip)
+        IP=""
+        if nodes_need_public_ip; then IP=$(get_ip); fi
         for TAG in "${TAGS[@]}"; do
             build_share_url "$TAG" "$IP"
             printf '\n'
@@ -3396,7 +3516,7 @@ menu() {
             1) init_base && add_config ;;
             2) require_config && modify_config ;;
             3) require_config && del_config ;;
-            4) require_config && view_config ;;
+            4) view_config ;;
             5) mkdir -p "$CONFIG_DIR" "$CERT_DIR" && chmod 700 "$CONFIG_DIR" "$CERT_DIR" && cert_manage ;;
             6) run_manage ;;
             7) init_base && update_manage ;;
@@ -3832,7 +3952,8 @@ add 选项:
   --protocol reality|hysteria2|tuic|anytls|argo|shadowsocks
   --tag NAME --port 1..65535 --uuid UUID --password VALUE
   --password-file PATH（或环境变量 SB_PASSWORD）
-  --sni DOMAIN                 Reality 默认 apple.com，自签默认 bing.com
+  --sni DOMAIN                 指定 Reality 伪装域名；省略则自动检测选第一名
+                               自签证书域名默认 bing.com
   --cert self|real             默认 self
   --method METHOD              SS 默认 aes-128-gcm
   --firewall auto|skip         默认 auto
@@ -3976,7 +4097,11 @@ parse_cli() {
 
 require_config() {
     [ -f "$CONFIG_FILE" ] || { echo '[错误] 尚未安装，请先执行 install。' >&2; return 1; }
-    ensure_deps jq || return 1
+    if [ "${1:-}" = readonly ]; then
+        command -v jq >/dev/null 2>&1 || { echo '[错误] 缺少 jq，请先安装后重试。' >&2; return 1; }
+    else
+        ensure_deps jq || return 1
+    fi
     jq -e 'type == "object" and (.inbounds | type == "array")' "$CONFIG_FILE" >/dev/null || return 1
 }
 
@@ -4161,7 +4286,8 @@ cli_dispatch() {
                     if [ -n "$CLI_TAG" ]; then
                         jq -e --arg tag "$CLI_TAG" '.inbounds[] | select(.tag == $tag)' "$CONFIG_FILE" >/dev/null || return 1
                     fi
-                    ip=$(get_ip)
+                    ip=""
+                    if nodes_need_public_ip "$CLI_TAG"; then ip=$(get_ip); fi
                     tags=$(jq -r --arg tag "$CLI_TAG" '.inbounds[] | select($tag == "" or .tag == $tag) | .tag' "$CONFIG_FILE") || return 1
                     if [ -n "$tags" ]; then
                         while IFS= read -r tag; do build_share_url "$tag" "$ip" || rc=1; done <<< "$tags"
