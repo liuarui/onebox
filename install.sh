@@ -1231,7 +1231,7 @@ get_domain() {
     local val
     if [ "$NON_INTERACTIVE" = 1 ]; then
         case "$prompt" in
-            *Argo*IP*) val="${CLI_EDGE:-saas.sin.fan}" ;;
+            *Argo*IP*) val="${CLI_EDGE:-$default}" ;;
             *Argo*域名*) val="$CLI_DOMAIN" ;;
             *解析到本机*) val="$CLI_DOMAIN" ;;
             *) val="${CLI_SNI:-$default}" ;;
@@ -1822,6 +1822,7 @@ build_share_url() {
                 local A_IP="${!var_ip}"
                 local A_DOM="${!var_dom}"
                 if [ -z "$A_IP" ]; then echo -e "${RED}[错误] [无法读取 Argo IP，无法生成链接]${PLAIN}" >&2; return 1; fi
+                if [ -z "$A_DOM" ]; then echo '[错误] 缺少 Argo 隧道域名，无法生成包含 Host/SNI 的链接。' >&2; return 1; fi
                 local A_IP_URI
                 A_IP_URI=$(wrap_ipv6 "$A_IP")
                 printf '%s\n' "vless://${N_UUID}@${A_IP_URI}:443?encryption=none&security=tls&type=ws&host=${A_DOM}&path=%2Fargo&sni=${A_DOM}#${TAG}"
@@ -2172,17 +2173,20 @@ add_config() {
                 IS_ARGO=1
                 local UUID
                 UUID=$(get_uuid) || return 1
-                local ARGO_IP
-                ARGO_IP=$(get_domain "请输入 Argo 优选域名/IP" "saas.sin.fan" "true") || return 1
                 local ARGO_DOMAIN
-                ARGO_DOMAIN=$(get_domain "请输入 Argo 隧道域名" "example.com") || return 1
+                ARGO_DOMAIN=$(get_domain "请输入 Argo 隧道公共域名（需在 Cloudflare 配置）" "") || return 1
+                local ARGO_IP
+                ARGO_IP=$(get_domain "请输入 Argo 连接域名/IP（可选优选地址）" "$ARGO_DOMAIN" "true") || return 1
 
                 local ARGO_TOKEN=""
+                printf '%s\n' '需要安装连接器命令中的完整 Tunnel Token；隧道 ID 和 VLESS 用户 UUID 不能代替 Token。' >&2
                 while true; do
-                    ask "请输入 Cloudflare Tunnel Token: " ARGO_TOKEN
-                    if [[ "$ARGO_TOKEN" =~ ^[A-Za-z0-9+/=._-]+$ ]]; then break; fi
-                    echo -e "${RED}[错误] 错误：Token 格式不正确或为空！${PLAIN}" >&2
+                    ask "请输入完整 Cloudflare Tunnel Token（非隧道 ID）: " ARGO_TOKEN
+                    if valid_tunnel_token "$ARGO_TOKEN"; then break; fi
+                    echo '[错误] 不是有效的 Tunnel Token；请复制安装连接器命令中的 Token 本身，不要填 UUID、API Token 或整条命令。' >&2
+                    if [ "$NON_INTERACTIVE" = 1 ]; then restore_config_and_service; return 1; fi
                 done
+                printf '[必须配置] Cloudflare 公共域名 %s → HTTP → http://127.0.0.1:%s；WebSocket 路径 /argo。脚本不创建云端映射。\n' "$ARGO_DOMAIN" "$PORT" >&2
 
                 save_secret "ARGO_IP_${PORT}" "$ARGO_IP" || { restore_config_and_service || return 1; return 1; }
                 save_secret "ARGO_DOMAIN_${PORT}" "$ARGO_DOMAIN" || { restore_config_and_service || return 1; return 1; }
@@ -2199,15 +2203,17 @@ add_config() {
                     fi
                     if [ -z "$CF_BIN" ] && { [ -e /usr/local/lib/onebox/cloudflared ] || [ -L /usr/local/lib/onebox/cloudflared ]; }; then
                         echo '[错误] cloudflared 目标路径异常，拒绝覆盖。' >&2
+                        restore_config_and_service || return 1
                         return 1
                     fi
                     if [ -z "$CF_BIN" ]; then
                         CF_BIN=/usr/local/lib/onebox/cloudflared
                         echo -e "${CYAN}[信息] 正在下载 cloudflared 组件...${PLAIN}"
                         local TMP_CF
-                        TMP_CF=$(mktemp) || { restore_config_and_service; return 1; }
                         local cf_arch="$CF_ARCH"
-                        [ -n "$cf_arch" ] || { echo "[错误] 此架构无 cloudflared 发布物。" >&2; return 1; }
+                        [ -n "$cf_arch" ] || { echo "[错误] 此架构无 cloudflared 发布物。" >&2; restore_config_and_service; return 1; }
+                        TMP_CF=$(mktemp) || { restore_config_and_service; return 1; }
+                        SB_OWNED_TEMP_FILES+=("$TMP_CF")
                         if run_step "下载 cloudflared" fetch_url "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${cf_arch}" "$TMP_CF"; then
                             if ! chmod 755 "$TMP_CF" ||
                                ! chown 0:0 "$TMP_CF" ||
@@ -2233,6 +2239,10 @@ add_config() {
                         CF_FAILED=1
                     elif [ "$CF_FAILED" = 0 ] && ! "$CF_BIN" --version >/dev/null 2>&1; then
                         echo 'cloudflared 无法运行，拒绝创建服务。' >&2
+                        CF_FAILED=1
+                    fi
+                    if [ "$CF_FAILED" = 0 ] && ! "$CF_BIN" tunnel run --help 2>&1 | grep -q -- '--token-file'; then
+                        echo '[错误] cloudflared 不支持 --token-file；请升级到 2025.4.0 或更新版本后重试。' >&2
                         CF_FAILED=1
                     fi
                     if [ "$CF_FAILED" = 0 ] && [ "$CF_NEW" = 1 ]; then
@@ -2303,6 +2313,9 @@ add_config() {
         fi
 
         print_config_detail "$TAG"
+        if [ "$IS_ARGO" = 1 ]; then
+            printf '[提示] 连接器已连上 Cloudflare；请确认 %s 的云端映射为 http://127.0.0.1:%s。\n' "$ARGO_DOMAIN" "$PORT"
+        fi
         if [ "$NON_INTERACTIVE" = 1 ]; then return 0; fi
         pause
     done
@@ -2392,8 +2405,8 @@ modify_config() {
             [ "$mod_idx" == "0" ] && break
 
             if [ "$action" == "argo_ip" ]; then
-                local NEW_ARGO_IP
-                NEW_ARGO_IP=$(get_domain "请输入新的 Argo 优选域名/IP" "saas.sin.fan" "true") || exit 1
+                local NEW_ARGO_IP argo_domain_key="ARGO_DOMAIN_${OLD_PORT}"
+                NEW_ARGO_IP=$(get_domain "请输入新的 Argo 优选域名/IP" "${!argo_domain_key}" "true") || exit 1
                 save_secret "ARGO_IP_${OLD_PORT}" "$NEW_ARGO_IP" || return 1
                 echo -e "${GREEN}[完成] 优选域名/IP 已成功更改为: $NEW_ARGO_IP${PLAIN}"
                 pause
@@ -2482,7 +2495,7 @@ modify_config() {
                 if [ "$IS_ARGO" -eq 1 ]; then
                     echo -e "\n${YELLOW}注意: 这是 Argo 节点，入口由 Cloudflare Tunnel 提供。${PLAIN}"
                     echo -e "${YELLOW}[提示] 改完本地端口后，必须去 Cloudflare Zero Trust 后台把该 Tunnel 的${PLAIN}"
-                    echo -e "${YELLOW}[提示] Public Hostname (Ingress) 目标同步改成 localhost:<新端口>，${PLAIN}"
+                    echo -e "${YELLOW}[提示] Public Hostname (Ingress) 目标同步改成 http://127.0.0.1:<新端口>，${PLAIN}"
                     echo -e "${YELLOW}[提示] 否则节点会立即失效(隧道返回 502)。${PLAIN}"
                     ask "确认继续修改端口？(y/n) [默认: n]: " argo_go
                     if [[ "${argo_go:-n}" != "y" && "${argo_go:-n}" != "Y" ]]; then
@@ -2560,7 +2573,7 @@ modify_config() {
                     fi
 
                     if [ "$IS_ARGO" -eq 1 ]; then
-                        echo -e "\n${YELLOW}【重要警告】: 您修改了 Argo 节点的本地端口！\n请务必前往 Cloudflare Zero Trust 后台，将对应 Tunnel 的 Public Hostname (Ingress) 映射目标端口同步更改为 localhost:${NEW_PORT}，否则节点将无法连接！${PLAIN}\n"
+                        echo -e "\n${YELLOW}【重要警告】: 您修改了 Argo 节点的本地端口！\n请务必前往 Cloudflare Zero Trust 后台，将对应 Tunnel 的 Public Hostname (Ingress) 映射目标同步更改为 http://127.0.0.1:${NEW_PORT}，否则节点将无法连接！${PLAIN}\n"
                     fi
                 fi
                 pause
@@ -3676,10 +3689,59 @@ restore_config_and_service() {
     commit_config
 }
 
+valid_tunnel_token_format() {
+    [ "${#1}" -ge 64 ] && [ "${#1}" -le 16384 ] && [[ "$1" =~ ^[A-Za-z0-9+/]+={0,2}$ ]]
+}
+
+valid_tunnel_token() {
+    local decoded
+    valid_tunnel_token_format "$1" || return 1
+    decoded=$(printf '%s' "$1" | base64 -d 2>/dev/null) || return 1
+    printf '%s' "$decoded" | jq -e '
+      type == "object" and
+      (.a | type == "string" and length > 0) and
+      (.s | type == "string" and length > 0) and
+      (.t | type == "string" and test("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"))
+    ' >/dev/null 2>&1 || return 1
+}
+
+managed_tunnel_metrics_addr() {
+    local svc="$1" file addr port
+    [[ "$svc" =~ ^cloudflared-[A-Za-z0-9_-]+$ ]] || return 1
+    if [ "$SERVICE_MANAGER" = openrc ]; then file="/etc/init.d/$svc"
+    else file="/etc/systemd/system/$svc.service"; fi
+    [ -r "$file" ] || return 1
+    addr=$(sed -n 's/.*--metrics \(127\.0\.0\.1:[0-9]*\).*/\1/p' "$file" | head -n 1)
+    port="${addr##*:}"
+    [[ "$addr" == 127.0.0.1:* && "$port" =~ ^[1-9][0-9]{0,4}$ ]] && [ "$port" -le 65535 ] || return 1
+    printf '%s\n' "$addr"
+}
+
+tunnel_is_ready() {
+    local body
+    body=$(curl --noproxy '*' -fsS --connect-timeout 1 --max-time 2 "http://$1/ready" 2>/dev/null) || return 1
+    printf '%s' "$body" | jq -e '.readyConnections | type == "number" and . > 0' >/dev/null 2>&1 || return 1
+}
+
+wait_tunnel_ready() {
+    local addr="$1" tag="$2" attempt
+    for ((attempt=0; attempt<15; attempt++)); do
+        if tunnel_is_ready "$addr"; then return 0; fi
+        sleep 2
+    done
+    printf '[错误] 未确认连接到 Cloudflare；请检查 Token 是否有效，以及 DNS 和出站 TCP 7844 是否可达。\n' >&2
+    if [ "$SERVICE_MANAGER" = systemd ]; then
+        printf '连接器日志：journalctl -u cloudflared-%s.service --no-pager -n 50\n' "$tag" >&2
+    fi
+    return 1
+}
+
 create_argo_service() {
-    local tag="$1" bin="$2" token="$3" token_file unit
+    local tag="$1" bin="$2" token="$3" token_file unit metrics_port metrics_addr
     [[ "$tag" =~ ^[A-Za-z0-9_-]+$ && "$bin" =~ ^/[A-Za-z0-9_./-]+$ ]] || return 1
-    [[ "$token" =~ ^[A-Za-z0-9+/=._-]+$ ]] || return 1
+    valid_tunnel_token "$token" || return 1
+    metrics_port=$(rand_port) || return 1
+    metrics_addr="127.0.0.1:$metrics_port"
     token_file=$(mktemp "$CONFIG_DIR/.tunnel-token.XXXXXX") || return 1
     printf '%s' "$token" > "$token_file" && chmod 600 "$token_file" || { rm -f "$token_file"; return 1; }
     if [ "$SERVICE_MANAGER" = openrc ]; then unit="/etc/init.d/cloudflared-$tag"
@@ -3692,7 +3754,7 @@ create_argo_service() {
 #!/sbin/openrc-run
 name="cloudflared-$tag"
 command="$bin"
-command_args="tunnel --no-autoupdate --protocol http2 run --token-file $token_file"
+command_args="tunnel --no-autoupdate --protocol http2 --metrics $metrics_addr run --token-file $token_file"
 command_background=true
 pidfile="/var/run/cloudflared-$tag.pid"
 depend() { need net; }
@@ -3707,7 +3769,7 @@ Description=cloudflared tunnel for $tag
 After=network-online.target
 Wants=network-online.target
 [Service]
-ExecStart=$bin tunnel --no-autoupdate --protocol http2 run --token-file $token_file
+ExecStart=$bin tunnel --no-autoupdate --protocol http2 --metrics $metrics_addr run --token-file $token_file
 Restart=on-failure
 RestartSec=10s
 [Install]
@@ -3717,6 +3779,7 @@ EOF
         chmod 644 "$unit" && systemctl daemon-reload && systemctl enable "cloudflared-$tag" --now &&
         systemctl is-active --quiet "cloudflared-$tag" || return 1
     fi
+    run_step '等待隧道连接 Cloudflare' wait_tunnel_ready "$metrics_addr" "$tag" || return 1
     register_argo_service "cloudflared-$tag"
 }
 
@@ -3775,8 +3838,8 @@ add 选项:
   --firewall auto|skip         默认 auto
   --address IP_OR_HOST         分享链接地址（省略则自动获取公网 IP）
 argo 选项:
-  --domain DOMAIN --edge HOST --tunnel-token-file PATH
-  也可通过 SB_TUNNEL_TOKEN 提供 Tunnel Token
+  --domain DOMAIN --tunnel-token-file PATH（完整连接器 Token，不是隧道 ID）
+  --edge HOST 可选，默认连接自己的隧道域名；也可通过 SB_TUNNEL_TOKEN 提供 Token
 真实证书:
   --domain DOMAIN --validation dns|http（默认 dns）
   --cf-token-file PATH（或环境变量 CF_Token；也支持 CF_Key + CF_Email）
@@ -3793,7 +3856,7 @@ parse_cli() {
     CLI_PASSWORD="${SB_PASSWORD:-}" CLI_TUNNEL_TOKEN="${SB_TUNNEL_TOKEN:-}"
     CLI_CERT=self CLI_METHOD=aes-128-gcm CLI_SNI="" CLI_DOMAIN=""
     CLI_VERSION=latest CLI_VALIDATION=dns CLI_HTTP01_READY=0 CLI_ADDRESS=""
-    CLI_FIREWALL=y CLI_EDGE=saas.sin.fan CLI_STRATEGY="" CLI_RESTORE_BBR=1
+    CLI_FIREWALL=y CLI_EDGE="" CLI_STRATEGY="" CLI_RESTORE_BBR=1
     CLI_LINES=80 CLI_LOG_SOURCE=service
     local option value
     local -a used_options=()
@@ -3889,7 +3952,7 @@ parse_cli() {
             anytls) CLI_PROTOCOL_INDEX=4 ;;
             argo|vless-argo) CLI_PROTOCOL_INDEX=5
                 [ -n "$CLI_DOMAIN" ] || die 'Argo 需要 --domain。' 2
-                [[ "$CLI_TUNNEL_TOKEN" =~ ^[A-Za-z0-9+/=._-]+$ ]] || die 'Argo 需要有效的 --tunnel-token-file 或 SB_TUNNEL_TOKEN。' 2 ;;
+                valid_tunnel_token_format "$CLI_TUNNEL_TOKEN" || die 'Argo 需要完整 Tunnel Token（--tunnel-token-file 或 SB_TUNNEL_TOKEN）；不能使用隧道 ID、API Token 或 VLESS UUID。' 2 ;;
             shadowsocks|ss) CLI_PROTOCOL_INDEX=6 ;;
             *) die 'add 需要 --protocol reality|hysteria2|tuic|anytls|argo|shadowsocks。' 2 ;;
         esac
@@ -3970,7 +4033,7 @@ cli_status() {
 }
 
 cli_doctor() {
-    local rc=0 count certs cert days svc state
+    local rc=0 count certs cert days svc state metrics_addr
     local -a registered=()
     printf 'onebox 只读体检（不会安装依赖、下载脚本或更改服务）\n'
     cli_status || rc=1
@@ -4011,7 +4074,17 @@ cli_doctor() {
             fi
             state=$(managed_service_state "$svc")
             printf 'tunnel %s: %s\n' "$svc" "$state"
-            [ "$state" = active ] || rc=1
+            if [ "$state" != active ]; then
+                rc=1
+            elif ! command -v curl >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+                printf '[待检查] 缺少 curl/jq，未确认隧道连接 Cloudflare。\n'; rc=1
+            elif ! metrics_addr=$(managed_tunnel_metrics_addr "$svc"); then
+                printf '[待检查] 旧隧道服务未配置本机 /ready 检查，进程运行不能证明连接成功。\n'; rc=1
+            elif tunnel_is_ready "$metrics_addr"; then
+                printf '[正常] 连接器已连接 Cloudflare；云端域名及 origin 映射仍需核对。\n'
+            else
+                printf '[异常] 连接器尚未连上 Cloudflare，请检查 Token、DNS、出站连接及隧道日志。\n'; rc=1
+            fi
         done
     fi
     [ "$rc" = 0 ] || printf '[提示] 服务异常可执行 onebox logs；安装排障可执行 onebox logs --source install。\n'

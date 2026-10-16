@@ -8,19 +8,15 @@
 
 支持使用 apt、apk、dnf/yum、zypper、pacman 的 Debian/Ubuntu、Alpine、RHEL/Rocky/AlmaLinux/Fedora、openSUSE、Arch 等常见 Linux。需要**正在运行的 systemd 或 OpenRC**；无 init 的 Docker/WSL、其他 init、未知包管理器或架构会报错退出。支持 x86_64、ARM64、x86、ARMv6/v7、riscv64、s390x、ppc64le；具体版本必须提供对应官方发行包，Argo 仅支持前五类架构。Alpine 优先使用官方 musl 包。
 
-## 一键安装
+## 交互式一键安装（推荐）
 
 请先用 root 登录，或执行 `sudo -i` 切换到 root：
 
 ```bash
-bash <(curl -fsSL "https://raw.githubusercontent.com/liuarui/onebox/main/install.sh")
+bash <(curl -fsSL "https://raw.githubusercontent.com/liuarui/onebox/main/install.sh") menu
 ```
 
-上面命令默认**无交互安装 VLESS + Reality，监听 TCP 443**，自动生成 UUID、Reality 密钥和分享链接，默认伪装域名 `apple.com`。443 已占用或已有同名节点时会报错退出，不会换成随机端口。等价的显式命令是：
-
-```bash
-bash <(curl -fsSL "https://raw.githubusercontent.com/liuarui/onebox/main/install.sh") add --protocol reality --port 443 --non-interactive
-```
+上面命令打开交互菜单，选择“1) 添加节点”，再选择协议并按提示填写端口等参数。安装完成后，直接执行 `onebox` 即可再次打开管理菜单，支持修改、查看、更新和卸载。
 
 请在 Bash 终端执行，系统需先有 Bash、curl 和 CA 证书。精简 Alpine 可先执行 `apk add --no-cache bash curl ca-certificates`，再运行 `bash` 切换终端；Debian/Ubuntu 可先执行 `apt-get update && apt-get install -y bash curl ca-certificates`。其余依赖由脚本自动安装。
 
@@ -31,8 +27,23 @@ bash <(curl -fsSL "https://raw.githubusercontent.com/liuarui/onebox/main/install
 ## 已下载脚本的安装方式
 
 ```sh
-# 默认无交互安装 VLESS + Reality，端口 443
-sh install.sh
+# 打开交互安装菜单
+sh install.sh menu
+```
+
+## 无交互安装
+
+适合自动化部署。默认 VLESS + Reality、TCP 443，自动生成 UUID、Reality 密钥和分享链接，伪装域名为 `apple.com`：
+
+```bash
+bash <(curl -fsSL "https://raw.githubusercontent.com/liuarui/onebox/main/install.sh") add --protocol reality --port 443 --non-interactive
+```
+
+443 已占用或已有同名节点时会报错退出。为兼容已有用法，省略所有参数运行 `install.sh` 仍执行上述默认无交互安装；交互安装请保留 `menu`。
+
+```sh
+# 下载后显式无交互创建节点
+sh install.sh add --protocol reality --port 443 --non-interactive
 
 # 只安装管理脚本和内核，不添加节点
 sh install.sh install --non-interactive
@@ -118,11 +129,25 @@ onebox cert --cert self --sni bing.com
 
 ```sh
 onebox add --protocol argo --tag argo-1 --port 18080 \
-  --domain tunnel.example.com --edge saas.sin.fan \
+  --domain tunnel.example.com \
   --tunnel-token-file /root/tunnel-token
 ```
 
-Token 文件为仅 root 可读的单行文件，也可使用 `SB_TUNNEL_TOKEN` 环境变量。请在 Cloudflare Tunnel 后台将该域名的服务目标设为 `http://localhost:18080`。本地入口仅监听 `127.0.0.1`，服务 Token 单独以 `600` 权限保存。
+本模式使用 Cloudflare 后台管理的 Tunnel，需要**完整的连接器 Token**：从该隧道的安装连接器命令中复制 Token 本身。UUID 形式的 Tunnel ID、VLESS 用户 UUID、Cloudflare API Token 都不能替代它；只有 Tunnel ID 不足以认证。当前不支持本地管理隧道的 credentials JSON 模式。Token 文件为仅 root 可读的单行文件，也可使用 `SB_TUNNEL_TOKEN` 环境变量，勿公开分享。
+
+在 Cloudflare Tunnel 后台为这条隧道添加 Published application/Public Hostname：
+
+| 设置 | 本例的值 |
+| --- | --- |
+| 公共域名 | `tunnel.example.com`，必须与 `--domain` 一致 |
+| Service 类型 | `HTTP` |
+| Service URL | `127.0.0.1:18080`，完整地址为 `http://127.0.0.1:18080` |
+
+本地入口仅监听 `127.0.0.1`，WebSocket 路径为 `/argo`。不要将目标填为 HTTPS、443 或其他端口；避免用 `localhost` 指向 IPv6 `::1`。Token 只用于连接已配置的隧道，脚本不会自动创建云端域名映射。使用 Cloudflare 后台创建映射时，还需确认对应 DNS 路由已生成，并允许 WebSocket，避免 Access 登录验证或挑战页拦截客户端。
+
+客户端默认直接连接自己的隧道域名；确认正常后，可通过 `--edge HOST_OR_IP` 指定优选地址，Host/SNI 仍为隧道域名。服务 Token 单独以 `600` 权限保存。使用已有 cloudflared 时需支持 `--token-file`（2025.4.0+）。新建时会等待本机 `/ready` 确认连接到 Cloudflare；这不等于云端域名、origin 映射和客户端全部正常。
+
+不通时先执行 `onebox doctor` 和 `onebox logs --tag argo-1`（systemd）：`1033` 优先检查连接器是否健康及 DNS 是否指向正确隧道；Tunnel 的 `502 / Unable to reach the origin service` 优先检查本机 sing-box、HTTP 协议和 `127.0.0.1:18080` 映射。Cloudflare 的说明见[运行参数](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/configure-tunnels/run-parameters/#token-file)与[故障排查](https://developers.cloudflare.com/tunnel/troubleshooting/)。
 
 ## 查看、管理与更新
 
