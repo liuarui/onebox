@@ -1628,11 +1628,16 @@ onebox_probe_pids_budget() {
 onebox_safe_sni_jobs() {
     onebox_probe_pids_budget
     sni_effective_jobs="$1"
-    # Each worker: Bash + curl + one resolver thread; leave four tasks for control/cleanup.
+    # Each worker: Bash + curl + one resolver thread; normally reserve four tasks.
     if [ "$sni_pid_headroom" -ge 0 ]; then
         local available=$(((sni_pid_headroom-4)/3))
         [ "$available" -ge 0 ] || available=0
         [ "$available" -ge "$sni_effective_jobs" ] || sni_effective_jobs="$available"
+        # Tight containers can still scan serially, leaving one task beyond the worker.
+        # Candidate preparation can also need four tasks, so never fall back at three.
+        if [ "$sni_effective_jobs" -lt 1 ] && [ "$sni_pid_headroom" -ge 4 ]; then
+            sni_effective_jobs=1
+        fi
     fi
     [ "$sni_effective_jobs" -gt 0 ]
 }
