@@ -59,6 +59,51 @@ KERNEL_TMP_DIR=""
 declare -a SB_OWNED_TEMP_FILES=()
 declare -a SB_OWNED_TEMP_DIRS=()
 
+# --- 低资源机器自适应 -------------------------------------------------------
+# cgroup pids.max / memory.max 是硬上限，fork 失败时脚本不会报错而是表现为
+# 「卡住」：并发子进程占满 pids 后，后续 curl/timeout 全部排队饿死。
+# 因此在任何并行扫描前先探测本机还能开多少进程。
+ONEBOX_PIDS_LIMIT=""
+ONEBOX_PIDS_FREE=""
+onebox_probe_pids_budget() {
+    local base limit current used
+    ONEBOX_PIDS_LIMIT="" ONEBOX_PIDS_FREE=""
+    # cgroup v2: /sys/fs/cgroup/pids.max；v1: /sys/fs/cgroup/pids/pids.max
+    limit=""; current=""
+    for base in /sys/fs/cgroup /sys/fs/cgroup/pids; do
+        if [ -r "$base/pids.max" ]; then
+            limit=$(cat "$base/pids.max" 2>/dev/null)
+            current=$(cat "$base/pids.current" 2>/dev/null)
+            break
+        fi
+    done
+    # 无 cgroup 限制时退回 ulimit（可能为 unlimited）
+    case "$limit" in
+        ''|max) limit=$(ulimit -u 2>/dev/null) || limit="" ;;
+    esac
+    case "$limit" in
+        ''|max|unlimited) return 0 ;;
+    esac
+    [[ "$limit" =~ ^[0-9]+$ ]] || return 0
+    [ -n "$current" ] || current=0
+    [[ "$current" =~ ^[0-9]+$ ]] || current=0
+    used=$((limit-current))
+    [ "$used" -ge 1 ] || used=1
+    ONEBOX_PIDS_LIMIT="$limit"
+    ONEBOX_PIDS_FREE="$used"
+}
+# 每个并发探测 worker 需要 4 个 pid：子 shell + timeout + openssl + curl。
+# 再留 8 个 pid 余量给主流程与系统工具，避免把机器拖到无法 fork。
+onebox_safe_sni_jobs() {
+    local requested="${1:-8}" safe
+    onebox_probe_pids_budget
+    [ -n "$ONEBOX_PIDS_FREE" ] || { printf '%s' "$requested"; return 0; }
+    safe=$(( (ONEBOX_PIDS_FREE-8) / 4 ))
+    [ "$safe" -ge 1 ] || safe=1
+    [ "$safe" -lt "$requested" ] || safe="$requested"
+    printf '%s' "$safe"
+}
+
 SB_PROGRESS_PID=""
 SB_SNI_PID=""
 stop_progress() {
@@ -1594,6 +1639,16 @@ run_reality_sni_selection() {
     local sni_region="${CLI_SNI_REGION:-all}" sni_categories="${CLI_SNI_CATEGORIES:-all}" sni_hosts="${CLI_SNI_HOSTS:-}"
     local sni_samples="${CLI_SNI_SAMPLES:-3}" sni_timeout="${CLI_SNI_TIMEOUT:-5}" sni_jobs="${CLI_SNI_JOBS:-8}"
     local -a candidates=() matches=() hosts=()
+    local launched=0
+    # 低资源机器（cgroup pids 限额）不能按默认并发跑，先收敛到安全值。
+    # 仅在用户没有显式指定 --sni-jobs 时自动降级，显式值仍受尊重。
+    if [ -z "${CLI_SNI_JOBS:-}" ]; then
+        local requested_jobs="$sni_jobs"
+        sni_jobs=$(onebox_safe_sni_jobs "$sni_jobs")
+        [ "$sni_jobs" = "$requested_jobs" ] || \
+            printf '[提示] 检测到进程数受限（可用 %s/%s），并发自动降为 %s 以避免卡死。\n' \
+                "$ONEBOX_PIDS_FREE" "$ONEBOX_PIDS_LIMIT" "$sni_jobs" >&2
+    fi
     # Persist in this isolated shell until its EXIT trap runs after function return.
     sni_work_dir=""; sni_pids=()
     trap cleanup_reality_sni_workers EXIT
@@ -1633,7 +1688,12 @@ run_reality_sni_selection() {
                 probe_reality_sni "${candidates[position]}" "$sni_samples" "$sni_timeout"
             ) >"$sni_work_dir/result-$position" 2>/dev/null < /dev/null &
             sni_pids+=("$!")
+            launched=$((launched+1))
         done
+        [ "${#sni_pids[@]}" -gt 0 ] || {
+            printf '[错误] 无法创建检测进程，请用 --sni 手动指定域名。\n' >&2
+            return 1
+        }
         for ((slot=0; slot<${#sni_pids[@]}; slot++)); do
             position=$((batch_start+slot)); host="${candidates[position]}"
             probe_rc=0
@@ -1650,7 +1710,10 @@ run_reality_sni_selection() {
                 printf ' [%s/%s] %s：未通过或超时\n' "$completed" "${#candidates[@]}" "$host" >&2
             fi
         done
-        batch_start=$((batch_start+sni_jobs))
+        # 本批实际启动数由 launched 记录（与 sni_jobs 相同时等同原逻辑），
+        # pids 受限时可能更少，必须按实际数量推进，否则候选被整批跳过。
+        batch_start=$((batch_start+launched))
+        launched=0
     done
     sni_pids=()
     if [ "${#matches[@]}" = 0 ]; then
