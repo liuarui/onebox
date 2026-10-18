@@ -140,6 +140,8 @@ Shadowsocks 支持 `aes-128-gcm`、`aes-256-gcm`、`chacha20-ietf-poly1305`、`2
 
 自动放行仅处理本机已识别的防火墙，云安全组需要自行配置；裸 iptables 未配置持久化时，新增规则仅在当前运行期生效。firewalld 新规则会分别写入并核验永久与运行时状态，不会全局 reload；已有永久规则会补齐当前放行，已有临时规则则复用并提示自行持久化，卸载时保留这些已有规则。
 
+新增规则会在变更前登记，部分放行失败时仍保留清理记录。iptables/ufw 查询异常或无法确认受管规则已消失时，清理返回失败并保留记录，处理后可重试。
+
 ## 证书
 
 Cloudflare DNS 验证，API Token 需具备目标区域的 DNS 编辑权限及区域读取权限：
@@ -192,6 +194,8 @@ onebox add --protocol argo --tag argo-1 --port 18080 \
 客户端默认直接连接自己的隧道域名；确认正常后，可通过 `--edge HOST_OR_IP` 指定优选地址，Host/SNI 仍为隧道域名。服务 Token 单独以 `600` 权限保存。使用已有 cloudflared 时需支持 `--token-file`（2025.4.0+）。新建时会等待本机 `/ready` 确认连接到 Cloudflare；这不等于云端域名、origin 映射和客户端全部正常。
 
 不通时先执行 `onebox doctor` 和 `onebox logs --tag argo-1`（systemd）：`1033` 优先检查连接器是否健康及 DNS 是否指向正确隧道；Tunnel 的 `502 / Unable to reach the origin service` 优先检查本机 sing-box、HTTP 协议和 `127.0.0.1:18080` 映射。Cloudflare 的说明见[运行参数](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/configure-tunnels/run-parameters/#token-file)与[故障排查](https://developers.cloudflare.com/tunnel/troubleshooting/)。
+
+删除 Argo 节点时会备份隧道服务、受管 Token 及启用/运行状态；删除失败或中断时随节点配置一起恢复，恢复失败则保留事务备份并报错。
 
 ## 查看、管理与更新
 

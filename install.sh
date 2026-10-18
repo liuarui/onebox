@@ -623,6 +623,27 @@ record_fw_port() {
     return 1
 }
 
+iptables_rule_state() {
+    local tool="$1" port="$2" proto="$3" rc=0 rules listed=0
+    "$tool" -C INPUT -p "$proto" --dport "$port" -m comment --comment onebox -j ACCEPT >/dev/null 2>&1 || rc=$?
+    case "$rc" in 0) return 0 ;; 1) ;; *) return 2 ;; esac
+    # Exit 1 can also mean an operational error. Confirm absence using a readable
+    # chain; a matching listed rule makes the failed check inconclusive.
+    rules=$("$tool" -S INPUT 2>/dev/null) || return 2
+    printf '%s\n' "$rules" | awk -v port="$port" -v proto="$proto" '
+      { p=""; d=""; c=""
+        for (i=1; i<NF; i++) {
+          if ($i=="-p" || $i=="--protocol") p=$(i+1)
+          if ($i=="--dport" || $i=="--destination-port") d=$(i+1)
+          if ($i=="--comment") { c=$(i+1); gsub(/[\047\042]/,"",c) }
+        }
+        if ((p==proto || (proto=="tcp" && p=="6") || (proto=="udp" && p=="17")) && d==port && c=="onebox") found=1
+      }
+      END { exit !found }' || listed=$?
+    [ "$listed" = 1 ] || return 2
+    return 1
+}
+
 open_fw_port() {
     local port=$1
     local proto=$2
@@ -631,12 +652,20 @@ open_fw_port() {
         open_fw_port "$port" "udp" || return 1
         return 0
     fi
-    local success=0
+    local success=0 fw_recorded=0 ufw_active=0 ufw_status=""
     local fw_found=0
 
-    if command -v ufw >/dev/null 2>&1 && LC_ALL=C ufw status 2>/dev/null | grep -qw "active"; then
+    if command -v ufw >/dev/null 2>&1; then
+        ufw_status=$(LC_ALL=C ufw status 2>/dev/null) || {
+            printf '[错误] 无法读取 ufw 状态，取消修改防火墙。\n' >&2; return 1;
+        }
+        if printf '%s\n' "$ufw_status" | grep -q '^Status: active$'; then ufw_active=1; fi
+    fi
+    if [ "$ufw_active" = 1 ]; then
         fw_found=1
-        if LC_ALL=C ufw status | awk -v p="$port/$proto" '$1 == p && $2 == "ALLOW" {found=1} END {exit !found}'; then return 0; fi
+        if printf '%s\n' "$ufw_status" | awk -v p="$port/$proto" '$1 == p && ($2 == "ALLOW" || ($2 == "(v6)" && $3 == "ALLOW")) {found=1} END {exit !found}'; then return 0; fi
+        record_fw_port "$port" "$proto" || return 1
+        fw_recorded=1
         if ufw allow "${port}"/"${proto}" comment 'onebox' >/dev/null 2>&1; then
             success=1
         fi
@@ -661,21 +690,28 @@ open_fw_port() {
         # Record ownership before changing either scope so partial failures
         # remain recoverable by uninstall. Both scopes were absent above.
         record_fw_port "$port" "$proto" || return 1
+        fw_recorded=1
         if firewall-cmd --add-port="$port/$proto" --permanent >/dev/null 2>&1 &&
            firewall-cmd --add-port="$port/$proto" >/dev/null 2>&1 &&
            firewall-cmd --query-port="$port/$proto" --permanent >/dev/null 2>&1 &&
            firewall-cmd --query-port="$port/$proto" >/dev/null 2>&1; then success=1; fi
     elif command -v iptables >/dev/null 2>&1; then
         fw_found=1
+        record_fw_port "$port" "$proto" || return 1
+        fw_recorded=1
         success=1
-        if ! iptables -C INPUT -p "${proto}" --dport "${port}" -m comment --comment "onebox" -j ACCEPT >/dev/null 2>&1; then
-            iptables -I INPUT -p "${proto}" --dport "${port}" -m comment --comment "onebox" -j ACCEPT >/dev/null 2>&1 || success=0
-        fi
-        if command -v ip6tables >/dev/null 2>&1; then
-            if ! ip6tables -C INPUT -p "${proto}" --dport "${port}" -m comment --comment "onebox" -j ACCEPT >/dev/null 2>&1; then
-                ip6tables -I INPUT -p "${proto}" --dport "${port}" -m comment --comment "onebox" -j ACCEPT >/dev/null 2>&1 || success=0
-            fi
-        fi
+        local tool query_rc
+        for tool in iptables ip6tables; do
+            command -v "$tool" >/dev/null 2>&1 || continue
+            query_rc=0
+            iptables_rule_state "$tool" "$port" "$proto" || query_rc=$?
+            case "$query_rc" in
+                0) ;;
+                1) "$tool" -I INPUT -p "$proto" --dport "$port" -m comment --comment onebox -j ACCEPT >/dev/null 2>&1 || success=0 ;;
+                *) printf '[错误] 无法确认 %s 规则状态；保留端口记录。\n' "$tool" >&2; return 1 ;;
+            esac
+            [ "$success" = 1 ] || break
+        done
         if command -v netfilter-persistent >/dev/null 2>&1; then
             netfilter-persistent save >/dev/null 2>&1 || echo '[提示] 防火墙规则已添加，但持久化失败；规则记录将保留。' >&2
         else
@@ -684,7 +720,7 @@ open_fw_port() {
     fi
 
     if [ "$fw_found" -eq 1 ] && [ "$success" -eq 1 ]; then
-        record_fw_port "$port" "$proto" || return 1
+        [ "$fw_recorded" = 1 ] || record_fw_port "$port" "$proto" || return 1
         echo -e "${GREEN}[完成] 放行端口 ${port}/${proto} 成功${PLAIN}" >&2
     elif [ "$fw_found" -eq 0 ]; then
         echo -e "${YELLOW}[提示] 未检测到系统内置防火墙工具，请确保云服务商后台和本机系统放行了 ${port} 端口！${PLAIN}" >&2
@@ -708,9 +744,19 @@ close_fw_port() {
     # A rule belonging to another node or administrator must not be removed.
     if [ "${UNINSTALLING:-0}" != 1 ]; then check_port_in_config "$port" "$proto" && return 0; fi
     [ -f "$FW_PORTS_FILE" ] && grep -Fxq "$port/$proto" "$FW_PORTS_FILE" || return 0
-    if command -v ufw >/dev/null 2>&1 && LC_ALL=C ufw status 2>/dev/null | grep -qw "active"; then
-        if LC_ALL=C ufw status | awk -v p="$port/$proto" '$1 == p && $2 == "ALLOW" && /# onebox([[:space:]]|$)/ {found=1} END {exit !found}'; then
+    local ufw_active=0 ufw_status=""
+    if command -v ufw >/dev/null 2>&1; then
+        ufw_status=$(LC_ALL=C ufw status 2>/dev/null) || {
+            printf '[错误] 无法读取 ufw 状态；保留端口记录。\n' >&2; return 1;
+        }
+        if printf '%s\n' "$ufw_status" | grep -q '^Status: active$'; then ufw_active=1; fi
+    fi
+    if [ "$ufw_active" = 1 ]; then
+        if printf '%s\n' "$ufw_status" | awk -v p="$port/$proto" '$1 == p && ($2 == "ALLOW" || ($2 == "(v6)" && $3 == "ALLOW")) && /# onebox([[:space:]]|$)/ {found=1} END {exit !found}'; then
             ufw delete allow "${port}"/"${proto}" >/dev/null 2>&1 || return 1
+            ufw_status=$(LC_ALL=C ufw status 2>/dev/null) || return 1
+            printf '%s\n' "$ufw_status" | grep -q '^Status: active$' || return 1
+            if printf '%s\n' "$ufw_status" | awk -v p="$port/$proto" '$1 == p && ($2 == "ALLOW" || ($2 == "(v6)" && $3 == "ALLOW")) && /# onebox([[:space:]]|$)/ {found=1} END {exit !found}'; then return 1; fi
         else
             printf '[提示] 未确认 ufw 规则归属，保留 %s/%s。\n' "$port" "$proto" >&2
         fi
@@ -731,14 +777,19 @@ close_fw_port() {
             [ "$query_rc" = 1 ] || return 1
         done
     elif command -v iptables >/dev/null 2>&1; then
-        while iptables -C INPUT -p "${proto}" --dport "${port}" -m comment --comment "onebox" -j ACCEPT >/dev/null 2>&1; do
-            iptables -D INPUT -p "${proto}" --dport "${port}" -m comment --comment "onebox" -j ACCEPT >/dev/null 2>&1 || return 1
-        done
-        if command -v ip6tables >/dev/null 2>&1; then
-            while ip6tables -C INPUT -p "${proto}" --dport "${port}" -m comment --comment "onebox" -j ACCEPT >/dev/null 2>&1; do
-                ip6tables -D INPUT -p "${proto}" --dport "${port}" -m comment --comment "onebox" -j ACCEPT >/dev/null 2>&1 || return 1
+        local tool query_rc
+        for tool in iptables ip6tables; do
+            command -v "$tool" >/dev/null 2>&1 || continue
+            while :; do
+                query_rc=0
+                iptables_rule_state "$tool" "$port" "$proto" || query_rc=$?
+                case "$query_rc" in
+                    0) "$tool" -D INPUT -p "$proto" --dport "$port" -m comment --comment onebox -j ACCEPT >/dev/null 2>&1 || return 1 ;;
+                    1) break ;;
+                    *) printf '[错误] 无法确认 %s 规则已清理；保留端口记录。\n' "$tool" >&2; return 1 ;;
+                esac
             done
-        fi
+        done
         if command -v netfilter-persistent >/dev/null 2>&1; then
             netfilter-persistent save >/dev/null 2>&1 || return 1
 
@@ -1105,6 +1156,10 @@ init_base() {
 
         if [ -z "$VERSION" ]; then
             echo -e "${YELLOW}[提示] 获取版本信息失败！${PLAIN}"
+            if [ "$NON_INTERACTIVE" = 1 ]; then
+                printf '[错误] 无法取得最新版本；请检查网络或指定 --version。\n' >&2
+                return 1
+            fi
             ask "请手动输入要安装的 sing-box 版本号 (例如 1.10.1): " VERSION
             if [ -z "$VERSION" ]; then
                 echo -e "${RED}[错误] 未输入版本号，安装终止。${PLAIN}"
@@ -3327,6 +3382,12 @@ del_config() {
 
         backup_config || return 1
 
+        if [ "$IS_ARGO" = 1 ] && ! backup_argo_service_for_delete "$TAG"; then
+            printf '[错误] 无法完整备份隧道服务及 Token，已取消删除。\n' >&2
+            restore_config_and_service || return 1
+            return 1
+        fi
+
         if ! apply_jq_config 'del(.inbounds[] | select(.tag == $tag))' --arg tag "$TAG"; then
             restore_config_and_service || return 1
             pause
@@ -3347,8 +3408,12 @@ del_config() {
         fi
 
         if [ "$IS_ARGO" = 1 ]; then
-            if ! cleanup_created_argo_service "$TAG" || ! unregister_argo_service "cloudflared-$TAG"; then
-                printf '[错误] 隧道删除未完成，保留恢复信息，请检查服务。\n' >&2
+            if ! cleanup_created_argo_service_impl "$TAG" || ! unregister_argo_service "cloudflared-$TAG"; then
+                printf '[错误] 隧道删除未完成，正在恢复节点、服务与 Token。\n' >&2
+                if ! restore_config_and_service; then
+                    CONFIG_TX_BLOCKED=1
+                    printf '[错误] 隧道恢复失败，完整备份保留在 %s。\n' "$CONFIG_TX_DIR" >&2
+                fi
                 return 1
             fi
         fi
@@ -4286,6 +4351,112 @@ managed_tunnel_token_file() {
     esac
 }
 
+backup_argo_service_for_delete() {
+    local tag="$1" d="${CONFIG_TX_DIR:-}/argo-delete" svc unit token state rc active=0 enabled=0
+    [ -n "${CONFIG_TX_DIR:-}" ] && [[ "$tag" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+    svc="cloudflared-$tag"
+    if [ "$SERVICE_MANAGER" = openrc ]; then unit="/etc/init.d/$svc"
+    else unit="/etc/systemd/system/$svc.service"; fi
+    mkdir "$d" || return 1
+    if [ -f "$unit" ]; then cp -p "$unit" "$d/unit" || return 1
+    else : > "$d/unit.absent" || return 1; fi
+    token=$(managed_tunnel_token_file "$svc") || return 1
+    printf '%s\n' "$token" > "$d/token-path" || return 1
+    if [ -n "$token" ] && [ -e "$token" ]; then
+        [ -f "$token" ] && cp -p "$token" "$d/token" || return 1
+    fi
+    if [ "$SERVICE_MANAGER" = openrc ]; then
+        if [ -f "$unit" ]; then
+            rc=0
+            rc-service "$svc" status >/dev/null 2>&1 || rc=$?
+            case "$rc" in 0) active=1 ;; 3) ;; *) return 1 ;; esac
+        fi
+        if [ -e "/etc/runlevels/default/$svc" ] || [ -L "/etc/runlevels/default/$svc" ]; then enabled=1; fi
+    else
+        state=$(systemctl show "$svc" -p LoadState --value) || return 1
+        case "$state" in
+            not-found) ;;
+            loaded)
+                state=$(systemctl show "$svc" -p ActiveState --value) || return 1
+                case "$state" in active|activating|reloading) active=1 ;; inactive|failed) ;; *) return 1 ;; esac
+                state=$(systemctl show "$svc" -p UnitFileState --value) || return 1
+                case "$state" in enabled) enabled=1 ;; disabled) ;; *) return 1 ;; esac ;;
+            *) return 1 ;;
+        esac
+    fi
+    # Publish the marker only after all files and state are safely backed up.
+    printf '%s\n' "$active" > "$d/active" &&
+    printf '%s\n' "$enabled" > "$d/enabled" &&
+    printf '%s\n' "$tag" > "$d/tag.tmp" && mv -f "$d/tag.tmp" "$d/tag"
+}
+
+restore_argo_file() {
+    local source="$1" target="$2" tmp
+    tmp=$(mktemp "${target}.restore.XXXXXX") || return 1
+    SB_OWNED_TEMP_FILES+=("$tmp")
+    if cp -p "$source" "$tmp" && mv -f "$tmp" "$target"; then return 0; fi
+    rm -f "$tmp"
+    return 1
+}
+
+restore_deleted_argo_service_files() {
+    local d="$1/argo-delete" tag svc unit token
+    [ -f "$d/tag" ] || return 0
+    IFS= read -r tag < "$d/tag" && [[ "$tag" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+    IFS= read -r token < "$d/token-path" || return 1
+    if [ -n "$token" ]; then
+        [[ "$token" =~ ^/etc/onebox/\.tunnel-token\.[A-Za-z0-9]+$ ]] || return 1
+    fi
+    svc="cloudflared-$tag"
+    if [ "$SERVICE_MANAGER" = openrc ]; then unit="/etc/init.d/$svc"
+    else unit="/etc/systemd/system/$svc.service"; fi
+    [ -f "$d/unit" ] || [ -f "$d/unit.absent" ] || return 1
+    stop_managed_service "$svc" || return 1
+    if [ -n "$token" ]; then
+        if [ -f "$d/token" ]; then restore_argo_file "$d/token" "$token" || return 1
+        else rm -f -- "$token" || return 1; fi
+    fi
+    if [ -f "$d/unit" ]; then restore_argo_file "$d/unit" "$unit" || return 1
+    else rm -f -- "$unit" || return 1; fi
+    if [ "$SERVICE_MANAGER" != openrc ]; then systemctl daemon-reload || return 1; fi
+    return 0
+}
+
+restore_deleted_argo_service_state() {
+    local d="$1/argo-delete" tag svc active enabled rc state
+    [ -f "$d/tag" ] || return 0
+    IFS= read -r tag < "$d/tag" && [[ "$tag" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+    IFS= read -r active < "$d/active" && IFS= read -r enabled < "$d/enabled" || return 1
+    case "$active:$enabled" in 0:0|0:1|1:0|1:1) ;; *) return 1 ;; esac
+    svc="cloudflared-$tag"
+    if [ -f "$d/unit.absent" ]; then [ "$active:$enabled" = 0:0 ]; return $?; fi
+    if [ "$SERVICE_MANAGER" = openrc ]; then
+        if [ "$enabled" = 1 ]; then rc-update add "$svc" default || return 1
+        elif [ -e "/etc/runlevels/default/$svc" ] || [ -L "/etc/runlevels/default/$svc" ]; then rc-update del "$svc" default || return 1; fi
+        if [ "$active" = 1 ]; then
+            rc-service "$svc" start && rc-service "$svc" status >/dev/null 2>&1 || return 1
+        else
+            rc=0
+            rc-service "$svc" status >/dev/null 2>&1 || rc=$?
+            case "$rc" in 0) rc-service "$svc" stop || return 1 ;; 3) ;; *) return 1 ;; esac
+            rc=0
+            rc-service "$svc" status >/dev/null 2>&1 || rc=$?
+            [ "$rc" = 3 ] || return 1
+        fi
+    else
+        if [ "$enabled" = 1 ]; then systemctl enable "$svc" >/dev/null 2>&1 || return 1
+        else systemctl disable "$svc" >/dev/null 2>&1 || return 1; fi
+        if [ "$active" = 1 ]; then
+            systemctl start "$svc" && systemctl is-active --quiet "$svc" || return 1
+        else
+            systemctl stop "$svc" || return 1
+            state=$(systemctl show "$svc" -p ActiveState --value) || return 1
+            case "$state" in inactive|failed) ;; *) return 1 ;; esac
+        fi
+    fi
+    return 0
+}
+
 cleanup_created_argo_service_impl() {
     local tag="$1" svc token_file
     [[ "$tag" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
@@ -4345,6 +4516,10 @@ restore_config_and_service() {
     if [ -n "${CONFIG_TX_ARGO_PENDING:-}" ]; then
         cleanup_created_argo_service "$CONFIG_TX_ARGO_PENDING" || return 1
     fi
+    if ! restore_deleted_argo_service_files "$d"; then
+        printf '隧道文件恢复失败；备份保留在 %s\n' "$d" >&2
+        return 1
+    fi
     local restore_tmp
     restore_tmp=$(mktemp "${CONFIG_FILE}.restore.XXXXXX") || return 1
     SB_OWNED_TEMP_FILES+=("$restore_tmp")
@@ -4365,6 +4540,10 @@ restore_config_and_service() {
     load_secrets || return 1
     if ! restore_service_state "$d"; then
         printf '配置与 secrets 已恢复，但服务恢复失败；备份保留在 %s\n' "$d" >&2
+        return 1
+    fi
+    if ! restore_deleted_argo_service_state "$d"; then
+        printf '隧道运行状态恢复失败；备份保留在 %s\n' "$d" >&2
         return 1
     fi
     commit_config
