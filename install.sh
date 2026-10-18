@@ -59,52 +59,28 @@ KERNEL_TMP_DIR=""
 declare -a SB_OWNED_TEMP_FILES=()
 declare -a SB_OWNED_TEMP_DIRS=()
 
-SB_PROGRESS_PID=""
 SB_SNI_PID=""
-stop_progress() {
-    if [ -n "${SB_PROGRESS_PID:-}" ]; then
-        kill "$SB_PROGRESS_PID" 2>/dev/null || :
-        wait "$SB_PROGRESS_PID" 2>/dev/null || :
-        SB_PROGRESS_PID=""
-    fi
-}
 run_step() {
-    local label="$1" log rc
+    local label="$1" log rc=0
     shift
     mkdir -p /var/log/onebox && chmod 700 /var/log/onebox || return 1
     log=$(mktemp /var/log/onebox/step.XXXXXX) || return 1
     chmod 600 "$log" || { rm -f "$log"; return 1; }
-    if [ -t 2 ] && [ "${TERM:-dumb}" != dumb ]; then
-        (
-            trap - EXIT
-            trap 'exit 0' INT TERM
-            frames=('[>>>.............]' '[...>>>..........]' '[......>>>.......]' '[.........>>>....]' '[............>>>.]')
-            i=0
-            while :; do
-                printf '\r\033[K%s %s' "${frames[i]}" "$label" >&2
-                i=$(( (i + 1) % ${#frames[@]} ))
-                sleep 0.2
-            done
-        ) &
-        SB_PROGRESS_PID=$!
-    else
-        printf '[进行中] %s\n' "$label" >&2
-    fi
+    # Keep installation transactions free of background animation jobs and their waits.
+    printf '[进行中] %s\n' "$label" >&2
     if "$@" >"$log" 2>&1; then rc=0; else rc=$?; fi
-    stop_progress
-    if [ -t 2 ] && [ "${TERM:-dumb}" != dumb ]; then printf '\r\033[K' >&2; fi
     if [ "$rc" -eq 0 ]; then
         printf '[完成] %s\n' "$label" >&2
         rm -f "$log"
     else
         printf '[失败] %s（退出码 %s）\n日志：%s\n' "$label" "$rc" "$log" >&2
+        printf '[诊断] Bash %s；系统架构 %s；包管理器 %s。\n' "$BASH_VERSION" "${ARCH:-未知}" "${PACKAGE_MANAGER:-未知}" >&2
         tail -n 15 "$log" >&2
     fi
     return "$rc"
 }
 
 cleanup_on_exit() {
-    stop_progress
     stop_sni_selection
     if [ -n "${CONFIG_TX_DIR:-}" ] && [ "${CONFIG_TX_RECOVERING:-0}" != 1 ]; then
         CONFIG_TX_RECOVERING=1
@@ -846,7 +822,7 @@ migrate_certs() {
           (.inbounds[] | select(.tls.key_path? == $oldkey) | .tls.key_path) = $newkey' \
           --arg oldcert "$CERT_DIR/fullchain.cer" --arg oldkey "$CERT_DIR/private.key" \
           --arg newcert "$CERT_DIR/$kind.cer" --arg newkey "$CERT_DIR/$kind.key" || exit 1
-        /usr/local/lib/onebox/sing-box check -c "$CONFIG_FILE" || exit 1
+        check_kernel_config "$CONFIG_FILE" || exit 1
         if [ "$kind" = real ]; then save_secret REAL_DOMAIN "${DOMAIN:-}" || exit 1
         else save_secret SELF_DOMAIN "${DOMAIN:-}" || exit 1; fi
         remove_secret CERT_TYPE && remove_secret DOMAIN || exit 1
@@ -861,6 +837,32 @@ kernel_ok() {
     ver=$( ( /usr/local/lib/onebox/sing-box version ) 2>/dev/null ) || return 1
     echo "$ver" | grep -qE '[0-9]+\.[0-9]+\.[0-9]+' || return 1
     return 0
+}
+
+require_kernel_binary() {
+    local bin="${1:-/usr/local/lib/onebox/sing-box}"
+    if [ ! -f "$bin" ]; then
+        printf '[错误] sing-box 内核文件不存在：%s。请重新安装或执行 onebox update。\n' "$bin" >&2
+        return 1
+    fi
+    if [ ! -x "$bin" ]; then
+        printf '[错误] sing-box 内核文件不可执行：%s。请检查权限或重新安装。\n' "$bin" >&2
+        return 1
+    fi
+}
+
+check_kernel_config() {
+    local config="$1" bin="${2:-/usr/local/lib/onebox/sing-box}"
+    require_kernel_binary "$bin" || return 1
+    "$bin" check -c "$config"
+}
+
+install_kernel_binary() {
+    local source="$1" target=/usr/local/lib/onebox/sing-box
+    mv -f "$source" "$target" || return 1
+    require_kernel_binary "$target" || return 1
+    # Validate the installed path before the transaction can report success.
+    "$target" version
 }
 
 fetch_url() {
@@ -939,12 +941,13 @@ install_kernel() {
     [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]] || return 1
     (
         umask 077
-        local d newbin active=0 touched=0 done_ok=0 new_is_112=0
+        local d newbin active=0 touched=0 done_ok=0 new_is_112=0 kernel_tx_owner="$BASHPID"
         mkdir -p /usr/local/lib/onebox || exit 1
         d=$(mktemp -d /usr/local/lib/onebox/.kernel-tx.XXXXXX) || exit 1
         kernel_tx_finish() {
             local rc=$? failed=0
-            stop_progress
+            # An inherited EXIT trap must never roll back another shell's transaction.
+            [ "$BASHPID" = "$kernel_tx_owner" ] || return 0
             trap - EXIT INT TERM
             if [ "$touched" = 1 ] && [ "$done_ok" = 0 ]; then
                 stop_sing_box_if_present || failed=1
@@ -998,13 +1001,13 @@ install_kernel() {
         if [ -f "$CONFIG_FILE" ]; then
             cp -p "$CONFIG_FILE" "$d/test_config.json" || exit 1
             upgrade_config_schema "$d/test_config.json" "$new_is_112" || exit 1
-            run_step "检查现有配置兼容性" "$newbin" check -c "$d/test_config.json" || exit 1
+            run_step "检查现有配置兼容性" check_kernel_config "$d/test_config.json" "$newbin" || exit 1
         fi
         touched=1
         if [ "$active" = 1 ]; then
             if [ "$SERVICE_MANAGER" = openrc ]; then run_step "停止旧内核" rc-service onebox stop || exit 1; else run_step "停止旧内核" systemctl stop onebox || exit 1; fi
         fi
-        run_step "[4/4] 安装内核" mv -f "$newbin" /usr/local/lib/onebox/sing-box || exit 1
+        run_step "[4/4] 安装内核" install_kernel_binary "$newbin" || exit 1
         if [ -f "$d/test_config.json" ]; then
             mv -f "$d/test_config.json" "$CONFIG_FILE" || exit 1
         fi
@@ -1146,7 +1149,7 @@ init_base() {
     else
         upgrade_config_schema "$CONFIG_FILE" "$is_112" || return 1
     fi
-    /usr/local/lib/onebox/sing-box check -c "$CONFIG_FILE" || return 1
+    check_kernel_config "$CONFIG_FILE" || return 1
     migrate_certs || return 1
 
     if [ "${KERNEL_REINSTALLED:-0}" -eq 1 ]; then
@@ -1177,7 +1180,7 @@ restart_service() {
         return 0
     fi
 
-    if ! /usr/local/lib/onebox/sing-box check -c "$CONFIG_FILE"; then return 1; fi
+    if ! check_kernel_config "$CONFIG_FILE"; then return 1; fi
 
     if [ "$SERVICE_MANAGER" == openrc ]; then
         if [ ! -e "/etc/init.d/onebox" ] && [ ! -L "/etc/init.d/onebox" ]; then
@@ -4887,7 +4890,7 @@ cli_dispatch() {
                     fi
                     return "$rc" ;;
                 delete) del_config ;;
-                check) /usr/local/lib/onebox/sing-box check -c "$CONFIG_FILE" ;;
+                check) check_kernel_config "$CONFIG_FILE" ;;
                 start|restart) restart_service ;;
                 stop) stop_sing_box_if_present ;;
                 update)

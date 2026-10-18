@@ -218,6 +218,8 @@ onebox bbr                            # 内核不支持或外部配置冲突时�
 onebox --help
 ```
 
+安装及更新会显示各阶段的开始、完成或失败状态；内核替换后会从固定安装路径验证能否运行，再报告安装完成。失败时会显示退出码、Bash 版本、系统架构及日志路径。
+
 `update-script` 从本仓库的 `main` 分支下载。`install` 重复运行会保留现有节点；指定版本不会替换已安装内核，替换请使用 `update --version`。
 
 `doctor` 汇总程序是否可运行、配置 JSON、主服务和登记隧道的状态，以及配置中引用的 onebox 证书有效期；7 天内到期会提醒。发现异常或缺少检查工具时返回 `1`，不会联网修复或安装依赖。内核完整配置校验仍使用 `onebox check`。`status` 会区分 `not-installed`、`inactive`/`stopped`、`failed`、`active` 等状态。
