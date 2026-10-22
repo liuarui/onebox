@@ -2,8 +2,45 @@
 # 免责声明：本项目仅供学习与技术研究，请在获得授权的环境中使用。
 # 使用者应遵守适用法律法规，并自行承担使用产生的风险；本项目按 LICENSE 原样提供。
 # POSIX bootstrap: Alpine/minimal images may not have Bash yet.
-if [ -z "${BASH_VERSION:-}" ]; then
-    if ! command -v bash >/dev/null 2>&1; then
+bootstrap_needs_bash=1
+if [ -n "${BASH_VERSION:-}" ] && [ "${BASH_VERSINFO[0]:-0}" -ge 4 ]; then
+    bootstrap_needs_bash=0
+fi
+if [ "$bootstrap_needs_bash" = 1 ]; then
+    bootstrap_script="$0"
+    bootstrap_temp=0
+    bootstrap_source_is_script=0
+    bootstrap_source_shebang=""
+    if [ -f "$bootstrap_script" ] && [ -r "$bootstrap_script" ]; then
+        IFS= read -r bootstrap_source_shebang < "$bootstrap_script" || :
+        [ "$bootstrap_source_shebang" = '#!/bin/sh' ] && bootstrap_source_is_script=1
+    fi
+    if [ "$bootstrap_source_is_script" != 1 ]; then
+        bootstrap_script="/tmp/onebox-bootstrap.$$.sh"
+        bootstrap_suffix=0
+        while ! (umask 077; set -C; : > "$bootstrap_script") 2>/dev/null; do
+            bootstrap_suffix=$((bootstrap_suffix + 1))
+            [ "$bootstrap_suffix" -le 9 ] || { echo '[错误] 无法创建安全的临时启动文件。' >&2; exit 1; }
+            bootstrap_script="/tmp/onebox-bootstrap.$$.${bootstrap_suffix}.sh"
+        done
+        bootstrap_temp=1
+        trap 'rm -f "$bootstrap_script"' 0
+        bootstrap_url='https://raw.githubusercontent.com/liuarui/onebox/main/install.sh'
+        if command -v curl >/dev/null 2>&1 && curl -fsSL --connect-timeout 10 --max-time 180 "$bootstrap_url" -o "$bootstrap_script"; then :
+        elif command -v wget >/dev/null 2>&1 && wget -T 180 -q -O "$bootstrap_script" "$bootstrap_url"; then :
+        else
+            echo '[错误] 无法从标准输入启动：请确认 curl/wget 可通过 HTTPS 访问 GitHub Raw。' >&2
+            exit 2
+        fi
+        [ -s "$bootstrap_script" ] || { echo '[错误] 下载的启动脚本为空。' >&2; exit 2; }
+        IFS= read -r bootstrap_shebang < "$bootstrap_script"
+        [ "$bootstrap_shebang" = '#!/bin/sh' ] || { echo '[错误] 下载的启动脚本格式无效。' >&2; exit 2; }
+    fi
+    bootstrap_have_bash=0
+    if command -v bash >/dev/null 2>&1 && bash -c '[ "${BASH_VERSINFO[0]}" -ge 4 ]' >/dev/null 2>&1; then
+        bootstrap_have_bash=1
+    fi
+    if [ "$bootstrap_have_bash" != 1 ]; then
         case "${1:-}" in
             -h|--help|help) printf '%s\n' '用法: sh install.sh [install|add|delete|list|links|status|check|start|stop|restart|update|cert|outbound|bbr|uninstall] [选项]' '运行命令时会自动安装 Bash；完整参数说明见 README.md。'; exit 0 ;;
         esac
@@ -19,7 +56,6 @@ if [ -z "${BASH_VERSION:-}" ]; then
         done
         [ "$(uname -s)" = Linux ] || { echo '[错误] 仅支持 Linux。' >&2; exit 3; }
         [ "$(id -u)" = 0 ] || { echo '[错误] 安装 Bash 需要 root，请使用 sudo sh install.sh ...。' >&2; exit 3; }
-        [ -f "$0" ] || { echo '[错误] 请先将脚本下载到文件，再用 sh install.sh 执行。' >&2; exit 2; }
         echo '[信息] 缺少 Bash，正在自动安装。' >&2
         if command -v apk >/dev/null 2>&1; then apk add --no-cache bash ca-certificates
         elif command -v apt-get >/dev/null 2>&1; then
@@ -30,9 +66,15 @@ if [ -z "${BASH_VERSION:-}" ]; then
         elif command -v pacman >/dev/null 2>&1; then pacman -Syu --noconfirm --needed bash ca-certificates
         else echo '[错误] 不支持的包管理器，无法自动安装 Bash。' >&2; exit 3
         fi
-        [ "$?" = 0 ] && command -v bash >/dev/null 2>&1 || { echo '[错误] Bash 安装失败，请检查软件源和网络。' >&2; exit 1; }
+        [ "$?" = 0 ] && command -v bash >/dev/null 2>&1 && bash -c '[ "${BASH_VERSINFO[0]}" -ge 4 ]' >/dev/null 2>&1 || { echo '[错误] Bash 4+ 安装失败，请检查软件源和网络。' >&2; exit 1; }
     fi
-    exec bash "$0" "$@"
+    if [ "$bootstrap_temp" = 1 ]; then
+        bash -n "$bootstrap_script" || { echo '[错误] 下载的启动脚本语法检查失败。' >&2; exit 2; }
+        bash "$bootstrap_script" "$@"
+        bootstrap_rc=$?
+        exit "$bootstrap_rc"
+    fi
+    exec bash "$bootstrap_script" "$@"
 fi
 
 [ "${BASH_VERSINFO[0]}" -ge 4 ] || { echo '[错误] 需要 Bash 4 或更高版本。' >&2; exit 3; }
@@ -4832,7 +4874,12 @@ parse_cli() {
         fi
     fi
     if [ "$CLI_COMMAND" = menu ]; then
-        [ "$NON_INTERACTIVE" = 0 ] && [ -t 0 ] || die '交互菜单需要终端；无交互默认安装请使用 onebox -n。' 2
+        [ "$NON_INTERACTIVE" = 0 ] || die '交互菜单需要终端；无交互默认安装请使用 onebox -n。' 2
+        if [ ! -t 0 ]; then
+            [ -r /dev/tty ] || die '交互菜单需要可用终端；无交互默认安装请使用 onebox -n。' 2
+            exec </dev/tty || die '无法连接交互终端。' 2
+        fi
+        [ -t 0 ] || die '交互菜单需要终端；无交互默认安装请使用 onebox -n。' 2
     fi
     [ "$CLI_COMMAND" = menu ] || NON_INTERACTIVE=1
     case "$CLI_COMMAND" in install|add|delete|list|links|status|check|doctor|logs|start|stop|restart|update|update-script|cert|outbound|bbr|uninstall|menu) ;; *) die "未知命令：$CLI_COMMAND（使用 --help 查看用法）。" 2 ;; esac

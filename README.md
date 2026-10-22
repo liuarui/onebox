@@ -4,23 +4,27 @@
 
 本项目仅供学习与技术研究，请在获得授权的服务器和网络环境中使用。使用者应遵守所在地适用的法律法规，不得用于违法或未经授权的活动，并自行评估和承担使用产生的风险。本项目按 [LICENSE](LICENSE) 原样提供，不提供任何明示或默示担保；作者及贡献者在适用法律允许的范围内不对使用本项目造成的损失承担责任。
 
-以 root 运行。指定命令后自动进入无交互模式，也可附加 `--non-interactive`（`-n`）。安装等操作会通过系统包管理器安装缺失依赖；下载到文件后用 `sh install.sh` 执行，还可自动安装 Bash。`status`、`doctor`、`logs` 为只读查看，缺少所需工具时会提示，不会安装依赖。
+以 root 运行。指定命令后自动进入无交互模式，也可附加 `--non-interactive`（`-n`）。安装脚本会自动安装 Bash 和执行安装操作所需的依赖。`status`、`doctor`、`logs` 为只读查看，缺少所需工具时会提示，不会安装依赖。
 
 支持使用 apt、apk、dnf/yum、zypper、pacman 的 Debian/Ubuntu、Alpine、RHEL/Rocky/AlmaLinux/Fedora、openSUSE、Arch 等常见 Linux。需要**正在运行的 systemd 或 OpenRC**；无 init 的 Docker/WSL、其他 init、未知包管理器或架构会报错退出。支持 x86_64、ARM64、x86、ARMv6/v7、riscv64、s390x、ppc64le；具体版本必须提供对应官方发行包，Argo 仅支持前五类架构。Alpine 优先使用官方 musl 包。
 
 ## 交互式一键安装（推荐）
 
-请先用 root 登录，或执行 `sudo -i` 切换到 root：
+请用 root 登录。直接把 GitHub Raw 脚本交给 `sh` 执行：
 
-```bash
-bash <(curl -fsSL "https://raw.githubusercontent.com/liuarui/onebox/main/install.sh") menu
+```sh
+wget -qO- "https://raw.githubusercontent.com/liuarui/onebox/main/install.sh" | sh -s -- menu
 ```
 
-上面命令打开交互菜单，选择“1) 添加节点”，再选择协议并按提示填写端口等参数。安装完成后，直接执行 `onebox` 即可再次打开管理菜单，支持修改、查看、更新和卸载。
+也可以使用 curl：
 
-请在 Bash 终端执行，系统需先有 Bash、curl 和 CA 证书。精简 Alpine 可先执行 `apk add --no-cache bash curl ca-certificates`，再运行 `bash` 切换终端；Debian/Ubuntu 可先执行 `apt-get update && apt-get install -y bash curl ca-certificates`。其余依赖由脚本自动安装。
+```sh
+curl -fsSL "https://raw.githubusercontent.com/liuarui/onebox/main/install.sh" | sh -s -- menu
+```
 
-脚本会将流式入口重新下载到私有临时目录，校验后执行，正常退出或失败时清理临时文件。安装后执行 `onebox` 进入菜单，执行 `onebox uninstall --yes` 无交互卸载。
+管道启动时，脚本会先通过同一个下载器获取一份可重启的临时副本，再自动安装缺失的 Bash；进入交互菜单时会从终端读取输入。执行安装操作时，其他缺失依赖也会自动安装。安装完成后直接执行 `onebox` 可再次打开管理菜单；无交互卸载使用 `onebox uninstall --yes`。
+
+远程命令开始前必须已有能通过 HTTPS 证书校验访问 GitHub Raw 的 `wget` 或 `curl`；脚本尚未下载时无法替自己安装下载器。进入脚本后，缺少 Bash 和其他依赖会自动安装。
 
 脚本地址：[GitHub Raw install.sh](https://raw.githubusercontent.com/liuarui/onebox/main/install.sh)。
 
@@ -35,8 +39,10 @@ sh install.sh menu
 
 适合自动化部署。默认 VLESS + Reality、TCP 443，自动生成 UUID、Reality 密钥和分享链接；自动检测 SNI 并选择排名第一的候选：
 
-```bash
-bash <(curl -fsSL "https://raw.githubusercontent.com/liuarui/onebox/main/install.sh") add --protocol reality --port 443 --non-interactive
+无交互一键安装：
+
+```sh
+wget -qO- "https://raw.githubusercontent.com/liuarui/onebox/main/install.sh" | sh -s -- add --protocol reality --port 443 --non-interactive
 ```
 
 443 已占用或已有同名节点时会报错退出。为兼容已有用法，省略所有参数运行 `install.sh` 仍执行上述默认无交互安装；交互安装请保留 `menu`。
