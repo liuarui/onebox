@@ -26,8 +26,15 @@ if [ "$bootstrap_needs_bash" = 1 ]; then
         bootstrap_temp=1
         trap 'rm -f "$bootstrap_script"' 0
         bootstrap_url='https://raw.githubusercontent.com/liuarui/onebox/main/install.sh'
-        if command -v curl >/dev/null 2>&1 && curl -fsSL --connect-timeout 10 --max-time 180 "$bootstrap_url" -o "$bootstrap_script"; then :
-        elif command -v wget >/dev/null 2>&1 && wget -T 180 -q -O "$bootstrap_script" "$bootstrap_url"; then :
+        bootstrap_wget() {
+            set -- -T 15 -q -O "$bootstrap_script" "$bootstrap_url"
+            # BusyBox wget has no retry option and does not use GNU's retry loop.
+            case "$(wget --help 2>&1)" in *--tries*) set -- -t 1 "$@" ;; esac
+            if command -v timeout >/dev/null 2>&1; then timeout -k 2 30 wget "$@"
+            else wget "$@"; fi
+        }
+        if command -v curl >/dev/null 2>&1 && curl -fsSL --connect-timeout 10 --max-time 30 "$bootstrap_url" -o "$bootstrap_script"; then :
+        elif command -v wget >/dev/null 2>&1 && bootstrap_wget; then :
         else
             echo '[错误] 无法从标准输入启动：请确认 curl/wget 可通过 HTTPS 访问 GitHub Raw。' >&2
             exit 2
@@ -565,6 +572,17 @@ apply_jq_config() {
     return 1
 }
 
+wget_fetch_once() {
+    local url="$1" out="$2" network_timeout="$3" total_timeout="$4"
+    local -a retry_options=()
+    case "$(wget --help 2>&1)" in *--tries*) retry_options=(-t 1) ;; esac
+    if command -v timeout >/dev/null 2>&1; then
+        timeout -k 2 "$total_timeout" wget -T "$network_timeout" "${retry_options[@]}" -qO "$out" "$url"
+    else
+        wget -T "$network_timeout" "${retry_options[@]}" -qO "$out" "$url"
+    fi
+}
+
 http_get() {
     local url="$1" body
     if command -v curl >/dev/null 2>&1; then
@@ -574,7 +592,7 @@ http_get() {
         fi
     fi
     if command -v wget >/dev/null 2>&1; then
-        if body=$(wget -T 10 -qO - "$url" 2>/dev/null); then
+        if body=$(wget_fetch_once "$url" - 10 12 2>/dev/null); then
             printf '%s' "$body"
             return 0
         fi
@@ -999,11 +1017,7 @@ fetch_url() {
     fi
     : > "$out" || return 1
     if command -v wget >/dev/null 2>&1; then
-        if command -v timeout >/dev/null 2>&1; then
-            timeout 300 wget -T 30 -qO "$out" "$url" && return 0
-        else
-            wget -T 30 -qO "$out" "$url" && return 0
-        fi
+        wget_fetch_once "$url" "$out" 30 300 && return 0
     fi
     return 1
 }
@@ -1067,7 +1081,7 @@ install_kernel() {
     [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]] || return 1
     (
         umask 077
-        local d newbin active=0 touched=0 done_ok=0 new_is_112=0 kernel_tx_owner="$BASHPID"
+        local d newbin config_backup='' config_staged='' active=0 touched=0 done_ok=0 new_is_112=0 kernel_tx_owner="$BASHPID"
         mkdir -p /usr/local/lib/onebox || exit 1
         d=$(mktemp -d /usr/local/lib/onebox/.kernel-tx.XXXXXX) || exit 1
         kernel_tx_finish() {
@@ -1077,11 +1091,11 @@ install_kernel() {
             trap - EXIT INT TERM
             if [ "$touched" = 1 ] && [ "$done_ok" = 0 ]; then
                 stop_sing_box_if_present || failed=1
-                if [ -f "$d/old_config" ]; then
-                    if ! cp -p "$d/old_config" "$d/restore_cfg" || ! mv -f "$d/restore_cfg" "$CONFIG_FILE"; then failed=1; fi
+                if [ -n "$config_backup" ] && [ -f "$config_backup" ]; then
+                    mv -f "$config_backup" "$CONFIG_FILE" || failed=1
                 fi
                 if [ -f "$d/old" ]; then
-                    if ! cp -p "$d/old" "$d/restore" || ! mv -f "$d/restore" /usr/local/lib/onebox/sing-box; then failed=1; fi
+                    mv -f "$d/old" /usr/local/lib/onebox/sing-box || failed=1
                 else
                     rm -f /usr/local/lib/onebox/sing-box || failed=1
                 fi
@@ -1096,9 +1110,11 @@ install_kernel() {
                 fi
             fi
             if [ "$failed" = 1 ]; then
-                printf '内核或服务恢复失败，完整备份保留: %s\n' "$d" >&2
+                printf '内核或服务恢复失败，恢复记录保留: %s；配置备份: %s\n' "$d" "${config_backup:-无}" >&2
                 exit 1
             fi
+            [ -z "$config_backup" ] || rm -f -- "$config_backup"
+            [ -z "$config_staged" ] || rm -f -- "$config_staged"
             rm -rf "$d"
             exit "$rc"
         }
@@ -1111,7 +1127,10 @@ install_kernel() {
             systemctl is-active --quiet onebox && active=1
         fi
         if [ -e /usr/local/lib/onebox/sing-box ]; then cp -p /usr/local/lib/onebox/sing-box "$d/old" || exit 1; fi
-        if [ -f "$CONFIG_FILE" ]; then cp -p "$CONFIG_FILE" "$d/old_config" || exit 1; fi
+        if [ -f "$CONFIG_FILE" ]; then
+            config_backup=$(mktemp "$CONFIG_DIR/.kernel-backup.XXXXXX") || exit 1
+            cp -p "$CONFIG_FILE" "$config_backup" || exit 1
+        fi
         run_step "[1/4] 下载 sing-box v${ver} (${SB_ARCH})" download_kernel_archive "$ver" "$d" || exit 1
         mkdir "$d/extract" || exit 1
         run_step "[2/4] 解压内核" tar -xzf "$d/archive" -C "$d/extract" "$KERNEL_ASSET_STEM/sing-box" || exit 1
@@ -1125,17 +1144,18 @@ install_kernel() {
         fi
         sb_bin_ge_112 "$newbin" && new_is_112=1
         if [ -f "$CONFIG_FILE" ]; then
-            cp -p "$CONFIG_FILE" "$d/test_config.json" || exit 1
-            upgrade_config_schema "$d/test_config.json" "$new_is_112" || exit 1
-            run_step "检查现有配置兼容性" check_kernel_config "$d/test_config.json" "$newbin" || exit 1
+            config_staged=$(mktemp "$CONFIG_DIR/.kernel-config.XXXXXX") || exit 1
+            cp -p "$CONFIG_FILE" "$config_staged" || exit 1
+            upgrade_config_schema "$config_staged" "$new_is_112" || exit 1
+            run_step "检查现有配置兼容性" check_kernel_config "$config_staged" "$newbin" || exit 1
         fi
         touched=1
         if [ "$active" = 1 ]; then
             if [ "$SERVICE_MANAGER" = openrc ]; then run_step "停止旧内核" rc-service onebox stop || exit 1; else run_step "停止旧内核" systemctl stop onebox || exit 1; fi
         fi
         run_step "[4/4] 安装内核" install_kernel_binary "$newbin" || exit 1
-        if [ -f "$d/test_config.json" ]; then
-            mv -f "$d/test_config.json" "$CONFIG_FILE" || exit 1
+        if [ -n "$config_staged" ]; then
+            mv -f "$config_staged" "$CONFIG_FILE" || exit 1
         fi
         if [ "$mode" != norestart ]; then run_step "启动并检查服务" restart_service || exit 1; fi
         done_ok=1
@@ -1298,6 +1318,65 @@ init_base() {
     fi
 }
 
+wait_onebox_ready() {
+    local expected sockets state pid properties key value proto port net _socket_state _recv _send endpoint _peer owner missing
+    local deadline=$((SECONDS+10))
+    local -A listeners=()
+    expected=$(mktemp "$CONFIG_DIR/.ready-ports.XXXXXX") || return 1
+    SB_OWNED_TEMP_FILES+=("$expected")
+    sockets=$(mktemp "$CONFIG_DIR/.ready-sockets.XXXXXX") || return 1
+    SB_OWNED_TEMP_FILES+=("$sockets")
+    if ! jq -r '.inbounds[] | select(.listen_port != null) |
+        if .type == "hysteria2" or .type == "tuic" or .network == "udp" then ["udp", .listen_port]
+        elif .type == "shadowsocks" and (.network // "") != "tcp" then
+            ["tcp", .listen_port], ["udp", .listen_port]
+        else ["tcp", .listen_port] end | @tsv' "$CONFIG_FILE" > "$expected"; then
+        return 1
+    fi
+    while :; do
+        state=''; pid=''; listeners=(); missing=''
+        if [ "$SERVICE_MANAGER" = openrc ]; then
+            if rc-service onebox status >/dev/null 2>&1; then
+                state=active
+                [ ! -r /var/run/onebox.pid ] || read -r pid < /var/run/onebox.pid
+            fi
+        else
+            properties=$(systemctl show onebox -p ActiveState -p MainPID) || return 1
+            while IFS='=' read -r key value; do
+                case "$key" in ActiveState) state="$value" ;; MainPID) pid="$value" ;; esac
+            done <<< "$properties"
+        fi
+        if [ "$state" = active ] && [[ "$pid" =~ ^[1-9][0-9]*$ ]]; then
+            # One snapshot per poll; ownership prevents unrelated services on the
+            # same port from satisfying readiness. No grep/awk pipelines per node.
+            if ! ss -H -lnptu > "$sockets"; then
+                printf '[错误] 无法读取本机监听端口。\n' >&2
+                return 1
+            fi
+            while read -r net _socket_state _recv _send endpoint _peer owner; do
+                case "$net" in tcp|udp) ;; *) continue ;; esac
+                [[ "$owner" == *"pid=$pid,"* ]] || continue
+                port="${endpoint##*:}"
+                [[ "$port" =~ ^[0-9]+$ ]] || continue
+                listeners["$net:$port"]=1
+            done < "$sockets"
+            while read -r proto port; do
+                [ -n "$proto" ] || continue
+                [ "${listeners["$proto:$port"]:-0}" = 1 ] || missing+=" $proto/$port"
+            done < "$expected"
+            if [ -z "$missing" ]; then
+                rm -f -- "$expected" "$sockets"
+                return 0
+            fi
+        fi
+        [ "$SECONDS" -lt "$deadline" ] || break
+        sleep 1
+    done
+    printf '[错误] sing-box 在 10 秒内未就绪（状态=%s，未确认监听:%s）。\n' "${state:-未知}" "${missing:- 无有效主进程}" >&2
+    rm -f -- "$expected" "$sockets"
+    return 1
+}
+
 restart_service() {
     local INBOUND_COUNT service_tmp
     if ! INBOUND_COUNT=$(jq -r 'if (.inbounds | type) == "array" then (.inbounds | length) else error("invalid inbounds") end' "$CONFIG_FILE" 2>/dev/null); then
@@ -1311,6 +1390,7 @@ restart_service() {
     fi
 
     if ! check_kernel_config "$CONFIG_FILE"; then return 1; fi
+    ensure_deps ss || return 1
 
     if [ "$SERVICE_MANAGER" == openrc ]; then
         if [ ! -e "/etc/init.d/onebox" ] && [ ! -L "/etc/init.d/onebox" ]; then
@@ -1334,8 +1414,6 @@ EOF
         fi
         rc-update add onebox default || return 1
         rc-service onebox restart || return 1
-        sleep 2
-        if ! rc-service onebox status >/dev/null 2>&1; then return 1; fi
     else
         if [ ! -e "/etc/systemd/system/onebox.service" ] && [ ! -L "/etc/systemd/system/onebox.service" ]; then
             service_tmp=$(mktemp "/etc/systemd/system/onebox.service.tmp.XXXXXX") || return 1
@@ -1369,13 +1447,8 @@ EOF
             return "$enable_rc"
         fi
         systemctl restart onebox || return 1
-        sleep 2
-        if [ "$(systemctl is-active onebox 2>/dev/null)" != "active" ]; then
-            sleep 2
-            [ "$(systemctl is-active onebox 2>/dev/null)" != "active" ] && return 1
-        fi
     fi
-    return 0
+    wait_onebox_ready
 }
 
 get_domain() {
@@ -1758,9 +1831,73 @@ onebox_probe_pids_budget() {
     fi
 }
 
+onebox_probe_memory_budget() {
+    local proc_root="${1:-/proc}" key value unit id controllers path v2_path='' v1_path=''
+    local line fstype source options left a b mount_root mount_dir relative directory limit usage free
+    sni_memory_headroom=-1
+    sni_memory_source='未发现可见的内存额度'
+    if [ -r "$proc_root/meminfo" ]; then
+        while read -r key value unit _; do
+            if [ "$key" = MemAvailable: ]; then
+                if [[ "$value" =~ ^[0-9]{1,12}$ ]] && [ "$unit" = kB ]; then
+                    sni_memory_headroom=$((10#$value*1024))
+                    sni_memory_source='MemAvailable'
+                fi
+                break
+            fi
+        done < "$proc_root/meminfo"
+    fi
+    [ -r "$proc_root/self/cgroup" ] && [ -r "$proc_root/self/mountinfo" ] || return 0
+    while IFS=: read -r id controllers path; do
+        if [ "$id" = 0 ] && [ -z "$controllers" ]; then v2_path="$path"; fi
+        case ",$controllers," in *,memory,*) v1_path="$path" ;; esac
+    done < "$proc_root/self/cgroup"
+    while IFS= read -r line; do
+        read -r fstype source options _ <<< "${line#* - }"
+        case "$fstype" in
+            cgroup2) path="$v2_path" ;;
+            cgroup) case ",$options," in *,memory,*) path="$v1_path" ;; *) continue ;; esac ;;
+            *) continue ;;
+        esac
+        [ -n "$path" ] || continue
+        left="${line%% - *}"
+        read -r id a b mount_root mount_dir _ <<< "$left"
+        printf -v mount_root '%b' "$mount_root"
+        printf -v mount_dir '%b' "$mount_dir"
+        case "$path" in
+            "$mount_root") relative='' ;;
+            "$mount_root"/*) relative="${path#"$mount_root"}" ;;
+            *) relative="$path" ;;
+        esac
+        directory="${mount_dir%/}/${relative#/}"; directory="${directory%/}"
+        while :; do
+            limit=''; usage=''
+            if [ "$fstype" = cgroup2 ]; then
+                [ ! -r "$directory/memory.max" ] || read -r limit < "$directory/memory.max"
+                [ ! -r "$directory/memory.current" ] || read -r usage < "$directory/memory.current"
+            else
+                [ ! -r "$directory/memory.limit_in_bytes" ] || read -r limit < "$directory/memory.limit_in_bytes"
+                [ ! -r "$directory/memory.usage_in_bytes" ] || read -r usage < "$directory/memory.usage_in_bytes"
+            fi
+            # Ignore unlimited v1 sentinels and reject unsafe arithmetic inputs.
+            if [[ "$limit" =~ ^[0-9]{1,15}$ && "$usage" =~ ^[0-9]{1,15}$ ]]; then
+                free=$((10#$limit-10#$usage)); [ "$free" -ge 0 ] || free=0
+                if [ "$sni_memory_headroom" -lt 0 ] || [ "$free" -lt "$sni_memory_headroom" ]; then
+                    sni_memory_headroom="$free"; sni_memory_source="$directory"
+                fi
+            fi
+            [ "$directory" != "$mount_dir" ] && [[ "$directory" == "$mount_dir"/* ]] || break
+            directory="${directory%/*}"
+        done
+    done < "$proc_root/self/mountinfo"
+    return 0
+}
+
 onebox_safe_sni_jobs() {
-    onebox_probe_pids_budget
+    onebox_probe_pids_budget "${2:-/proc}"
+    onebox_probe_memory_budget "${2:-/proc}"
     sni_effective_jobs="$1"
+    sni_resource_reason="$sni_pid_source"
     # Each worker: Bash + curl + one resolver thread; normally reserve four tasks.
     if [ "$sni_pid_headroom" -ge 0 ]; then
         local available=$(((sni_pid_headroom-4)/3))
@@ -1770,6 +1907,16 @@ onebox_safe_sni_jobs() {
         # Candidate preparation can also need four tasks, so never fall back at three.
         if [ "$sni_effective_jobs" -lt 1 ] && [ "$sni_pid_headroom" -ge 4 ]; then
             sni_effective_jobs=1
+        fi
+    fi
+    # Heuristic TLS-worker allowance, not a hard memory cap: reserve 16 MiB
+    # for other work and budget 24 MiB for each Bash/curl worker.
+    if [ "$sni_memory_headroom" -ge 0 ]; then
+        local memory_jobs=$(((sni_memory_headroom-16*1024*1024)/(24*1024*1024)))
+        [ "$memory_jobs" -ge 0 ] || memory_jobs=0
+        if [ "$memory_jobs" -lt "$sni_effective_jobs" ]; then
+            sni_effective_jobs="$memory_jobs"
+            sni_resource_reason="$sni_memory_source（剩余约 $((sni_memory_headroom/1024/1024)) MiB）"
         fi
     fi
     [ "$sni_effective_jobs" -gt 0 ]
@@ -1883,7 +2030,7 @@ run_reality_sni_selection() {
     trap 'exit 130' INT
     trap 'exit 143' TERM
     local auto_sni answer host score chain ranked index=0 slot batch_start=0 position completed=0 tier result scan_rc probe_rc
-    local sni_effective_jobs sni_pid_headroom sni_pid_source sni_curl_certinfo worker launched pending last_jobs=0 sni_launch_abort=0
+    local sni_effective_jobs sni_pid_headroom sni_pid_source sni_memory_headroom sni_memory_source sni_resource_reason sni_curl_certinfo worker launched pending last_jobs=0 sni_launch_abort=0
     local -a deadlines=()
     local sni_region="${CLI_SNI_REGION:-all}" sni_categories="${CLI_SNI_CATEGORIES:-all}" sni_hosts="${CLI_SNI_HOSTS:-}"
     local sni_samples="${CLI_SNI_SAMPLES:-3}" sni_timeout="${CLI_SNI_TIMEOUT:-5}" sni_jobs="${CLI_SNI_JOBS:-8}"
@@ -1907,7 +2054,7 @@ run_reality_sni_selection() {
     fi
     # Check before dependency/candidate subprocesses, then recalculate for every batch.
     if ! onebox_safe_sni_jobs "$sni_jobs"; then
-        printf '[错误] 剩余进程额度不足，无法安全启动 SNI 检测：%s。请释放资源或显式指定 --sni。\n' "$sni_pid_source" >&2
+        printf '[错误] 剩余 PID/内存额度不足，无法安全启动 SNI 检测：%s。请释放资源或显式指定 --sni。\n' "$sni_resource_reason" >&2
         if [ "$NON_INTERACTIVE" = 0 ]; then manual_reality_sni; return $?; fi
         return 1
     fi
@@ -1939,12 +2086,12 @@ run_reality_sni_selection() {
         "${#candidates[@]}" "$sni_region" "$sni_categories" "$sni_jobs" "$sni_samples" "$sni_timeout" >&2
     while [ "$batch_start" -lt "${#candidates[@]}" ]; do
         if ! onebox_safe_sni_jobs "$sni_jobs"; then
-            printf '[错误] 剩余进程额度不足，停止扫描：%s。请释放资源或显式指定 --sni。\n' "$sni_pid_source" >&2
+            printf '[错误] 剩余 PID/内存额度不足，停止扫描：%s。请释放资源或显式指定 --sni。\n' "$sni_resource_reason" >&2
             return 1
         fi
         if [ "$sni_effective_jobs" != "$last_jobs" ]; then
             if [ "$sni_effective_jobs" -lt "$sni_jobs" ]; then
-                printf '[提示] 根据剩余 PID 额度将并发从 %s 降至 %s：%s；为控制和清理保留余量。\n' "$sni_jobs" "$sni_effective_jobs" "$sni_pid_source" >&2
+                printf '[提示] 根据剩余 PID/内存额度将并发从 %s 降至 %s：%s；为控制和清理保留余量。\n' "$sni_jobs" "$sni_effective_jobs" "$sni_resource_reason" >&2
             fi
             last_jobs="$sni_effective_jobs"
         fi
@@ -2080,7 +2227,10 @@ ensure_acme_installed() {
     ensure_deps curl wget socat openssl tar gzip || return 1
     export LE_WORKING_DIR="$ACME_HOME"
     ensure_cron || return 1
-    [ -f "$ACME_HOME/acme.sh" ] && return 0
+    if [ -s "$ACME_HOME/acme.sh" ] && sh -n "$ACME_HOME/acme.sh"; then
+        update_acme_cron ensure
+        return $?
+    fi
     local stage installer failed=0
     mkdir -p /var/lib/onebox || return 1
     chmod 700 /var/lib/onebox || return 1
@@ -2092,7 +2242,7 @@ ensure_acme_installed() {
         failed=1
     elif [ ! -s "$installer" ] || ! sh -n "$installer"; then
         failed=1
-    elif ! (cd "$stage" && sh "$installer" --install-online --home "$ACME_HOME" --config-home "$ACME_HOME" --cert-home "$ACME_HOME" --no-profile); then
+    elif ! (cd "$stage" && sh "$installer" --install-online --home "$ACME_HOME" --config-home "$ACME_HOME" --cert-home "$ACME_HOME" --no-profile --nocron); then
         failed=1
     elif [ ! -f "$ACME_HOME/acme.sh" ]; then
         failed=1
@@ -2102,6 +2252,7 @@ ensure_acme_installed() {
         echo '[错误] acme.sh 引导安装失败，请检查网络及安装日志。' >&2
         return 1
     fi
+    update_acme_cron ensure
 }
 
 cert_remaining_days() {
@@ -2137,6 +2288,7 @@ apply_real_cert() {
     export LE_WORKING_DIR="$ACME_HOME"
     local NEW_DOMAIN
     NEW_DOMAIN=$(get_domain "请输入解析到本机的域名" "") || return 1
+    ensure_acme_installed || return 1
 
     local reuse=0
     local had_prior=0
@@ -2174,8 +2326,7 @@ apply_real_cert() {
             if [[ "$v_mode" == "1" || "$v_mode" == "2" ]]; then break; fi
         done
 
-        ensure_acme_installed || return 1
-        "$ACME_HOME/acme.sh" --set-default-ca --server letsencrypt >/dev/null 2>&1
+        "$ACME_HOME/acme.sh" --set-default-ca --server letsencrypt >/dev/null 2>&1 || return 1
 
         if [ "$v_mode" == "1" ]; then
             if ! confirm_http01_ready; then
@@ -2227,12 +2378,34 @@ deploy_real_cert() {
     [[ "$domain" =~ ^[A-Za-z0-9.-]+$ && "$domain" != .* && "$domain" != *..* ]] || return 1
     (
         umask 077
-        local stage changed=0 completed=0 active=0 reload target i
-        local -a targets=()
+        local stage changed=0 completed=0 active=0 reload target i conf name owned line
+        local -a targets=() retired_domains=() retired_ecc=()
         stage=$(mktemp -d "$CERT_DIR/.real-deploy.XXXXXX") || exit 1
         targets=("$CERT_DIR/real.cer" "$CERT_DIR/real.key" "$SECRETS_FILE"
                  "$ACME_HOME/$domain/$domain.conf"
                  "$ACME_HOME/${domain}_ecc/$domain.conf")
+        # Older domains must not renew back into the one shared live certificate.
+        # Only retire records explicitly deploying to onebox's shared paths.
+        for conf in "$ACME_HOME"/*/*.conf; do
+            [ -f "$conf" ] || continue
+            name="${conf##*/}"; name="${name%.conf}"
+            [ "$name" != "$domain" ] || continue
+            valid_host "$name" || continue
+            owned=0
+            while IFS= read -r line; do
+                case "$line" in
+                    "Le_RealFullChainPath='$CERT_DIR/real.cer'"|"Le_RealKeyPath='$CERT_DIR/real.key'") owned=1 ;;
+                esac
+            done < "$conf"
+            [ "$owned" = 1 ] || continue
+            case "$conf" in
+                "$ACME_HOME/$name/$name.conf") retired_ecc+=(0) ;;
+                "$ACME_HOME/${name}_ecc/$name.conf") retired_ecc+=(1) ;;
+                *) continue ;;
+            esac
+            retired_domains+=("$name")
+            targets+=("$conf" "$conf.removed")
+        done
         if [ "$SERVICE_MANAGER" = openrc ]; then
             rc-service onebox status >/dev/null 2>&1 && active=1
             reload="if [ -e /etc/init.d/onebox ] && rc-service onebox status >/dev/null 2>&1; then rc-service onebox restart >/dev/null 2>&1; fi"
@@ -2295,6 +2468,14 @@ deploy_real_cert() {
         save_secret REAL_DOMAIN "$domain" || exit 1
         if [ "$had_prior" = 1 ]; then save_secret REAL_CERT_OWNED 0 || exit 1
         else save_secret REAL_CERT_OWNED 1 || exit 1; fi
+        for i in "${!retired_domains[@]}"; do
+            name="${retired_domains[i]}"
+            if [ "${retired_ecc[i]}" = 1 ]; then
+                "$ACME_HOME/acme.sh" --remove -d "$name" --ecc || exit 1
+            else
+                "$ACME_HOME/acme.sh" --remove -d "$name" || exit 1
+            fi
+        done
         completed=1
     )
 }
@@ -4107,19 +4288,86 @@ ui_clear() {
     fi
 }
 
-cleanup_acme_cron() {
-    local cron_text tmp rc
-    cron_text=$(crontab -l 2>/dev/null); rc=$?
-    if [ "$rc" != 0 ]; then
-        # No table is a normal outcome; other failures must not erase anything.
-        if [ "$rc" = 1 ] && [ -z "$cron_text" ]; then return 0; fi
-        return 1
-    fi
-    tmp=$(mktemp "$CONFIG_DIR/.cron-cleanup.XXXXXX") || return 1
+is_onebox_acme_cron() {
+    local line="$1" cmd token i
+    local -a args=()
+    # Parse only known argument spellings; never eval a crontab or shell config.
+    if [[ "$line" =~ ^[[:space:]]*\# ]]; then return 1; fi
+    if [[ "$line" =~ ^[[:space:]]*@[^[:space:]]+[[:space:]]+(.+)$ ]]; then
+        cmd="${BASH_REMATCH[1]}"
+    elif [[ "$line" =~ ^[[:space:]]*([^[:space:]]+[[:space:]]+){5}(.+)$ ]]; then
+        cmd="${BASH_REMATCH[2]}"
+    else return 1; fi
+    read -r -a args <<< "$cmd"
+    case "${args[0]:-}" in
+        flock|*/flock)
+            [ "${args[1]:-}" = -n ] && [ "${args[2]:-}" = -o ] &&
+            [ "${args[3]:-}" = /run/lock/onebox.lock ] || return 1
+            args=("${args[@]:4}") ;;
+    esac
+    case "${args[0]:-}" in
+        "$ACME_HOME/acme.sh"|\""$ACME_HOME/acme.sh"\"|\""$ACME_HOME"\"/acme.sh|\'"$ACME_HOME/acme.sh"\'|\'"$ACME_HOME"\'/acme.sh) ;;
+        *) return 1 ;;
+    esac
+    [ "${args[1]:-}" = --cron ] || return 2
+    for ((i=2; i<${#args[@]}; i++)); do
+        token="${args[i]}"
+        case "$token" in
+            --home|--config-home|--cert-home)
+                i=$((i+1))
+                case "${args[i]:-}" in "$ACME_HOME"|\""$ACME_HOME"\"|\'"$ACME_HOME"\') ;; *) return 2 ;; esac ;;
+            '>') i=$((i+1)); [ "${args[i]:-}" = /dev/null ] || return 2 ;;
+            '>/dev/null'|'2>/dev/null'|'2>&1') ;;
+            '#') [ "$((i+2))" = "${#args[@]}" ] && [ "${args[i+1]}" = onebox-acme-renewal ] || return 2; break ;;
+            *) return 2 ;;
+        esac
+    done
+    return 0
+}
+
+update_acme_cron() {
+    local mode="$1" cron_text tmp errors rc line flock_bin matched=0
+    tmp=$(mktemp "${TMPDIR:-/tmp}/onebox-cron.XXXXXX") || return 1
     SB_OWNED_TEMP_FILES+=("$tmp")
-    printf '%s\n' "$cron_text" | awk -v path="$ACME_HOME" 'index($0,path)==0' > "$tmp" || return 1
+    errors=$(mktemp "${TMPDIR:-/tmp}/onebox-cron-errors.XXXXXX") || return 1
+    SB_OWNED_TEMP_FILES+=("$errors")
+    cron_text=$(LC_ALL=C crontab -l 2> "$errors"); rc=$?
+    if [ "$rc" != 0 ]; then
+        line=$(<"$errors")
+        if [ "$rc" != 1 ] || [ -n "$cron_text" ]; then return 1; fi
+        case "$line" in
+            *'no crontab for '*|*"can't open "*'No such file or directory'*|*'cannot open '*'No such file or directory'*) ;;
+            *) printf '[错误] 无法读取 crontab，已保留原任务和 ACME 数据。\n%s\n' "$line" >&2; return 1 ;;
+        esac
+    fi
+    if [ -n "$cron_text" ]; then
+        while IFS= read -r line; do
+            if is_onebox_acme_cron "$line"; then
+                matched=$((matched+1))
+            else
+                rc=$?
+                if [ "$rc" = 2 ]; then
+                    printf '[错误] onebox ACME 任务已被自定义，无法安全重写；请检查 crontab。\n' >&2
+                    return 1
+                fi
+                printf '%s\n' "$line" >> "$tmp" || return 1
+            fi
+        done <<< "$cron_text"
+    fi
+    if [ "$mode" = ensure ]; then
+        flock_bin=$(command -v flock) || return 1
+        printf '13 0,6,12,18 * * * %s -n -o /run/lock/onebox.lock "%s/acme.sh" --cron --home "%s" --config-home "%s" > /dev/null # onebox-acme-renewal\n' \
+            "$flock_bin" "$ACME_HOME" "$ACME_HOME" "$ACME_HOME" >> "$tmp" || return 1
+    elif [ "$matched" = 0 ]; then
+        rm -f -- "$tmp" "$errors"
+        return 0
+    fi
     crontab "$tmp" || return 1
-    rm -f "$tmp"
+    rm -f -- "$tmp" "$errors"
+}
+
+cleanup_acme_cron() {
+    update_acme_cron remove
 }
 
 uninstall_all() {
@@ -4164,7 +4412,7 @@ uninstall_all() {
             done
         fi
 
-        if [ -d "$ACME_HOME" ]; then
+        if [ -d "$ACME_HOME" ] || command -v crontab >/dev/null 2>&1; then
             ensure_deps crontab || return 1
             cleanup_acme_cron || return 1
             rm -rf -- "$ACME_HOME" || return 1
@@ -4189,9 +4437,6 @@ uninstall_all() {
 menu() {
     local choice=""
     ensure_deps jq || return 1
-    local LATEST_VER_CACHE
-    LATEST_VER_CACHE=$(get_latest_version)
-    GLOBAL_LATEST_VER="$LATEST_VER_CACHE"
 
     while true; do
         ui_clear
@@ -4200,9 +4445,7 @@ menu() {
 
         VER=$( ( /usr/local/lib/onebox/sing-box version ) 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
         if [ -n "$VER" ]; then
-            if [ -n "$GLOBAL_LATEST_VER" ] && [ "$VER" != "$GLOBAL_LATEST_VER" ]; then VER_SHOW="${VER} ${YELLOW}[新版: ${GLOBAL_LATEST_VER}]${PLAIN}"
-            else VER_SHOW="${VER}"
-            fi
+            VER_SHOW="$VER"
         else
             VER_SHOW="未安装"
         fi
