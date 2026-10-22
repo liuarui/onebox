@@ -138,6 +138,7 @@ detect_environment() {
 }
 
 GLOBAL_IP=""
+IP_LOOKUP_SKIPPED=0
 GLOBAL_LATEST_VER=""
 KERNEL_REINSTALLED=0
 
@@ -207,26 +208,50 @@ lookup_public_ip_endpoint() {
 }
 
 get_ip() {
-    if [ -n "${CLI_ADDRESS:-}" ]; then printf '%s\n' "$CLI_ADDRESS"; return 0; fi
+    IP_LOOKUP_SKIPPED=0
+    if [ -n "${CLI_ADDRESS:-}" ]; then GLOBAL_IP="$CLI_ADDRESS"; return 0; fi
     if [ -z "$GLOBAL_IP" ]; then
-        mkdir -p "$CONFIG_DIR" 2>/dev/null
         local IP_CACHE="$CONFIG_DIR/.ip_cache"
-        local IP_TTL=300
-        if [ -f "$IP_CACHE" ]; then
-            local c_time c_ip
-            c_time=$(head -n 1 "$IP_CACHE" 2>/dev/null)
-            c_ip=$(tail -n 1 "$IP_CACHE" 2>/dev/null)
-            if [[ "$c_time" =~ ^[0-9]+$ ]] && [ "$c_time" -le "$(date +%s)" ] &&
-               [ $(( $(date +%s) - c_time )) -le $IP_TTL ] &&
-               { [[ "$c_ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || [[ "$c_ip" == *:* && "$c_ip" =~ ^[0-9a-fA-F:]+$ ]]; }; then
-                GLOBAL_IP="$c_ip"
-                echo "$GLOBAL_IP"
-                return
+        local IP_TTL=300 c_time='' c_ip='' now=''
+        local valid_cache_ip=0
+        # Read the tiny cache with Bash builtins so a full cgroup PID budget
+        # does not trigger several failing forks before we can show node data.
+        if [ -r "$IP_CACHE" ]; then
+            { IFS= read -r c_time || :; IFS= read -r c_ip || :; } < "$IP_CACHE"
+            if [[ "$c_ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] ||
+               [[ "$c_ip" == *:* && "$c_ip" =~ ^[0-9a-fA-F:]+$ ]]; then
+                valid_cache_ip=1
             fi
         fi
 
-        local ip
+        # The probe reads procfs/cgroup files using shell builtins. Leave room
+        # for the command-substitution shell, timeout, and curl before trying
+        # the network; Bash may otherwise retry a failed fork indefinitely.
+        onebox_probe_pids_budget
+        local pid_headroom="$sni_pid_headroom" pid_source="$sni_pid_source"
+
+        # Bash's printf time format avoids forking date just to validate a cache.
+        printf -v now '%(%s)T' -1 2>/dev/null || now=''
+        # Bash 4.0/4.1 lack printf's %T format; use date only when there is
+        # enough process headroom to do so safely.
+        if [ -z "$now" ] && { [ "$pid_headroom" -lt 0 ] || [ "$pid_headroom" -ge 8 ]; }; then
+            now=$(date +%s 2>/dev/null)
+        fi
+        if [ "$valid_cache_ip" = 1 ] && [[ "$c_time" =~ ^[0-9]+$ && "$now" =~ ^[0-9]+$ ]] &&
+           [ "$c_time" -le "$now" ] && [ $((now-c_time)) -le "$IP_TTL" ]; then
+            GLOBAL_IP="$c_ip"
+            return 0
+        fi
+
+        if [ "$pid_headroom" -ge 0 ] && [ "$pid_headroom" -lt 8 ]; then
+            IP_LOOKUP_SKIPPED=1
+            printf '[提示] 剩余进程额度不足（%s），已跳过公网 IP 查询；节点详情仍会显示，分享链接请稍后重试或用 --address 指定。\n' \
+                "$pid_source" >&2
+            return 1
+        fi
+
         printf '[信息] 正在查询公网地址（超时后可用 onebox links --address 手动指定）...\n' >&2
+        local ip
         ip=$(lookup_public_ip_endpoint https://ipv4.icanhazip.com)
         if [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
             GLOBAL_IP="$ip"
@@ -238,12 +263,20 @@ get_ip() {
         fi
 
         if [ -n "$GLOBAL_IP" ]; then
-            { date +%s; echo "$GLOBAL_IP"; } > "$IP_CACHE" 2>/dev/null
-            chmod 600 "$IP_CACHE" 2>/dev/null
+            # CONFIG_DIR normally exists already; create it only on a
+            # successful lookup, and rely on the script's umask 077.
+            [ -d "$CONFIG_DIR" ] || mkdir -p "$CONFIG_DIR" 2>/dev/null || :
+            printf -v now '%(%s)T' -1 2>/dev/null || now=''
+            if [ -z "$now" ] && { [ "$pid_headroom" -lt 0 ] || [ "$pid_headroom" -ge 8 ]; }; then
+                now=$(date +%s 2>/dev/null)
+            fi
+            if [[ "$now" =~ ^[0-9]+$ ]]; then
+                printf '%s\n%s\n' "$now" "$GLOBAL_IP" > "$IP_CACHE" 2>/dev/null || :
+            fi
         fi
     fi
     [ -n "$GLOBAL_IP" ] || { printf '[提示] 未查到公网 IP；节点配置仍可查看，分享链接请用 --address 指定。\n' >&2; return 1; }
-    echo "$GLOBAL_IP"
+    return 0
 }
 
 get_latest_version() {
@@ -2589,6 +2622,7 @@ build_share_url() {
 print_config_detail() {
     local TAG=$1
     local IP=""
+    IP_LOOKUP_SKIPPED=0
     load_secrets
 
     local -a M=()
@@ -2597,7 +2631,7 @@ print_config_detail() {
     local N_UUID=${M[3]} N_PASS=${M[4]} SNI=${M[5]} SID=${M[6]}
     local IS_REALITY=${M[7]} IS_WS=${M[8]} SS_METHOD=${M[9]}
 
-    if [ "$IS_WS" != 1 ] && [[ "$CERT_PATH" != */real.cer ]]; then IP=$(get_ip); fi
+    if [ "$IS_WS" != 1 ] && [[ "$CERT_PATH" != */real.cer ]]; then get_ip || :; IP=$GLOBAL_IP; fi
 
     resolve_conn "$CERT_PATH" "$IP"
     local INSECURE_TEXT="true"
@@ -2612,8 +2646,8 @@ print_config_detail() {
             if [ "$IS_REALITY" == "1" ]; then
                 local var_name="REALITY_PUB_${PORT}"
                 local PUB="${!var_name}"
-                local IP_DISP
-                IP_DISP=$(wrap_ipv6 "$IP")
+                local IP_DISP="$IP"
+                [[ "$IP_DISP" == *:* ]] && IP_DISP="[$IP_DISP]"
                 echo -e "地址 (address)\t\t\t= ${IP_DISP:-[获取公网IP失败]}"
                 echo -e "端口 (port)\t\t\t= $PORT"
                 echo -e "用户ID (id)\t\t\t= $N_UUID"
@@ -2627,8 +2661,8 @@ print_config_detail() {
                 local var_dom="ARGO_DOMAIN_${PORT}"
                 local A_IP="${!var_ip}"
                 local A_DOM="${!var_dom}"
-                local A_IP_DISP
-                A_IP_DISP=$(wrap_ipv6 "$A_IP")
+                local A_IP_DISP="$A_IP"
+                [[ "$A_IP_DISP" == *:* ]] && A_IP_DISP="[$A_IP_DISP]"
                 echo -e "地址 (address)\t\t\t= $A_IP_DISP"
                 echo -e "端口 (port)\t\t\t= 443"
                 echo -e "用户ID (id)\t\t\t= $N_UUID"
@@ -2640,8 +2674,8 @@ print_config_detail() {
             fi
             ;;
         hysteria2)
-            local CONN_ADDR_DISP
-            CONN_ADDR_DISP=$(wrap_ipv6 "$CONN_ADDR")
+            local CONN_ADDR_DISP="$CONN_ADDR"
+            [[ "$CONN_ADDR_DISP" == *:* ]] && CONN_ADDR_DISP="[$CONN_ADDR_DISP]"
             echo -e "地址 (address)\t\t\t= ${CONN_ADDR_DISP:-[获取目标地址失败]}"
             echo -e "端口 (port)\t\t\t= $PORT"
             printf '密码 (password)\t\t\t= %s\n' "$N_PASS"
@@ -2651,8 +2685,8 @@ print_config_detail() {
             [ -n "$SNI_VAL" ] && echo -e "伪装域名 (sni)\t\t\t= $SNI_VAL"
             ;;
         tuic)
-            local CONN_ADDR_DISP
-            CONN_ADDR_DISP=$(wrap_ipv6 "$CONN_ADDR")
+            local CONN_ADDR_DISP="$CONN_ADDR"
+            [[ "$CONN_ADDR_DISP" == *:* ]] && CONN_ADDR_DISP="[$CONN_ADDR_DISP]"
             echo -e "地址 (address)\t\t\t= ${CONN_ADDR_DISP:-[获取目标地址失败]}"
             echo -e "端口 (port)\t\t\t= $PORT"
             echo -e "用户ID (id)\t\t\t= $N_UUID"
@@ -2664,8 +2698,8 @@ print_config_detail() {
             [ -n "$SNI_VAL" ] && echo -e "伪装域名 (sni)\t\t\t= $SNI_VAL"
             ;;
         anytls)
-            local CONN_ADDR_DISP
-            CONN_ADDR_DISP=$(wrap_ipv6 "$CONN_ADDR")
+            local CONN_ADDR_DISP="$CONN_ADDR"
+            [[ "$CONN_ADDR_DISP" == *:* ]] && CONN_ADDR_DISP="[$CONN_ADDR_DISP]"
             echo -e "地址 (address)\t\t\t= ${CONN_ADDR_DISP:-[获取目标地址失败]}"
             echo -e "端口 (port)\t\t\t= $PORT"
             printf '密码 (password)\t\t\t= %s\n' "$N_PASS"
@@ -2674,8 +2708,8 @@ print_config_detail() {
             [ -n "$SNI_VAL" ] && echo -e "伪装域名 (sni)\t\t\t= $SNI_VAL"
             ;;
         shadowsocks)
-            local CONN_ADDR_DISP
-            CONN_ADDR_DISP=$(wrap_ipv6 "$CONN_ADDR")
+            local CONN_ADDR_DISP="$CONN_ADDR"
+            [[ "$CONN_ADDR_DISP" == *:* ]] && CONN_ADDR_DISP="[$CONN_ADDR_DISP]"
             echo -e "地址 (address)\t\t\t= ${CONN_ADDR_DISP:-[获取目标地址失败]}"
             echo -e "端口 (port)\t\t\t= $PORT"
             printf '密码 (password)\t\t\t= %s\n' "$N_PASS"
@@ -2685,7 +2719,11 @@ print_config_detail() {
     esac
 
     echo -e "------------- 链接 (URL) -------------"
-    build_share_url "$TAG" "$IP"
+    if [ "$IP_LOOKUP_SKIPPED" = 1 ]; then
+        printf '[提示] 进程额度不足，已跳过分享链接生成；稍后重试，或用 onebox links --address 指定地址。\n'
+    else
+        build_share_url "$TAG" "$IP"
+    fi
 
     if [ "$INSECURE_TEXT" == "true" ] && [ "$IS_REALITY" != "1" ] && [ "$IS_WS" != "1" ] && [ "$TYPE" != "shadowsocks" ]; then
         echo -e "\n${YELLOW}警告! 此节点使用自签名证书，请确保客户端已开启「跳过证书验证」！${PLAIN}\n"
@@ -3480,11 +3518,16 @@ show_all_links() {
         echo -e "${RED}[错误] 未添加节点配置！${PLAIN}"
     else
         IP=""
-        if nodes_need_public_ip; then IP=$(get_ip); fi
-        for TAG in "${TAGS[@]}"; do
-            build_share_url "$TAG" "$IP"
-            printf '\n'
-        done
+        IP_LOOKUP_SKIPPED=0
+        if nodes_need_public_ip; then get_ip || :; IP=$GLOBAL_IP; fi
+        if [ "$IP_LOOKUP_SKIPPED" = 1 ]; then
+            printf '[提示] 进程额度不足，已跳过分享链接生成；稍后重试，或用 onebox links --address 指定地址。\n'
+        else
+            for TAG in "${TAGS[@]}"; do
+                build_share_url "$TAG" "$IP"
+                printf '\n'
+            done
+        fi
     fi
     echo -e "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
     pause
@@ -5062,7 +5105,12 @@ cli_dispatch() {
                         jq -e --arg tag "$CLI_TAG" '.inbounds[] | select(.tag == $tag)' "$CONFIG_FILE" >/dev/null || return 1
                     fi
                     ip=""
-                    if nodes_need_public_ip "$CLI_TAG"; then ip=$(get_ip); fi
+                    IP_LOOKUP_SKIPPED=0
+                    if nodes_need_public_ip "$CLI_TAG"; then get_ip || :; ip=$GLOBAL_IP; fi
+                    if [ "$IP_LOOKUP_SKIPPED" = 1 ]; then
+                        printf '[提示] 进程额度不足，已跳过链接生成；请稍后重试，或用 --address 指定地址。\n' >&2
+                        return 1
+                    fi
                     tags=$(jq -r --arg tag "$CLI_TAG" '.inbounds[] | select($tag == "" or .tag == $tag) | .tag' "$CONFIG_FILE") || return 1
                     if [ -n "$tags" ]; then
                         while IFS= read -r tag; do build_share_url "$tag" "$ip" || rc=1; done <<< "$tags"
