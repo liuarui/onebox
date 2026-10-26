@@ -1496,7 +1496,6 @@ reality_sni_catalog() {
     # Columns: category, affiliation region (not IP geolocation), hostname.
     # Korea additionally tags Samsung and LG; all other tags follow upstream.
     cat <<'EOF'
-cdn global www.cloudflare.com
 cdn global addons.mozilla.org
 cdn global www.python.org
 cloud global aws.amazon.com
@@ -1679,8 +1678,7 @@ manual_reality_sni() {
     fi
     while true; do
         # Read in the selector itself so TERM can interrupt an idle prompt.
-        ask '请输入伪装域名 [默认: www.cloudflare.com]: ' manual_host
-        manual_host="${manual_host:-www.cloudflare.com}"
+        ask '请输入已确认可用的伪装域名（必填）: ' manual_host || return 1
         if reality_sni_allowed_host "$manual_host"; then printf '%s\n' "$manual_host"; return 0; fi
         printf '[错误] 域名格式无效或属于已排除的 Apple 域名，请重新输入。\n' >&2
     done

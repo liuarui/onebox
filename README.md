@@ -72,13 +72,13 @@ sh install.sh install --version 1.14.3
 
 ### Reality SNI 自动检测
 
-交互式添加 `VLESS-REALITY` 时，会询问“是否自动检测并推荐 SNI”。选择 `y` 后可选快速检测、全部候选、分类多选、地区推荐或自定义域名/网址列表，也可调整测速次数、单次超时和并发数；默认检测全部候选。选择 `n` 或结果中的 `0` 可手动输入，默认值为 `www.cloudflare.com`。请求均有超时，未找到候选时回到手动输入，所需依赖自动安装。
+交互式添加 `VLESS-REALITY` 时，会询问“是否自动检测并推荐 SNI”。选择 `y` 后可选快速检测、全部候选、分类多选、地区推荐或自定义域名/网址列表，也可调整测速次数、单次超时和并发数；默认检测全部候选。选择 `n` 或结果中的 `0` 可手动输入已确认可用的域名，必填且无固定默认值。请求均有超时，未找到候选时回到手动输入，所需依赖自动安装。
 
-内置 **92 个候选、10 类分类、9 个地区**。域名、分类和地区集中维护在 `install.sh` 的 `reality_sni_catalog()`，运行时无需下载或执行外部检测脚本。内置列表、自定义列表和 Reality 手动 SNI 均排除 `apple.com`、`icloud.com`、`mzstatic.com` 及其子域名。
+内置 **91 个候选、10 类分类、9 个地区**。域名、分类和地区集中维护在 `install.sh` 的 `reality_sni_catalog()`，运行时无需下载或执行外部检测脚本。内置列表、自定义列表和 Reality 手动 SNI 均排除 `apple.com`、`icloud.com`、`mzstatic.com` 及其子域名。
 
 | 分类键 | 分类 | 数量 |
 | --- | --- | --- |
-| `cdn` | 全球 CDN / anycast | 3 |
+| `cdn` | 全球 CDN / anycast | 2 |
 | `cloud` | 云 / 开发基础设施 | 10 |
 | `tech` | 科技 / 半导体大厂 | 14 |
 | `fin` | 金融 / 支付 / 银行 | 10 |
@@ -89,7 +89,7 @@ sh install.sh install --version 1.14.3
 | `ecom` | 电商 / 零售 / 品牌 | 10 |
 | `region` | 区域锚点 | 11 |
 
-快速检测取 `cdn,cloud,tech`，共 27 个站点。地区键为 `global`（全球通用）、`us`（美国/北美）、`eu`（欧洲）、`jp`（日本）、`hk`（香港）、`sg`（东南亚/新加坡）、`cn`（中国大陆）、`au`（澳洲）、`kr`（韩国）。选择某地区会检测该区站点加全球通用站；`global` 只测全球通用站，`all` 不限制地区。地区标签按站点归属分类，韩国包括 Samsung、LG；标签不是站点 IP 地理定位，也不保证请求实际落在该地区。
+快速检测取 `cdn,cloud,tech`，共 26 个站点。地区键为 `global`（全球通用）、`us`（美国/北美）、`eu`（欧洲）、`jp`（日本）、`hk`（香港）、`sg`（东南亚/新加坡）、`cn`（中国大陆）、`au`（澳洲）、`kr`（韩国）。选择某地区会检测该区站点加全球通用站；`global` 只测全球通用站，`all` 不限制地区。地区标签按站点归属分类，韩国包括 Samsung、LG；标签不是站点 IP 地理定位，也不保证请求实际落在该地区。
 
 每站使用 curl 检查 TLS 1.3、X25519、证书主机名/信任及实际 HTTP/2（h2）响应，不再启动 `openssl s_client`。HTTP 状态码为 403 等不影响 TLS 筛选。需要 curl ≥ 7.73、OpenSSL ≥ 1.1.1 TLS 后端和 HTTP2 支持；缺失依赖会自动安装，现有 curl 功能不足则提示通过系统软件源升级，或手动指定 `--sni`。curl ≥ 7.88 时统计服务端提供的证书链长度；旧版标为链长度未知，排在已知链之后。
 
@@ -97,9 +97,9 @@ sh install.sh install --version 1.14.3
 
 每个任务由父进程独立计时，超过“次数 × 单次超时 + 3 秒”后终止整组进程，避免 TLS 客户端卡住时整批一直等待。中断扫描会清理检测任务及临时文件。其他进程仍可能同时消耗额度，容器隐藏的宿主机限制也无法完全预判。
 
-通过检查的短链站点（不超过 3 层）优先，同组按握手完成耗时排序；长链站点标为备选。耗时使用 `curl time_appconnect`，包含 DNS、TCP 和 TLS，不是纯 TLS 用时。自动推荐要求目标能返回 HTTP/2 响应，只有 TLS 握手成功而 HTTP 请求异常的站点不会入选。检测结果只代表服务器当前网络，不能保证所有客户端可用。
+通过检查的短链站点（不超过 3 层）优先，同组按握手完成耗时排序；长链站点标为备选。耗时使用 `curl time_appconnect`，包含 DNS、TCP 和 TLS，不是纯 TLS 用时。自动推荐要求目标能返回 HTTP/2 响应，只有 TLS 握手成功而 HTTP 请求异常的站点不会入选。自动检测是 TLS 条件筛选，不能替代真实客户端的 Reality 连接验证；结果只代表服务器当前网络。
 
-无交互模式省略 `--sni` 时自动检测 **全部 92 个候选**并选择排名第一的站点，不等待输入；全部检测失败则报错退出并恢复本次配置事务。显式指定 `--sni www.cloudflare.com` 可跳过自动检测。
+无交互模式省略 `--sni` 时自动检测 **全部 91 个候选**并选择排名第一的站点，不等待输入；全部检测失败则报错退出并恢复本次配置事务。显式指定 `--sni DOMAIN` 可跳过自动检测；请将 `DOMAIN` 替换为你确认可用的域名。
 
 ```sh
 # 日本地区站点＋全球通用站，自动选择第一名
@@ -110,7 +110,7 @@ onebox add --protocol reality --port 443 --sni-category edu,tech --sni-region sg
 
 # 用自定义列表替代内置候选，自动规范化网址、去重
 onebox add --protocol reality --port 443 \
-  --sni-hosts 'https://www.cloudflare.com/ www.nus.edu.sg,www.amd.com' \
+  --sni-hosts 'https://www.intel.com/ www.nus.edu.sg,www.amd.com' \
   --sni-jobs 4 --sni-samples 3 --sni-timeout 5
 ```
 
@@ -121,7 +121,7 @@ onebox add --protocol reality --port 443 \
 以下命令一次添加一个节点，完成后退出。`add` 也会自动安装内核、依赖和固定入口。已有同名节点或端口冲突时返回失败。
 
 ```sh
-onebox add --protocol reality --tag reality-1 --port 443 --sni www.cloudflare.com
+onebox add --protocol reality --tag reality-1 --port 443
 onebox add --protocol hysteria2 --tag hy2-1 --port 8443 --cert self
 onebox add --protocol tuic --tag tuic-1 --port 9443 --cert self
 onebox add --protocol anytls --tag anytls-1 --port 10443 --cert self
