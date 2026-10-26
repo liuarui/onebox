@@ -1492,15 +1492,13 @@ get_domain() {
 reality_sni_catalog() {
     # Candidate metadata adapted from chnnic/Reality-SNI-Check (MIT):
     # https://github.com/chnnic/Reality-SNI-Check
-    # Upstream snapshot df1369dc080470d2; all 98 candidates except 4 Apple hosts.
+    # Upstream snapshot df1369dc080470d2; locally excluded candidates removed.
     # Columns: category, affiliation region (not IP geolocation), hostname.
     # Korea additionally tags Samsung and LG; all other tags follow upstream.
     cat <<'EOF'
 cdn global www.cloudflare.com
-cdn global www.amazon.com
 cdn global addons.mozilla.org
 cdn global www.python.org
-cdn global www.fastly.com
 cloud global aws.amazon.com
 cloud global azure.microsoft.com
 cloud global www.digitalocean.com
