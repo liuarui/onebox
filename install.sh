@@ -1671,7 +1671,7 @@ reality_sni_candidates() {
 }
 
 select_reality_sni_preset() {
-    local preset_destination="$1" preset_allow_scan="${2:-0}" preset_choice preset_index
+    local preset_destination="$1" preset_choice preset_index
     local -a preset_hosts=(www.intel.com www.nvidia.com www.ibm.com www.sony.com www.python.org)
     if [ "$NON_INTERACTIVE" = 1 ]; then
         printf '[提示] 使用第一个预设 SNI：%s（未经本机测速，请验证实际连接）。\n' "${preset_hosts[0]}" >&2
@@ -1682,7 +1682,6 @@ select_reality_sni_preset() {
     for preset_index in "${!preset_hosts[@]}"; do
         printf ' %s) %s\n' "$((preset_index+1))" "${preset_hosts[preset_index]}" >&2
     done
-    [ "$preset_allow_scan" != 1 ] || printf ' 6) 自动检测并优选 SNI\n' >&2
     printf ' 0) 取消\n' >&2
     while true; do
         ask '请选择编号 [默认: 1]: ' preset_choice || return 1
@@ -1690,7 +1689,6 @@ select_reality_sni_preset() {
             [1-5])
                 printf -v "$preset_destination" '%s' "${preset_hosts[${preset_choice:-1}-1]}"
                 return 0 ;;
-            6) [ "$preset_allow_scan" != 1 ] || return 2 ;;
             0) return 130 ;;
         esac
         printf '[提示] 请输入菜单中的编号。\n' >&2
@@ -1714,10 +1712,10 @@ configure_reality_sni_scan() {
     local mode selection key label count item categories candidate_text
     local -a keys=() entries=()
     while true; do
-        printf '\nSNI 检测范围：\n 1) 快速检测（CDN、云、科技）\n 2) 全部候选（默认）\n 3) 按分类检测（可多选）\n 4) 按地区推荐\n 5) 自定义域名/网址列表\n 6) 检测设置（次数=%s，超时=%ss，并发=%s）\n 0) 返回预设选择\n' "$sni_samples" "$sni_timeout" "$sni_jobs" >&2
+        printf '\nSNI 检测范围：\n 1) 快速检测（CDN、云、科技）\n 2) 全部候选（默认）\n 3) 按分类检测（可多选）\n 4) 按地区推荐\n 5) 自定义域名/网址列表\n 6) 检测设置（次数=%s，超时=%ss，并发=%s）\n 0) 取消\n' "$sni_samples" "$sni_timeout" "$sni_jobs" >&2
         ask '请选择 [0-6，默认: 2]: ' mode
         case "${mode:-2}" in
-            0) return 2 ;;
+            0) return 130 ;;
             1) sni_region=all; sni_categories=cdn,cloud,tech; sni_hosts=""; return 0 ;;
             2) sni_region=all; sni_categories=all; sni_hosts=""; return 0 ;;
             3)
@@ -2166,11 +2164,11 @@ run_reality_sni_selection() {
         printf '[完成] 自动选择排名第一的 SNI：%s。检测仅代表本机当前网络。\n' "${hosts[0]}" >&2
         printf '%s\n' "${hosts[0]}"; return 0
     fi
-    printf ' 0) 返回预设选择\n检测无法保证所有客户端网络可用。\n' >&2
+    printf ' 0) 取消\n检测无法保证所有客户端网络可用。\n' >&2
     while true; do
         ask "请选择 [0-$index，默认: 1]: " answer
         answer="${answer:-1}"
-        if [ "$answer" = 0 ]; then return 2; fi
+        if [ "$answer" = 0 ]; then return 130; fi
         if [[ "$answer" =~ ^[1-9][0-9]{0,2}$ ]] && [ "$answer" -le "$index" ]; then
             printf '%s\n' "${hosts[answer-1]}"; return 0
         fi
@@ -2195,10 +2193,6 @@ resolve_reality_sni() {
         reality_sni_allowed_host "$CLI_SNI" || return 1
         printf -v "$destination" '%s' "$CLI_SNI"
         return 0
-    fi
-    if [ "$NON_INTERACTIVE" = 0 ]; then
-        select_reality_sni_preset "$destination" 1; rc=$?
-        [ "$rc" = 2 ] || return "$rc"
     fi
     # Preflight before mktemp or forking a selector: tight machines can still
     # choose a preset using only builtins, without entering the scanner at all.
@@ -2227,7 +2221,7 @@ resolve_reality_sni() {
         return 0
     fi
     # wait completed the selector's EXIT cleanup before we display a fallback.
-    [ "$rc" = 2 ] || printf '[提示] SNI 优选未完成，改用预设列表，无需手输域名。\n' >&2
+    printf '[提示] SNI 优选未完成，改用预设列表，无需手输域名。\n' >&2
     select_reality_sni_preset "$destination"
 }
 
