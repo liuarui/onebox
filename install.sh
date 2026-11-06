@@ -1670,17 +1670,30 @@ reality_sni_candidates() {
       (area=="all" || $2=="global" || $2==area) && (selected["all"] || selected[$1]) && !seen[$3]++ {print $3}'
 }
 
-manual_reality_sni() {
-    local manual_host
+select_reality_sni_preset() {
+    local preset_destination="$1" preset_allow_scan="${2:-0}" preset_choice preset_index
+    local -a preset_hosts=(www.intel.com www.nvidia.com www.ibm.com www.sony.com www.python.org)
     if [ "$NON_INTERACTIVE" = 1 ]; then
-        reality_sni_allowed_host "${CLI_SNI:-}" || return 1
-        printf '%s\n' "$CLI_SNI"; return 0
+        printf '[提示] 使用第一个预设 SNI：%s（未经本机测速，请验证实际连接）。\n' "${preset_hosts[0]}" >&2
+        printf -v "$preset_destination" '%s' "${preset_hosts[0]}"
+        return 0
     fi
+    printf '\n请选择预设 SNI（无需测速；这些预设未经本机检测，请验证实际连接）：\n' >&2
+    for preset_index in "${!preset_hosts[@]}"; do
+        printf ' %s) %s\n' "$((preset_index+1))" "${preset_hosts[preset_index]}" >&2
+    done
+    [ "$preset_allow_scan" != 1 ] || printf ' 6) 自动检测并优选 SNI\n' >&2
+    printf ' 0) 取消\n' >&2
     while true; do
-        # Read in the selector itself so TERM can interrupt an idle prompt.
-        ask '请输入已确认可用的伪装域名（必填）: ' manual_host || return 1
-        if reality_sni_allowed_host "$manual_host"; then printf '%s\n' "$manual_host"; return 0; fi
-        printf '[错误] 域名格式无效或属于已排除的 Apple 域名，请重新输入。\n' >&2
+        ask '请选择编号 [默认: 1]: ' preset_choice || return 1
+        case "${preset_choice:-1}" in
+            [1-5])
+                printf -v "$preset_destination" '%s' "${preset_hosts[${preset_choice:-1}-1]}"
+                return 0 ;;
+            6) [ "$preset_allow_scan" != 1 ] || return 2 ;;
+            0) return 130 ;;
+        esac
+        printf '[提示] 请输入菜单中的编号。\n' >&2
     done
 }
 
@@ -1701,7 +1714,7 @@ configure_reality_sni_scan() {
     local mode selection key label count item categories candidate_text
     local -a keys=() entries=()
     while true; do
-        printf '\nSNI 检测范围：\n 1) 快速检测（CDN、云、科技）\n 2) 全部候选（默认）\n 3) 按分类检测（可多选）\n 4) 按地区推荐\n 5) 自定义域名/网址列表\n 6) 检测设置（次数=%s，超时=%ss，并发=%s）\n 0) 手动填写 SNI\n' "$sni_samples" "$sni_timeout" "$sni_jobs" >&2
+        printf '\nSNI 检测范围：\n 1) 快速检测（CDN、云、科技）\n 2) 全部候选（默认）\n 3) 按分类检测（可多选）\n 4) 按地区推荐\n 5) 自定义域名/网址列表\n 6) 检测设置（次数=%s，超时=%ss，并发=%s）\n 0) 返回预设选择\n' "$sni_samples" "$sni_timeout" "$sni_jobs" >&2
         ask '请选择 [0-6，默认: 2]: ' mode
         case "${mode:-2}" in
             0) return 2 ;;
@@ -1753,7 +1766,7 @@ configure_reality_sni_scan() {
             6)
                 prompt_sni_integer '每站测速次数（1–5，取最小值）' "$sni_samples" 5 sni_samples || return 1
                 prompt_sni_integer '单次请求超时秒数（1–15）' "$sni_timeout" 15 sni_timeout || return 1
-                prompt_sni_integer '并发检测上限（1–16，按 PID 额度下调）' "$sni_jobs" 16 sni_jobs || return 1 ;;
+                prompt_sni_integer '并发检测上限（1–16，按 PID/内存额度下调）' "$sni_jobs" 16 sni_jobs || return 1 ;;
             *) printf '[提示] 请输入有效编号。\n' >&2 ;;
         esac
     done
@@ -2025,7 +2038,7 @@ run_reality_sni_selection() {
     trap - EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
-    local auto_sni answer host score chain ranked index=0 slot batch_start=0 position completed=0 tier result scan_rc probe_rc
+    local answer host score chain ranked index=0 slot batch_start=0 position completed=0 tier result scan_rc probe_rc
     local sni_effective_jobs sni_pid_headroom sni_pid_source sni_memory_headroom sni_memory_source sni_resource_reason sni_curl_certinfo worker launched pending last_jobs=0 sni_launch_abort=0
     local -a deadlines=()
     local sni_region="${CLI_SNI_REGION:-all}" sni_categories="${CLI_SNI_CATEGORIES:-all}" sni_hosts="${CLI_SNI_HOSTS:-}"
@@ -2034,34 +2047,25 @@ run_reality_sni_selection() {
     # Persist in this isolated shell until its EXIT trap runs after function return.
     sni_work_dir=""; sni_pids=(); sni_poll_open=0
     trap cleanup_reality_sni_workers EXIT
-    if [ "$NON_INTERACTIVE" = 1 ] && [ -n "${CLI_SNI:-}" ]; then manual_reality_sni; return $?; fi
+    if [ "$NON_INTERACTIVE" = 1 ] && [ -n "${CLI_SNI:-}" ]; then
+        reality_sni_allowed_host "$CLI_SNI" || return 1
+        printf '%s\n' "$CLI_SNI"; return 0
+    fi
     if [ "$NON_INTERACTIVE" = 0 ]; then
-        while true; do
-            ask '是否自动检测并推荐 SNI？(y/n) [默认: y]: ' auto_sni
-            case "${auto_sni:-y}" in
-                y|Y) break ;;
-                n|N) manual_reality_sni; return $? ;;
-                *) printf '[提示] 请输入 y 或 n。\n' >&2 ;;
-            esac
-        done
         configure_reality_sni_scan; scan_rc=$?
-        if [ "$scan_rc" = 2 ]; then manual_reality_sni; return $?; fi
         [ "$scan_rc" = 0 ] || return "$scan_rc"
     fi
     # Check before dependency/candidate subprocesses, then recalculate for every batch.
     if ! onebox_safe_sni_jobs "$sni_jobs"; then
         printf '[错误] 剩余 PID/内存额度不足，无法安全启动 SNI 检测：%s。请释放资源或显式指定 --sni。\n' "$sni_resource_reason" >&2
-        if [ "$NON_INTERACTIVE" = 0 ]; then manual_reality_sni; return $?; fi
         return 1
     fi
     if ! ensure_deps curl setsid mkfifo; then
-        if [ "$NON_INTERACTIVE" = 1 ]; then printf '[错误] 无法准备 SNI 检测依赖。\n' >&2; return 1; fi
-        printf '[提示] 检测依赖不可用，改为手动输入 SNI。\n' >&2
-        manual_reality_sni; return $?
+        printf '[提示] 检测依赖不可用，无法自动优选 SNI。\n' >&2
+        return 1
     fi
     sni_work_dir=$(mktemp -d "${TMPDIR:-/tmp}/onebox-sni.XXXXXX") || return 1
     if ! check_reality_sni_curl; then
-        if [ "$NON_INTERACTIVE" = 0 ]; then manual_reality_sni; return $?; fi
         return 1
     fi
     result=$(reality_sni_candidates "$sni_region" "$sni_categories" "$sni_hosts") || return 1
@@ -2146,11 +2150,8 @@ run_reality_sni_selection() {
     done
     sni_pids=()
     if [ "${#matches[@]}" = 0 ]; then
-        if [ "$NON_INTERACTIVE" = 1 ]; then
-            printf '[错误] 没有通过 SNI 检测的候选；请检查出站网络、调整筛选条件，或用 --sni 显式指定域名。\n' >&2; return 1
-        fi
-        printf '[提示] 没有候选通过全部检测，改为手动输入。\n' >&2
-        manual_reality_sni; return $?
+        printf '[提示] 没有候选通过全部检测。\n' >&2
+        return 1
     fi
     ranked=$(printf '%s\n' "${matches[@]}" | LC_ALL=C sort -k1,1n -k2,2n -k4,4) || return 1
     printf '\n候选 SNI（短证书链优先，同组按多次 TCP/TLS 建连最小耗时排序；通过 %s/%s）：\n' "${#matches[@]}" "${#candidates[@]}" >&2
@@ -2165,11 +2166,11 @@ run_reality_sni_selection() {
         printf '[完成] 自动选择排名第一的 SNI：%s。检测仅代表本机当前网络。\n' "${hosts[0]}" >&2
         printf '%s\n' "${hosts[0]}"; return 0
     fi
-    printf ' 0) 手动输入\n检测无法保证所有客户端网络可用。\n' >&2
+    printf ' 0) 返回预设选择\n检测无法保证所有客户端网络可用。\n' >&2
     while true; do
         ask "请选择 [0-$index，默认: 1]: " answer
         answer="${answer:-1}"
-        if [ "$answer" = 0 ]; then manual_reality_sni; return $?; fi
+        if [ "$answer" = 0 ]; then return 2; fi
         if [[ "$answer" =~ ^[1-9][0-9]{0,2}$ ]] && [ "$answer" -le "$index" ]; then
             printf '%s\n' "${hosts[answer-1]}"; return 0
         fi
@@ -2189,18 +2190,45 @@ stop_sni_selection() {
 
 resolve_reality_sni() {
     local destination="$1" selection_file sni_resolution_value rc=0
-    selection_file=$(mktemp "${TMPDIR:-/tmp}/onebox-sni-choice.XXXXXX") || return 1
+    local sni_effective_jobs sni_pid_headroom sni_pid_source sni_memory_headroom sni_memory_source sni_resource_reason
+    if [ "$NON_INTERACTIVE" = 1 ] && [ -n "${CLI_SNI:-}" ]; then
+        reality_sni_allowed_host "$CLI_SNI" || return 1
+        printf -v "$destination" '%s' "$CLI_SNI"
+        return 0
+    fi
+    if [ "$NON_INTERACTIVE" = 0 ]; then
+        select_reality_sni_preset "$destination" 1; rc=$?
+        [ "$rc" = 2 ] || return "$rc"
+    fi
+    # Preflight before mktemp or forking a selector: tight machines can still
+    # choose a preset using only builtins, without entering the scanner at all.
+    if ! onebox_safe_sni_jobs "${CLI_SNI_JOBS:-8}"; then
+        printf '[提示] 资源不足，跳过 SNI 优选：%s；改用预设。\n' "$sni_resource_reason" >&2
+        select_reality_sni_preset "$destination"
+        return $?
+    fi
+    if ! selection_file=$(mktemp "${TMPDIR:-/tmp}/onebox-sni-choice.XXXXXX"); then
+        printf '[提示] 无法创建检测临时文件，改用预设 SNI。\n' >&2
+        select_reality_sni_preset "$destination"
+        return $?
+    fi
     SB_OWNED_TEMP_FILES+=("$selection_file")
     # One explicit subshell: $! must identify the shell owning the cleanup trap.
     (run_reality_sni_selection) >"$selection_file" <&0 &
     SB_SNI_PID=$!
+    rc=0
     wait "$SB_SNI_PID" || rc=$?
     SB_SNI_PID=""
     IFS= read -r sni_resolution_value < "$selection_file" || :
     rm -f -- "$selection_file"
-    [ "$rc" = 0 ] || return "$rc"
-    reality_sni_allowed_host "$sni_resolution_value" || return 1
-    printf -v "$destination" '%s' "$sni_resolution_value"
+    case "$rc" in 130|143) return "$rc" ;; esac
+    if [ "$rc" = 0 ] && reality_sni_allowed_host "$sni_resolution_value"; then
+        printf -v "$destination" '%s' "$sni_resolution_value"
+        return 0
+    fi
+    # wait completed the selector's EXIT cleanup before we display a fallback.
+    [ "$rc" = 2 ] || printf '[提示] SNI 优选未完成，改用预设列表，无需手输域名。\n' >&2
+    select_reality_sni_preset "$destination"
 }
 
 
@@ -5016,7 +5044,8 @@ add 选项:
   --protocol reality|hysteria2|tuic|anytls|argo|shadowsocks
   --tag NAME --port 1..65535 --uuid UUID --password VALUE
   --password-file PATH（或环境变量 SB_PASSWORD）
-  --sni DOMAIN                 指定 Reality 伪装域名；省略则自动检测选第一名
+  --sni DOMAIN                 指定 Reality 伪装域名并跳过检测
+                               无交互省略则自动优选，失败使用第一个预设
                                自签证书域名默认 bing.com
 Reality SNI 自动检测选项（仅 add --protocol reality）:
   --sni-region all|global|us|eu|jp|hk|sg|cn|au|kr（默认 all）
@@ -5024,7 +5053,7 @@ Reality SNI 自动检测选项（仅 add --protocol reality）:
                                默认 all；与地区筛选取交集，地区包含全球通用站
   --sni-hosts 'HOST URL ...'    自定义列表替代内置列表，空格/逗号分隔
                                不与地区/分类筛选混用；排除 Apple 旗下域名
-  --sni-jobs 1..16             并发上限，默认 8；按剩余 PID 额度自动下调
+  --sni-jobs 1..16             并发上限，默认 8；按剩余 PID/内存额度自动下调
   --sni-samples 1..5           每站测速次数，默认 3，取最小值
   --sni-timeout 1..15          每次请求超时秒数，默认 5
                                短证书链优先、同组按耗时排名；--sni 跳过检测
