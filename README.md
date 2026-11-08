@@ -219,7 +219,7 @@ onebox add --protocol argo --tag argo-1 --port 18080 \
 
 `onebox kns` schema 1 适配器版本为 `1.3.0`，提供历史节点只读发现与凭据导入，以及 KNS 节点安装、状态查询、启停、重装、重配置和卸载接口。`discover` 只返回 tag、协议、监听和可导入性，不返回凭据；`import` 要求一次性 HTTPS 回调，只读取支持的旧节点配置并交给 KNS 加密保存，不改写 OneBox 配置或服务。导入实例标记为外部只读资源，不能通过 KNS 重配置、停用或卸载。当前支持单用户 VLESS Reality、Hysteria2、TUIC、AnyTLS 和 Shadowsocks；VLESS WS/Argo、多用户节点和不完整配置会显示为不可导入。管理操作复用 OneBox 的 sing-box 服务；只读 `status` 返回资源归属、共享引用计数和卸载预览。停用或卸载仅在共享配置不再引用对应端口/协议时清理防火墙规则；卸载不会停止或卸载共享服务，但会重载服务。回调包含协议凭据和 TLS 参数（包括 ALPN）。
 
-小内存或低 PID 限额 LXC 会优先走串行路径：Reality 自动检测按可见 cgroup PID/内存余量降到单任务；旧节点发现批量读取端口元数据，避免每个 inbound 单独启动 jq；证书域名优先使用 OneBox secrets/配置，缺失时最多启动一个 openssl 进程读取证书 CN，不再启动多进程管道。检测到的剩余 PID 少于 3 时跳过 KNS 发现，导入少于 5 时跳过，安装/依赖变更少于 8 时跳过；可见可用内存低于 16/32/64 MiB 时，也会分别跳过发现/导入/安装和依赖变更，避免在余量不足时启动重操作。读不到 cgroup/UID 限额时不会假定额度耗尽；其他系统进程仍可能同时占用额度，隐藏的宿主机限制也无法探测，因此这些是预检门槛，不是硬资源保证。运行仍需要 Bash 4+、jq（导入还需 curl 与支持 `--close` 的 flock），并要求 systemd 或 OpenRC；在无 init 容器或依赖缺失且无法预装的环境中不保证可用。
+小内存或低 PID 限额 LXC 会优先走串行路径：Reality 自动检测按可见 cgroup PID/内存余量降到单任务；旧节点发现批量读取端口元数据，避免每个 inbound 单独启动 jq；证书域名优先使用 OneBox secrets/配置，缺失时最多启动一个 openssl 进程读取证书 CN，不再启动多进程管道。检测到的剩余 PID 少于 3 时跳过 KNS 发现，导入少于 5 时跳过，安装/依赖变更少于 8 时跳过；可见可用内存低于 16/32/64 MiB 时，也会分别跳过发现/导入/安装和依赖变更，避免在余量不足时启动重操作。Linux cgroup 的 `pids.current` 统计内核 task，包含线程，因此 20–30 的总额度还要扣除容器 init、Komari Agent、sing-box 和其他进程/线程。剩余额度是启动前采样，不是预留；其他系统进程仍可能抢占，隐藏的宿主机限制也无法探测，因此预检不是硬资源保证。运行仍需要 Bash 4+、jq（导入还需 curl 与支持 `--close` 的 flock），并要求 systemd 或 OpenRC；在无 init 容器或依赖缺失且无法预装的环境中不保证可用。
 
 ```sh
 onebox kns schema
