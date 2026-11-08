@@ -217,7 +217,7 @@ onebox add --protocol argo --tag argo-1 --port 18080 \
 
 ## Komari KNS 适配器
 
-`onebox kns` 提供 Komari 插件调用的单实例安装、状态查询、重装、重配置和卸载接口。它复用 OneBox 的 sing-box 服务，每个 KNS 节点使用独立配置片段；卸载只删除该实例，不会停止或卸载共享服务。
+`onebox kns` 提供 Komari 插件调用的单实例安装、状态查询、启停、重装、重配置和卸载接口。它复用 OneBox 的 sing-box 服务，每个 KNS 节点使用独立配置片段；停用只从共享配置移除该实例的 inbound，卸载只删除该实例拥有的配置、登记和证书，不会停止或卸载共享服务。
 
 ```sh
 onebox kns schema
@@ -226,10 +226,12 @@ onebox kns status --instance-id vless-main
 onebox kns install --request-file /run/onebox/kns/requests/job-001.json
 onebox kns reconfigure --request-file /run/onebox/kns/requests/job-002.json
 onebox kns reinstall --request-file /run/onebox/kns/requests/job-003.json
-onebox kns uninstall --request-file /run/onebox/kns/requests/job-004.json
+onebox kns disable --request-file /run/onebox/kns/requests/job-004.json
+onebox kns enable --request-file /run/onebox/kns/requests/job-005.json
+onebox kns uninstall --request-file /run/onebox/kns/requests/job-006.json
 ```
 
-安装、重配置、重装和卸载请求使用 schema 1 JSON 文件。请求目录只允许 root 写入；请求文件必须由 root 拥有、权限为 `0600` 或 `0400`、大小不超过 64 KiB，并在执行后删除。Komari 插件应通过安全文件传输下发请求，避免把节点凭据打印到 Agent 任务日志。
+安装、重配置、重装、启停和卸载请求使用 schema 1 JSON 文件。请求目录只允许 root 写入；请求文件必须由 root 拥有、权限为 `0600` 或 `0400`、大小不超过 64 KiB，并在执行后删除。Komari 插件应通过安全文件传输下发请求，避免把节点凭据打印到 Agent 任务日志。
 
 ```sh
 install -d -o root -g root -m 0700 /run/onebox/kns/requests
@@ -262,13 +264,13 @@ install -o root -g root -m 0600 /dev/null /run/onebox/kns/requests/job-001.json
 
 可选的 `instance.listenAddress` 仅支持 `::`、`0.0.0.0`、`127.0.0.1` 或 `::1`，默认 `::`。它控制本机监听接口；订阅发布使用的公网域名或地址由 Komari 插件另行配置。
 
-节点结果通过 `report.callback` HTTPS POST 回传，使用 `Authorization: Bearer <oneTimeToken>` 和 JSON 内容类型。回调返回任意 HTTP 2xx 即视为已接收；服务端应校验 schema、`jobId`、`machineUuid` 和一次性 Token，并立即消费 Token。回调正文遵循 KNS schema，包含运行时、实例监听参数、协议凭据及受管资源；命令行标准输出只返回脱敏状态。安装或卸载的配置变更在回调成功后提交，回调失败会尝试恢复配置与服务状态。
+节点结果通过 `report.callback` HTTPS POST 回传，使用 `Authorization: Bearer <oneTimeToken>` 和 JSON 内容类型。回调返回任意 HTTP 2xx 即视为已接收；服务端应校验 schema、`jobId`、`machineUuid` 和一次性 Token，并拒绝重放。回调正文遵循 KNS schema，包含运行时、实例监听参数、协议凭据及受管资源；命令行标准输出只返回脱敏状态。安装、重配置、重装、启停或卸载的配置变更在回调成功后提交，回调失败会尝试恢复配置与服务状态。
 
 `instance` 不包含公网 Endpoint。Komari 插件应自行解析机器 IPv4/IPv6、域名、NAT 端口和 DDNS，并在发布订阅时选择连接地址。TLS 协议会复用匹配 SNI 的 OneBox 真实证书；找不到匹配证书时会为该实例生成独立自签证书，客户端结果会标记 `allowInsecure: true`。部署前应通过 `onebox cert --cert real ...` 配置与 SNI 匹配的真实证书，或让订阅端明确处理自签证书。
 
 安装后会尝试通过 OneBox 已支持的本机防火墙工具放行相应 TCP/UDP 端口，卸载时仅清理 OneBox 登记且不再被其他节点使用的规则。云厂商安全组仍需单独设置；本机没有受支持的防火墙工具或规则操作失败时会输出提示，节点配置仍会保留。
 
-相同实例与配置的重复 `install` 幂等；`reinstall` 从已保存的实例配置恢复并保留凭据，不能借此修改实例参数。配置变化应使用 `reconfigure`；同协议重配置会尽量复用现有凭据。`uninstall` 需要携带相同机器 UUID，并通过一次性回调确认实例已移除。`list` 和 `status` 不显示凭据；状态等级只反映本机服务和监听情况，不等同于真实代理握手验证。
+相同实例与配置的重复 `install` 幂等；`reinstall` 从已保存的实例配置恢复并保留凭据，不能借此修改实例参数。配置变化应使用 `reconfigure`；同协议重配置会尽量复用现有凭据。`enable` 和 `disable` 只修改指定 KNS inbound，保留登记文件与凭据；`uninstall` 可删除启用或已停用实例，且需要携带相同机器 UUID 并通过一次性回调确认实例已移除。`list` 和 `status` 不显示凭据；状态等级只反映本机服务和监听情况，不等同于真实代理握手验证。
 
 ## 查看、管理与更新
 

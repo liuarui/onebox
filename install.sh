@@ -107,7 +107,7 @@ KNS_STATE_DIR="$CONFIG_DIR/kns"
 KNS_INSTANCES_DIR="$KNS_STATE_DIR/instances"
 KNS_CERTS_DIR="$KNS_STATE_DIR/certs"
 KNS_REQUEST_DIR="/run/onebox/kns/requests"
-KNS_ADAPTER_VERSION="1.0.0"
+KNS_ADAPTER_VERSION="1.1.0"
 
 KERNEL_TMP_DIR=""
 declare -a SB_OWNED_TEMP_FILES=()
@@ -5418,7 +5418,7 @@ kns_instance_file() { printf '%s/%s.json\n' "$KNS_INSTANCES_DIR" "$1"; }
 
 kns_schema() {
     cat <<EOF
-{"schema":1,"adapterVersion":"$KNS_ADAPTER_VERSION","runtime":{"engine":"sing-box","id":"onebox-main"},"commands":["install","reconfigure","reinstall","status","uninstall","list","schema"],"actions":["install","reconfigure","reinstall","uninstall"],"protocols":{"vless":{"transports":["tcp"],"security":"reality"},"hysteria2":{"transports":["udp"]},"tuic":{"transports":["udp"]},"anytls":{"transports":["tcp"]},"shadowsocks":{"transports":["tcp+udp"]},"trojan":{"transports":["tcp"]},"vmess":{"transports":["tcp"]}},"request":{"required":["schema","jobId","machineUuid","action","runtime","instance","idempotencyKey","report"],"instance":{"required":["id","protocol","listenPort","transport","options"],"optional":{"listenAddress":"::, 0.0.0.0, 127.0.0.1, or ::1; default ::"},"options":{"security":"reality for vless","sni":"required for TLS protocols","method":"optional for shadowsocks"}}},"callback":{"method":"POST","contentType":"application/json","authorization":"Bearer report.oneTimeToken","successStatus":"any HTTP 2xx"},"result":{"stdout":"redacted JSON; never contains node credentials","callbackInstance":{"id":"string","protocol":"string","listen":{"port":"number","transport":"string"},"tls":"optional protocol TLS metadata","credential":"protocol-specific object","resources":"array of owned resources"}},"requestTransport":"root-owned mode-0600 JSON file"}
+{"schema":1,"adapterVersion":"$KNS_ADAPTER_VERSION","runtime":{"engine":"sing-box","id":"onebox-main"},"commands":["install","reconfigure","reinstall","enable","disable","status","uninstall","list","schema"],"actions":["install","reconfigure","reinstall","enable","disable","uninstall"],"protocols":{"vless":{"transports":["tcp"],"security":"reality"},"hysteria2":{"transports":["udp"]},"tuic":{"transports":["udp"]},"anytls":{"transports":["tcp"]},"shadowsocks":{"transports":["tcp+udp"]},"trojan":{"transports":["tcp"]},"vmess":{"transports":["tcp"]}},"request":{"required":["schema","jobId","machineUuid","action","runtime","instance","idempotencyKey","report"],"instance":{"required":["id","protocol","listenPort","transport","options"],"optional":{"listenAddress":"::, 0.0.0.0, 127.0.0.1, or ::1; default ::"},"options":{"security":"reality for vless","sni":"required for TLS protocols","method":"optional for shadowsocks"}}},"callback":{"method":"POST","contentType":"application/json","authorization":"Bearer report.oneTimeToken","successStatus":"any HTTP 2xx"},"result":{"stdout":"redacted JSON; never contains node credentials","callbackInstance":{"id":"string","protocol":"string","listen":{"port":"number","transport":"string"},"tls":"optional protocol TLS metadata","credential":"protocol-specific object","resources":"array of owned resources"}},"requestTransport":"root-owned mode-0600 JSON file"}
 EOF
 }
 
@@ -5432,19 +5432,20 @@ kns_list() {
 }
 
 kns_status() {
-    local file="$KNS_INSTANCE_FILE" tag port service health=L0 installed=false
+    local file="$KNS_INSTANCE_FILE" tag port service health=L0 installed=false enabled=false config_present=false manifest_enabled=false
     [ -f "$file" ] && [ ! -L "$file" ] || { kns_emit_result status "$KNS_INSTANCE_ID" false false not_installed unknown; return 0; }
     tag=$(jq -er '.tag | strings' "$file") || { kns_emit_error invalid_state '实例登记文件无效。'; return 1; }
     port=$(jq -er '.listen.port | numbers' "$file") || { kns_emit_error invalid_state '实例监听端口无效。'; return 1; }
-    if [ -r "$CONFIG_FILE" ] && jq -e --arg tag "$tag" '.inbounds[] | select(.tag == $tag)' "$CONFIG_FILE" >/dev/null 2>&1; then
-        installed=true
-        service=$(managed_service_state onebox 2>/dev/null || printf 'unknown')
-        if [ "$service" = active ] && command -v ss >/dev/null 2>&1 && ss -H -lntup "( sport = :$port )" 2>/dev/null | grep -q .; then health=L1; fi
-        jq -c --arg version "$KNS_ADAPTER_VERSION" --arg service "$service" --arg health "$health" \
-            '{schema:1,adapterVersion:$version,operation:"status",instance:{id,machineUuid,protocol,tag,listen,installed:true,installState:"installed",serviceState:$service,healthLevel:$health,updatedAt},runtime:{engine:"sing-box",id:.runtimeId}}' "$file"
-    else
-        kns_emit_result status "$KNS_INSTANCE_ID" false "$installed" orphaned L0
+    manifest_enabled=$(jq -r 'if has("enabled") then (.enabled | tostring) else "true" end' "$file") || return 1
+    if [ -r "$CONFIG_FILE" ] && jq -e --arg tag "$tag" '.inbounds[]? | select(.tag == $tag)' "$CONFIG_FILE" >/dev/null 2>&1; then config_present=true; fi
+    if [ "$config_present" = true ]; then enabled=true; installed=true
+    elif [ "$manifest_enabled" = false ]; then enabled=false; installed=true
+    else enabled=false; installed=false
     fi
+    service=$(managed_service_state onebox 2>/dev/null || printf 'unknown')
+    if [ "$installed" = true ] && [ "$enabled" = true ] && [ "$service" = active ] && command -v ss >/dev/null 2>&1 && ss -H -lntup "( sport = :$port )" 2>/dev/null | grep -q .; then health=L1; fi
+    jq -c --arg version "$KNS_ADAPTER_VERSION" --arg service "$service" --arg health "$health" --argjson enabled "$enabled" --argjson installed "$installed" \
+        '{schema:1,adapterVersion:$version,operation:"status",instance:{id,machineUuid,protocol,tag,listen,installed:$installed,enabled:$enabled,installState:(if $installed then (if $enabled then "installed" else "disabled" end) else "orphaned" end),serviceState:$service,healthLevel:$health,updatedAt},runtime:{engine:"sing-box",id:.runtimeId}}' "$file"
 }
 
 kns_request_validate() {
@@ -5663,6 +5664,17 @@ kns_close_instance_firewall() {
     return "$failed"
 }
 
+kns_enable_conflicts() {
+    local tag="$1" port="$2" address="$3" network="$4" conflict=false
+    case "$network" in
+      tcp) conflict=$(jq -r --arg tag "$tag" --arg addr "$address" --argjson port "$port" '[.inbounds[]? | select(.tag != $tag and .listen_port == $port and (.type != "hysteria2" and .type != "tuic") and (((.listen // "") as $a | $a == "" or $a == "::" or $a == "0.0.0.0" or $addr == "::" or $addr == "0.0.0.0" or $a == $addr)))] | length > 0' "$CONFIG_FILE") || return 2 ;;
+      udp) conflict=$(jq -r --arg tag "$tag" --arg addr "$address" --argjson port "$port" '[.inbounds[]? | select(.tag != $tag and .listen_port == $port and (.type == "hysteria2" or .type == "tuic" or .type == "shadowsocks") and (((.listen // "") as $a | $a == "" or $a == "::" or $a == "0.0.0.0" or $addr == "::" or $addr == "0.0.0.0" or $a == $addr)))] | length > 0' "$CONFIG_FILE") || return 2 ;;
+      tcp+udp) conflict=$(jq -r --arg tag "$tag" --arg addr "$address" --argjson port "$port" '[.inbounds[]? | select(.tag != $tag and .listen_port == $port and (((.listen // "") as $a | $a == "" or $a == "::" or $a == "0.0.0.0" or $addr == "::" or $addr == "0.0.0.0" or $a == $addr)))] | length > 0' "$CONFIG_FILE") || return 2 ;;
+      *) return 2 ;;
+    esac
+    [ "$conflict" = true ]
+}
+
 kns_commit_after_callback() {
     local backup="${CONFIG_TX_DIR:-}"
     [ -z "$backup" ] && return 0
@@ -5712,9 +5724,9 @@ kns_apply() {
     fi
     if [ "$changed" = true ]; then
         case "$KNS_NETWORK" in
-          tcp) conflict=$(jq -r --arg tag "$KNS_TAG" --argjson port "$KNS_LISTEN_PORT" '[.inbounds[]? | select(.tag != $tag and .listen_port == $port and (.type != "hysteria2" and .type != "tuic"))] | length > 0' "$CONFIG_FILE") ;;
-          udp) conflict=$(jq -r --arg tag "$KNS_TAG" --argjson port "$KNS_LISTEN_PORT" '[.inbounds[]? | select(.tag != $tag and .listen_port == $port and (.type == "hysteria2" or .type == "tuic" or .type == "shadowsocks"))] | length > 0' "$CONFIG_FILE") ;;
-          tcp+udp) conflict=$(jq -r --arg tag "$KNS_TAG" --argjson port "$KNS_LISTEN_PORT" '[.inbounds[]? | select(.tag != $tag and .listen_port == $port)] | length > 0' "$CONFIG_FILE") ;;
+          tcp) conflict=$(jq -r --arg tag "$KNS_TAG" --arg addr "$KNS_LISTEN_ADDR" --argjson port "$KNS_LISTEN_PORT" '[.inbounds[]? | select(.tag != $tag and .listen_port == $port and (.type != "hysteria2" and .type != "tuic") and (((.listen // "") as $a | $a == "" or $a == "::" or $a == "0.0.0.0" or $addr == "::" or $addr == "0.0.0.0" or $a == $addr)))] | length > 0' "$CONFIG_FILE") ;;
+          udp) conflict=$(jq -r --arg tag "$KNS_TAG" --arg addr "$KNS_LISTEN_ADDR" --argjson port "$KNS_LISTEN_PORT" '[.inbounds[]? | select(.tag != $tag and .listen_port == $port and (.type == "hysteria2" or .type == "tuic" or .type == "shadowsocks") and (((.listen // "") as $a | $a == "" or $a == "::" or $a == "0.0.0.0" or $addr == "::" or $addr == "0.0.0.0" or $a == $addr)))] | length > 0' "$CONFIG_FILE") ;;
+          tcp+udp) conflict=$(jq -r --arg tag "$KNS_TAG" --arg addr "$KNS_LISTEN_ADDR" --argjson port "$KNS_LISTEN_PORT" '[.inbounds[]? | select(.tag != $tag and .listen_port == $port and (((.listen // "") as $a | $a == "" or $a == "::" or $a == "0.0.0.0" or $addr == "::" or $addr == "0.0.0.0" or $a == $addr)))] | length > 0' "$CONFIG_FILE") ;;
         esac
         [ "$conflict" != true ] || { kns_emit_error port_in_use '监听端口与现有 OneBox 节点的传输协议冲突。'; return 1; }
         backup_config || { kns_emit_error transaction_failed '无法创建配置和实例状态备份。'; return 1; }
@@ -5752,7 +5764,7 @@ kns_apply() {
 }
 
 kns_uninstall() {
-    local tag type port network file
+    local tag type port network file manifest_enabled=false
     file=$(kns_instance_file "$KNS_INSTANCE_ID")
     if [ ! -f "$file" ] || [ -L "$file" ]; then
         KNS_CLIENT=null
@@ -5764,8 +5776,13 @@ kns_uninstall() {
     [ "$(jq -r '.machineUuid' "$file")" = "$KNS_MACHINE_UUID" ] || { kns_emit_error instance_conflict 'instance id 已绑定到另一台机器。'; return 1; }
     port=$(jq -r '.listen.port' "$file")
     network=$(jq -r '.listen.transport' "$file")
-    type=$(jq -r --arg tag "$tag" '.inbounds[] | select(.tag == $tag) | .type' "$CONFIG_FILE")
-    [ -n "$type" ] && [ "$port" != null ] && [ -n "$network" ] || { kns_emit_error not_found '实例清单存在，但共享配置中找不到对应节点。'; return 1; }
+    type=$(jq -r --arg tag "$tag" '.inbounds[]? | select(.tag == $tag) | .type' "$CONFIG_FILE")
+    if [ -z "$type" ]; then
+        manifest_enabled=$(jq -r 'if has("enabled") then (.enabled | tostring) else "true" end' "$file") || return 1
+        [ "$manifest_enabled" = false ] || { kns_emit_error not_found '实例清单存在，但共享配置中找不到对应节点。'; return 1; }
+        type=$(jq -r '.protocol' "$file")
+    fi
+    [ -n "$type" ] && [ "$port" != null ] && [ -n "$network" ] || { kns_emit_error not_found '实例清单存在，但缺少有效的监听信息。'; return 1; }
     backup_config || { kns_emit_error transaction_failed '无法创建卸载事务备份。'; return 1; }
     apply_jq_config 'del(.inbounds[] | select(.tag == $tag))' --arg tag "$tag" || { restore_config_and_service >/dev/null 2>&1 || CONFIG_TX_BLOCKED=1; kns_emit_error config_invalid '移除目标节点配置失败，已尝试回滚。'; return 1; }
     rm -f -- "$file" || { restore_config_and_service >/dev/null 2>&1 || CONFIG_TX_BLOCKED=1; kns_emit_error state_write_failed '移除实例登记文件失败，已尝试回滚。'; return 1; }
@@ -5782,6 +5799,66 @@ kns_uninstall() {
     kns_commit_after_callback
     kns_close_instance_firewall "$port" "$network" || printf '[警告] 节点已卸载，但防火墙规则未能全部清理；请检查 OneBox 端口记录。\n' >&2
     kns_emit_result uninstall "$KNS_INSTANCE_ID" true false not_installed unknown
+}
+
+kns_toggle() {
+    local file="$KNS_INSTANCE_FILE" tag enabled_now inbound tmp updated manifest_enabled port network address conflict
+    [ -f "$file" ] && [ ! -L "$file" ] || { kns_emit_error not_found '实例登记文件不存在。'; return 1; }
+    tag=$(jq -er '.tag | strings' "$file") || { kns_emit_error invalid_state '实例登记文件无效。'; return 1; }
+    [ "$tag" = "kns-${KNS_INSTANCE_ID}" ] || { kns_emit_error instance_conflict '拒绝修改 tag 与 instance_id 不匹配的实例。'; return 1; }
+    [ "$(jq -r '.machineUuid' "$file")" = "$KNS_MACHINE_UUID" ] || { kns_emit_error instance_conflict 'instance id 已绑定到另一台机器。'; return 1; }
+    inbound=$(jq -c '.inbound' "$file") || return 1
+    [ "$inbound" != null ] || { kns_emit_error invalid_state '实例登记文件缺少配置片段。'; return 1; }
+    port=$(jq -r '.listen.port' "$file"); network=$(jq -r '.listen.transport' "$file")
+    if jq -e --arg tag "$tag" '.inbounds[]? | select(.tag == $tag)' "$CONFIG_FILE" >/dev/null 2>&1; then enabled_now=true; else enabled_now=false; fi
+    manifest_enabled=$(jq -r 'if has("enabled") then (.enabled | tostring) else "true" end' "$file") || return 1
+    if [ "$KNS_COMMAND" = enable ] && [ "$enabled_now" = true ] && [ "$manifest_enabled" = true ]; then
+        KNS_CLIENT=$(jq -c '.client' "$file") || return 1; KNS_CLIENT_PROTOCOL=$(jq -r '.protocol' "$file") || return 1
+        kns_callback || { kns_emit_error callback_failed '启用状态回调失败。'; return 1; }
+        kns_open_instance_firewall "$port" "$network" || printf '[警告] 无法为已启用实例放行监听端口 %s/%s。\n' "$port" "$network" >&2
+        kns_emit_result enable "$KNS_INSTANCE_ID" false true installed L0; return 0
+    fi
+    if [ "$KNS_COMMAND" = disable ] && [ "$enabled_now" = false ] && [ "$manifest_enabled" = false ]; then
+        KNS_CLIENT=$(jq -c '.client' "$file") || return 1; KNS_CLIENT_PROTOCOL=$(jq -r '.protocol' "$file") || return 1
+        kns_callback || { kns_emit_error callback_failed '停用状态回调失败。'; return 1; }
+        kns_close_instance_firewall "$port" "$network" || printf '[警告] 无法清理已停用实例的防火墙规则。\n' >&2
+        kns_emit_result disable "$KNS_INSTANCE_ID" false true disabled L0; return 0
+    fi
+    if [ "$KNS_COMMAND" = enable ]; then
+        address=$(jq -r '.listen // "::"' <<< "$inbound") || return 1
+        if kns_enable_conflicts "$tag" "$port" "$address" "$network"; then
+            kns_emit_error port_in_use '监听端口与现有 OneBox 节点的传输协议冲突。'; return 1
+        else
+            conflict=$?
+            [ "$conflict" -eq 1 ] || { kns_emit_error config_invalid '无法核对启用节点的端口冲突。'; return 1; }
+        fi
+    fi
+    backup_config || { kns_emit_error transaction_failed '无法创建配置和实例状态备份。'; return 1; }
+    if [ "$KNS_COMMAND" = disable ]; then
+        apply_jq_config 'del(.inbounds[] | select(.tag == $tag))' --arg tag "$tag" || { restore_config_and_service >/dev/null 2>&1 || CONFIG_TX_BLOCKED=1; kns_emit_error config_invalid '停用目标实例失败，已尝试回滚。'; return 1; }
+        updated=false
+    else
+        apply_jq_config '.inbounds = ([.inbounds[]? | select(.tag != $tag)] + [$inbound])' --arg tag "$tag" --argjson inbound "$inbound" || { restore_config_and_service >/dev/null 2>&1 || CONFIG_TX_BLOCKED=1; kns_emit_error config_invalid '启用目标实例失败，已尝试回滚。'; return 1; }
+        updated=true
+    fi
+    if ! check_kernel_config "$CONFIG_FILE" >/dev/null 2>&1 || ! restart_service >/dev/null 2>&1; then
+        restore_config_and_service >/dev/null 2>&1 || CONFIG_TX_BLOCKED=1
+        kns_emit_error service_reload_failed '实例状态变更后配置校验或共享服务重载失败，已尝试回滚。'; return 1
+    fi
+    tmp=$(mktemp "$KNS_INSTANCES_DIR/.${KNS_INSTANCE_ID}.XXXXXX") || { restore_config_and_service >/dev/null 2>&1 || CONFIG_TX_BLOCKED=1; kns_emit_error state_write_failed '无法更新实例登记文件。'; return 1; }
+    if ! jq --argjson enabled "$updated" --arg action "$KNS_COMMAND" --arg timestamp "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" '.enabled=$enabled | .lastAction=$action | .updatedAt=$timestamp' "$file" > "$tmp" || ! chmod 600 "$tmp" || ! mv -f "$tmp" "$file"; then
+        rm -f "$tmp"; restore_config_and_service >/dev/null 2>&1 || CONFIG_TX_BLOCKED=1; kns_emit_error state_write_failed '无法提交实例启停状态。'; return 1
+    fi
+    KNS_CLIENT=$(jq -c '.client' "$file") || { restore_config_and_service >/dev/null 2>&1 || CONFIG_TX_BLOCKED=1; return 1; }
+    KNS_CLIENT_PROTOCOL=$(jq -r '.protocol' "$file") || { restore_config_and_service >/dev/null 2>&1 || CONFIG_TX_BLOCKED=1; return 1; }
+    if ! kns_callback; then restore_config_and_service >/dev/null 2>&1 || CONFIG_TX_BLOCKED=1; kns_emit_error callback_failed '实例状态回调失败，配置变更已尝试回滚。'; return 1; fi
+    kns_commit_after_callback
+    if [ "$KNS_COMMAND" = enable ]; then
+        kns_open_instance_firewall "$port" "$network" || printf '[警告] 无法为已启用实例放行监听端口 %s/%s。\n' "$port" "$network" >&2
+    else
+        if ! jq -s -e --argjson port "$port" --arg network "$network" 'any(.[]; .enabled != false and .listen.port == $port and .listen.transport == $network)' "$KNS_INSTANCES_DIR"/*.json >/dev/null 2>&1; then kns_close_instance_firewall "$port" "$network" || printf '[警告] 无法清理已停用实例的防火墙规则。\n' >&2; fi
+    fi
+    kns_emit_result "$KNS_COMMAND" "$KNS_INSTANCE_ID" true true "$([ "$updated" = true ] && printf installed || printf disabled)" L0
 }
 
 kns_secure_state_dirs() {
@@ -5808,6 +5885,12 @@ kns_dispatch() {
         kns_request_validate || return 1
         require_config || { kns_emit_error onebox_not_installed 'OneBox 配置不存在。'; return 1; }
         kns_uninstall ;;
+      enable|disable)
+        ensure_deps jq curl || { kns_emit_error missing_dependency 'OneBox 需要 jq 和 curl。'; return 1; }
+        kns_request_validate || return 1
+        require_config || { kns_emit_error onebox_not_installed 'OneBox 配置不存在。'; return 1; }
+        KNS_INSTANCE_FILE=$(kns_instance_file "$KNS_INSTANCE_ID")
+        kns_toggle ;;
       install|reconfigure|reinstall)
         ensure_deps jq curl sha256sum || { kns_emit_error missing_dependency 'OneBox 需要 jq、curl 和 sha256sum。'; return 1; }
         kns_request_validate || return 1
@@ -5822,7 +5905,7 @@ kns_main() {
     KNS_COMMAND="$command" KNS_REQUEST_FILE="" KNS_INSTANCE_ID="" KNS_YES=0
     local -a forwarded=("$@")
     case "$KNS_COMMAND" in schema|list) [ "$#" = 0 ] || { printf '{"success":false,"error":{"code":"invalid_arguments"}}\n'; return 2; } ;;
-      status|uninstall|install|reconfigure|reinstall) ;;
+      status|uninstall|install|reconfigure|reinstall|enable|disable) ;;
       *) printf '{"success":false,"error":{"code":"invalid_command"}}\n'; return 2 ;;
     esac
     while [ "$#" -gt 0 ]; do
@@ -5836,7 +5919,7 @@ kns_main() {
     done
     NON_INTERACTIVE=1
     case "$KNS_COMMAND" in
-      install|reconfigure|reinstall|uninstall) [ -n "$KNS_REQUEST_FILE" ] && [ -z "$KNS_INSTANCE_ID" ] || { printf '{"success":false,"error":{"code":"invalid_arguments"}}\n'; return 2; } ;;
+      install|reconfigure|reinstall|enable|disable|uninstall) [ -n "$KNS_REQUEST_FILE" ] && [ -z "$KNS_INSTANCE_ID" ] || { printf '{"success":false,"error":{"code":"invalid_arguments"}}\n'; return 2; } ;;
       status) [ -z "$KNS_REQUEST_FILE" ] && [[ "$KNS_INSTANCE_ID" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]] || { printf '{"success":false,"error":{"code":"invalid_arguments"}}\n'; return 2; } ;;
     esac
     detect_environment || return $?
