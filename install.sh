@@ -5814,14 +5814,14 @@ kns_toggle() {
     manifest_enabled=$(jq -r 'if has("enabled") then (.enabled | tostring) else "true" end' "$file") || return 1
     if [ "$KNS_COMMAND" = enable ] && [ "$enabled_now" = true ] && [ "$manifest_enabled" = true ]; then
         KNS_CLIENT=$(jq -c '.client' "$file") || return 1; KNS_CLIENT_PROTOCOL=$(jq -r '.protocol' "$file") || return 1
-        kns_callback || { kns_emit_error callback_failed '启用状态回调失败。'; return 1; }
         kns_open_instance_firewall "$port" "$network" || printf '[警告] 无法为已启用实例放行监听端口 %s/%s。\n' "$port" "$network" >&2
+        kns_callback || { kns_emit_error callback_failed '启用状态回调失败。'; return 1; }
         kns_emit_result enable "$KNS_INSTANCE_ID" false true installed L0; return 0
     fi
     if [ "$KNS_COMMAND" = disable ] && [ "$enabled_now" = false ] && [ "$manifest_enabled" = false ]; then
         KNS_CLIENT=$(jq -c '.client' "$file") || return 1; KNS_CLIENT_PROTOCOL=$(jq -r '.protocol' "$file") || return 1
-        kns_callback || { kns_emit_error callback_failed '停用状态回调失败。'; return 1; }
         kns_close_instance_firewall "$port" "$network" || printf '[警告] 无法清理已停用实例的防火墙规则。\n' >&2
+        kns_callback || { kns_emit_error callback_failed '停用状态回调失败。'; return 1; }
         kns_emit_result disable "$KNS_INSTANCE_ID" false true disabled L0; return 0
     fi
     if [ "$KNS_COMMAND" = enable ]; then
