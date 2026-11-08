@@ -6149,14 +6149,14 @@ kns_main() {
     if [ "$KNS_COMMAND" = schema ]; then kns_schema; return $?; fi
     case "$KNS_COMMAND" in
       discover|list)
-        onebox_require_pid_headroom 3 "KNS $KNS_COMMAND" || { printf 'KNS_RESOURCE=low_pid_headroom\n'; return 1; }
-        onebox_require_memory_headroom $((16 * 1024 * 1024)) "KNS $KNS_COMMAND" || { printf 'KNS_RESOURCE=low_memory_headroom\n'; return 1; } ;;
+        onebox_require_pid_headroom 3 "KNS $KNS_COMMAND" || { printf '{"schema":1,"adapterVersion":"%s","error":{"code":"low_pid_headroom"}}\n' "$KNS_ADAPTER_VERSION"; return 1; }
+        onebox_require_memory_headroom $((16 * 1024 * 1024)) "KNS $KNS_COMMAND" || { printf '{"schema":1,"adapterVersion":"%s","error":{"code":"low_memory_headroom"}}\n' "$KNS_ADAPTER_VERSION"; return 1; } ;;
       import)
-        onebox_require_pid_headroom 5 'KNS 旧节点导入' || { printf 'KNS_RESOURCE=low_pid_headroom\n'; return 1; }
-        onebox_require_memory_headroom $((32 * 1024 * 1024)) 'KNS 旧节点导入' || { printf 'KNS_RESOURCE=low_memory_headroom\n'; return 1; } ;;
+        onebox_require_pid_headroom 5 'KNS 旧节点导入' || { printf '{"schema":1,"adapterVersion":"%s","error":{"code":"low_pid_headroom"}}\n' "$KNS_ADAPTER_VERSION"; return 1; }
+        onebox_require_memory_headroom $((32 * 1024 * 1024)) 'KNS 旧节点导入' || { printf '{"schema":1,"adapterVersion":"%s","error":{"code":"low_memory_headroom"}}\n' "$KNS_ADAPTER_VERSION"; return 1; } ;;
       install|reconfigure|reinstall|enable|disable|uninstall)
-        onebox_require_pid_headroom 8 "KNS $KNS_COMMAND" || { printf 'KNS_RESOURCE=low_pid_headroom\n'; return 1; }
-        onebox_require_memory_headroom $((64 * 1024 * 1024)) "KNS $KNS_COMMAND" || { printf 'KNS_RESOURCE=low_memory_headroom\n'; return 1; } ;;
+        onebox_require_pid_headroom 8 "KNS $KNS_COMMAND" || { printf '{"schema":1,"adapterVersion":"%s","error":{"code":"low_pid_headroom"}}\n' "$KNS_ADAPTER_VERSION"; return 1; }
+        onebox_require_memory_headroom $((64 * 1024 * 1024)) "KNS $KNS_COMMAND" || { printf '{"schema":1,"adapterVersion":"%s","error":{"code":"low_memory_headroom"}}\n' "$KNS_ADAPTER_VERSION"; return 1; } ;;
     esac
     if [ "$KNS_COMMAND" = status ] || [ "$KNS_COMMAND" = list ] || [ "$KNS_COMMAND" = discover ]; then kns_dispatch; return $?; fi
     trap cleanup_on_exit EXIT
