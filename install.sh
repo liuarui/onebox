@@ -107,7 +107,7 @@ KNS_STATE_DIR="$CONFIG_DIR/kns"
 KNS_INSTANCES_DIR="$KNS_STATE_DIR/instances"
 KNS_CERTS_DIR="$KNS_STATE_DIR/certs"
 KNS_REQUEST_DIR="/run/onebox/kns/requests"
-KNS_ADAPTER_VERSION="1.1.0"
+KNS_ADAPTER_VERSION="1.1.1"
 
 KERNEL_TMP_DIR=""
 declare -a SB_OWNED_TEMP_FILES=()
@@ -5618,7 +5618,7 @@ kns_generate_node() {
         --arg transport "$KNS_NETWORK" --argjson port "$KNS_LISTEN_PORT" '
         {id:$id,protocol:$protocol,
          listen:{port:$port,transport:$transport},
-         tls:(if $source.tls.enabled then {security:($source.tls.security // "tls"),sni:$source.tls.server_name,publicKey:$source.tls.public_key,shortId:$source.tls.short_id,allowInsecure:$source.tls.allow_insecure} else null end),
+         tls:(if $source.tls.enabled then {security:($source.tls.security // "tls"),sni:$source.tls.server_name,publicKey:$source.tls.public_key,shortId:$source.tls.short_id,allowInsecure:$source.tls.allow_insecure,alpn:$source.tls.alpn} else null end),
          credential:(if ($source.credentials.uuid? != null and $source.credentials.password? != null) then {type:"uuid_password",uuid:$source.credentials.uuid,password:$source.credentials.password}
                      elif ($source.credentials.uuid? != null) then {type:"uuid",value:$source.credentials.uuid,flow:$source.credentials.flow,alterId:$source.credentials.alter_id,security:$source.credentials.security}
                      elif ($source.credentials.password? != null and $source.credentials.method? != null) then {type:"shadowsocks",method:$source.credentials.method,value:$source.credentials.password}
