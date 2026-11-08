@@ -49,6 +49,7 @@ if [ "$bootstrap_needs_bash" = 1 ]; then
     fi
     if [ "$bootstrap_have_bash" != 1 ]; then
         case "${1:-}" in
+            kns) echo '[错误] KNS 命令需要预先安装 Bash 4+；为避免低进程额度容器触发包管理器，不会自动安装 Bash。' >&2; exit 3 ;;
             -h|--help|help) printf '%s\n' '用法: sh install.sh [install|add|delete|list|links|status|check|start|stop|restart|update|cert|outbound|bbr|uninstall] [选项]' '运行命令时会自动安装 Bash；完整参数说明见 README.md。'; exit 0 ;;
         esac
         bootstrap_skip_value=0
@@ -107,7 +108,7 @@ KNS_STATE_DIR="$CONFIG_DIR/kns"
 KNS_INSTANCES_DIR="$KNS_STATE_DIR/instances"
 KNS_CERTS_DIR="$KNS_STATE_DIR/certs"
 KNS_REQUEST_DIR="/run/onebox/kns/requests"
-KNS_ADAPTER_VERSION="1.2.0"
+KNS_ADAPTER_VERSION="1.3.0"
 
 KERNEL_TMP_DIR=""
 declare -a SB_OWNED_TEMP_FILES=()
@@ -1250,6 +1251,8 @@ ensure_cron() {
 }
 
 init_base() {
+    onebox_require_pid_headroom 8 'OneBox 初始化/依赖安装' || return 1
+    onebox_require_memory_headroom $((64 * 1024 * 1024)) 'OneBox 初始化/依赖安装' || return 1
     ensure_deps curl wget jq tar gzip openssl ss sha256sum base64 flock || return 1
 
     if ! kernel_ok; then
@@ -1847,6 +1850,20 @@ onebox_probe_pids_budget() {
     fi
 }
 
+# Refuse fork-heavy operations before starting package managers or service
+# commands when the visible cgroup/UID budget is nearly exhausted. This uses
+# shell builtins only. Unknown/unmounted limits remain advisory.
+onebox_require_pid_headroom() {
+    local minimum="$1" operation="$2"
+    onebox_probe_pids_budget
+    if [ "$sni_pid_headroom" -ge 0 ] && [ "$sni_pid_headroom" -lt "$minimum" ]; then
+        printf '[错误] 进程额度不足，已跳过 %s（可用 %s，至少需要 %s；来源：%s）。请稍后重试或提高容器 pids 限额。\n' \
+            "$operation" "$sni_pid_headroom" "$minimum" "$sni_pid_source" >&2
+        return 1
+    fi
+    return 0
+}
+
 onebox_probe_memory_budget() {
     local proc_root="${1:-/proc}" key value unit id controllers path v2_path='' v1_path=''
     local line fstype source options left a b mount_root mount_dir relative directory limit usage free
@@ -1906,6 +1923,17 @@ onebox_probe_memory_budget() {
             directory="${directory%/*}"
         done
     done < "$proc_root/self/mountinfo"
+    return 0
+}
+
+onebox_require_memory_headroom() {
+    local minimum="$1" operation="$2"
+    onebox_probe_memory_budget
+    if [ "$sni_memory_headroom" -ge 0 ] && [ "$sni_memory_headroom" -lt "$minimum" ]; then
+        printf '[错误] 可用内存不足，已跳过 %s（约 %s MiB，至少需要 %s MiB；来源：%s）。请稍后重试或提高容器内存限额。\n' \
+            "$operation" "$((sni_memory_headroom / 1024 / 1024))" "$((minimum / 1024 / 1024))" "$sni_memory_source" >&2
+        return 1
+    fi
     return 0
 }
 
@@ -5051,7 +5079,7 @@ onebox 仅供学习与技术研究，请遵守适用法律法规，在获得授�
   add              添加一个节点（自动安装缺少的依赖及内核）
   delete           删除节点，需要 --tag NAME --yes
   list | links     节点列表 / 分享链接（--tag 可筛选）
-  kns              KNS 节点接口：install/reconfigure/reinstall/status/uninstall/list/schema
+  kns              KNS 节点接口：discover/import/install/reconfigure/reinstall/status/uninstall/list/schema
   status | check   服务状态 / 配置检查
   doctor           只读体检：程序、配置 JSON、服务、隧道和证书
   logs             最近 80 行服务日志（systemd），--source install 查看安装步骤日志
@@ -5418,7 +5446,7 @@ kns_instance_file() { printf '%s/%s.json\n' "$KNS_INSTANCES_DIR" "$1"; }
 
 kns_schema() {
     cat <<EOF
-{"schema":1,"adapterVersion":"$KNS_ADAPTER_VERSION","runtime":{"engine":"sing-box","id":"onebox-main"},"commands":["install","reconfigure","reinstall","enable","disable","status","uninstall","list","schema"],"actions":["install","reconfigure","reinstall","enable","disable","uninstall"],"protocols":{"vless":{"transports":["tcp"],"security":"reality"},"hysteria2":{"transports":["udp"]},"tuic":{"transports":["udp"]},"anytls":{"transports":["tcp"]},"shadowsocks":{"transports":["tcp+udp"]},"trojan":{"transports":["tcp"]},"vmess":{"transports":["tcp"]}},"request":{"required":["schema","jobId","machineUuid","action","runtime","instance","idempotencyKey","report"],"instance":{"required":["id","protocol","listenPort","transport","options"],"optional":{"listenAddress":"::, 0.0.0.0, 127.0.0.1, or ::1; default ::"},"options":{"security":"reality for vless","sni":"required for TLS protocols","method":"optional for shadowsocks"}}},"callback":{"method":"POST","contentType":"application/json","authorization":"Bearer report.oneTimeToken","successStatus":"any HTTP 2xx"},"result":{"stdout":"redacted JSON; never contains node credentials","callbackInstance":{"id":"string","protocol":"string","listen":{"port":"number","transport":"string"},"tls":"optional protocol TLS metadata","credential":"protocol-specific object","resources":"array with ownership and reference metadata"},"statusInstance":{"resources":"current config, firewall and service references","uninstallPreview":{"complete":"boolean","serviceImpact":"reload or unknown"}}},"requestTransport":"root-owned mode-0600 JSON file"}
+{"schema":1,"adapterVersion":"$KNS_ADAPTER_VERSION","runtime":{"engine":"sing-box","id":"onebox-main"},"commands":["install","reconfigure","reinstall","enable","disable","status","uninstall","list","discover","import","schema"],"actions":["install","reconfigure","reinstall","enable","disable","uninstall","import"],"protocols":{"vless":{"transports":["tcp"],"security":"reality"},"hysteria2":{"transports":["udp"]},"tuic":{"transports":["udp"]},"anytls":{"transports":["tcp"]},"shadowsocks":{"transports":["tcp+udp"]},"trojan":{"transports":["tcp"]},"vmess":{"transports":["tcp"]}},"request":{"required":["schema","jobId","machineUuid","action","runtime","instance","idempotencyKey","report"],"instance":{"required":["id","protocol","listenPort","transport","options"],"optional":{"listenAddress":"::, 0.0.0.0, 127.0.0.1, or ::1; default ::","legacyTag":"existing inbound tag for read-only import"},"options":{"security":"reality for vless","sni":"required for TLS protocols","method":"optional for shadowsocks"}}},"callback":{"method":"POST","contentType":"application/json","authorization":"Bearer report.oneTimeToken","successStatus":"any HTTP 2xx"},"result":{"stdout":"redacted JSON; never contains node credentials","discovery":"metadata only; never contains credentials","callbackInstance":{"id":"string","protocol":"string","listen":{"port":"number","transport":"string"},"tls":"optional protocol TLS metadata","credential":"protocol-specific object","resources":"array with ownership and reference metadata"},"statusInstance":{"resources":"current config, firewall and service references","uninstallPreview":{"complete":"boolean","serviceImpact":"reload or unknown"}}},"requestTransport":"root-owned mode-0600 JSON file"}
 EOF
 }
 
@@ -5429,6 +5457,76 @@ kns_list() {
         [ -f "$file" ] && [ ! -L "$file" ] || continue
         jq -c 'del(.client,.requestHash)' "$file" || return 1
     done | jq -s --arg version "$KNS_ADAPTER_VERSION" '[.[] | . as $x | {id:$x.id,machineUuid:$x.machineUuid,runtimeId:$x.runtimeId,protocol:$x.protocol,tag:$x.tag,listen:$x.listen,updatedAt:$x.updatedAt}] | {schema:1,adapterVersion:$version,runtime:{engine:"sing-box",id:"onebox-main"},instances:.}'
+}
+
+onebox_certificate_domain() {
+    local cert="$1" subject
+    KNS_CERT_COMMON_NAME=''
+    command -v openssl >/dev/null 2>&1 || return 1
+    subject=$(openssl x509 -in "$cert" -noout -subject -nameopt RFC2253 2>/dev/null) || return 1
+    [[ "$subject" == *CN=* ]] || return 1
+    subject="${subject#*CN=}"
+    subject="${subject%%,*}"
+    [ -n "$subject" ] || return 1
+    KNS_CERT_COMMON_NAME="$subject"
+}
+
+kns_discover() {
+    local file registered='[]' real_domain self_domain='bing.com' public_key_ports='' port pub_var pub separator=''
+    local -a manifests=() reality_ports=()
+    require_config readonly || return 1
+    if [ -d "$KNS_INSTANCES_DIR" ] && [ ! -L "$KNS_INSTANCES_DIR" ]; then
+        for file in "$KNS_INSTANCES_DIR"/*.json; do
+            [ -f "$file" ] && [ ! -L "$file" ] || continue
+            manifests+=("$file")
+        done
+    fi
+    if [ "${#manifests[@]}" -gt 0 ]; then
+        registered=$(jq -s '[.[] | .tag? | strings] | unique' "${manifests[@]}") || return 1
+    fi
+    load_secrets || return 1
+    real_domain=${REAL_DOMAIN:-}
+    self_domain=${SELF_DOMAIN:-bing.com}
+    # Prefer OneBox metadata. A single openssl process is a legacy fallback;
+    # avoid the former openssl|sed|tr pipeline in constrained containers.
+    if [ -z "$real_domain" ] && [ -s "$CERT_DIR/real.cer" ]; then
+        onebox_certificate_domain "$CERT_DIR/real.cer" && real_domain="$KNS_CERT_COMMON_NAME"
+    fi
+    while IFS= read -r port; do
+        [[ "$port" =~ ^[0-9]{1,5}$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || continue
+        pub_var="REALITY_PUB_${port}"; pub=${!pub_var:-}
+        [ -n "$pub" ] || continue
+        reality_ports+=("$port")
+    done < <(jq -r '.inbounds[]? | select(.type == "vless" and .tls.reality.enabled == true) | .listen_port // empty' "$CONFIG_FILE")
+    for port in "${reality_ports[@]}"; do
+        public_key_ports+="${separator}${port}"
+        separator=,
+    done
+    public_key_ports="[${public_key_ports}]"
+    jq -c --arg version "$KNS_ADAPTER_VERSION" --argjson registered "$registered" --arg real "$real_domain" --arg self "$self_domain" --argjson publicKeyPorts "$public_key_ports" '
+      [.inbounds[]? | select((.tag? | type) == "string" and .tag != "" and .tag != "dns-in") | . as $inbound |
+       ($inbound.type // "unknown") as $type |
+       ($inbound.listen_port // 0) as $port |
+       ($inbound.users // []) as $users |
+       (if $type == "hysteria2" or $type == "tuic" then "udp"
+        elif $type == "shadowsocks" then "tcp+udp"
+        elif $inbound.transport.type? == "ws" then "ws" else "tcp" end) as $transport |
+       (if $type == "vless" then (if $inbound.tls.reality.enabled? == true and $transport == "tcp" then "reality" else "unsupported" end)
+        elif $type == "shadowsocks" then "none" else "tls" end) as $security |
+       (if $type == "vless" then $security else "" end) as $optionSecurity |
+       ($inbound.tls.server_name // (if (($inbound.tls.certificate_path // "") | endswith("/real.cer")) then $real elif (($inbound.tls.certificate_path // "") | endswith("/self.cer")) then $self else "" end)) as $sni |
+       (($registered | index($inbound.tag)) != null) as $managed |
+       (if $type == "vless" then ($security == "reality" and ($users|length) == 1 and (($users[0].uuid // "")|test("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")) and (($inbound.tls.reality.short_id[0] // "")|length) > 0 and (($inbound.listen_port // 0) > 0) and (($publicKeyPorts | index($port)) != null))
+        elif $type == "shadowsocks" then ((["aes-128-gcm","aes-256-gcm","chacha20-ietf-poly1305","2022-blake3-aes-128-gcm","2022-blake3-aes-256-gcm","2022-blake3-chacha20-poly1305"] | index($inbound.method // "")) != null and (($inbound.password // "")|length) > 0 and $transport == "tcp+udp" and ($port > 0))
+        elif $type == "hysteria2" or $type == "anytls" then (($users|length) == 1 and (($users[0].password // "")|length) > 0 and ($port > 0))
+        elif $type == "tuic" then (($users|length) == 1 and (($users[0].uuid // "")|test("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")) and (($users[0].password // "")|length) > 0 and ($port > 0))
+        else false end) as $credentialShape |
+       (($inbound.listen // "::") as $listenAddr |
+        {tag:$inbound.tag,protocol:$type,listen:{port:(if ($port|type)=="number" then $port else 0 end),address:$listenAddr,transport:$transport},managed:$managed,
+         importable:($credentialShape and ($managed|not) and ($inbound.tag|test("^[A-Za-z0-9._:-]{1,128}$")) and ((["::","0.0.0.0"] | index($listenAddr)) != null) and ($type == "shadowsocks" or $sni != "" or $type == "vless")),
+         options:{security:$optionSecurity,sni:$sni,method:($inbound.method // "")},
+         reason:(if $managed then "already_managed" elif (["::","0.0.0.0"] | index($listenAddr)) == null then "unsupported_listen_address" elif (($inbound.tag|test("^[A-Za-z0-9._:-]{1,128}$"))|not) then "invalid_tag" elif (["vless","hysteria2","tuic","anytls","shadowsocks"] | index($type)) == null then "unsupported_protocol" elif ($users|length) > 1 then "multiple_users" elif $type != "shadowsocks" and $sni == "" then "missing_sni" elif $credentialShape then "" else "unsupported_or_incomplete_config" end)})]
+      | {schema:1,adapterVersion:$version,runtime:{engine:"sing-box",id:"onebox-main"},instances:.}' "$CONFIG_FILE"
 }
 
 kns_config_transport_references() {
@@ -5513,12 +5611,13 @@ kns_request_validate() {
       (.machineUuid | type == "string" and test("^[A-Za-z0-9._:-]{1,128}$")) and
       (.idempotencyKey | type == "string" and test("^[A-Za-z0-9._:-]{1,256}$")) and
       (.runtime | type == "object" and ((keys - ["engine","id"]) | length == 0) and .engine == "sing-box" and (.id | type == "string" and test("^[A-Za-z0-9_-]{1,64}$"))) and
-      (.instance | type == "object" and ((keys - ["id","protocol","listenPort","listenAddress","transport","options"]) | length == 0)) and
+      (.instance | type == "object" and ((keys - ["id","protocol","listenPort","listenAddress","transport","options","legacyTag"]) | length == 0)) and
       (.instance.id | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")) and
       (.instance.protocol | type == "string" and length > 0 and length <= 32) and
       (.instance.listenPort | type == "number" and floor == . and . >= 1 and . <= 65535) and
       ((.instance.listenAddress // "::") | type == "string" and length > 0 and length <= 45) and
       (.instance.transport as $transport | (["tcp","udp","tcp+udp"] | index($transport)) != null) and
+      (if $action == "import" then (.instance.legacyTag | type == "string" and test("^[A-Za-z0-9._:-]{1,128}$")) else ((.instance | has("legacyTag")) | not) end) and
       (.instance.options | type == "object" and ((keys - ["security","sni","method"]) | length == 0)) and
       (.report | type == "object" and ((keys - ["callback","oneTimeToken"]) | length == 0)) and
       (.report.callback | type == "string" and test("^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?/[A-Za-z0-9._~/-]*$")) and
@@ -5536,6 +5635,7 @@ kns_request_validate() {
     KNS_NETWORK=$(jq -r '.instance.transport' "$request")
     KNS_SNI=$(jq -r '.instance.options.sni // empty' "$request")
     KNS_METHOD=$(jq -r '.instance.options.method // "aes-128-gcm"' "$request")
+    KNS_LEGACY_TAG=$(jq -r '.instance.legacyTag // empty' "$request")
     KNS_CALLBACK_URL=$(jq -r '.report.callback' "$request")
     KNS_CALLBACK_TOKEN=$(jq -r '.report.oneTimeToken' "$request")
     KNS_INSTANCE_FILE=$(kns_instance_file "$KNS_INSTANCE_ID")
@@ -5680,9 +5780,9 @@ kns_generate_node() {
 
 kns_callback() {
     local payload conf response http_code
-    payload=$(mktemp "$KNS_STATE_DIR/.callback.XXXXXX") || return 1; SB_OWNED_TEMP_FILES+=("$payload"); chmod 600 "$payload" || return 1
-    conf=$(mktemp "$KNS_STATE_DIR/.curl.XXXXXX") || return 1; SB_OWNED_TEMP_FILES+=("$conf"); chmod 600 "$conf" || return 1
-    response=$(mktemp "$KNS_STATE_DIR/.ack.XXXXXX") || return 1; SB_OWNED_TEMP_FILES+=("$response"); chmod 600 "$response" || return 1
+    payload=$(mktemp "$KNS_REQUEST_DIR/.callback.XXXXXX") || return 1; SB_OWNED_TEMP_FILES+=("$payload"); chmod 600 "$payload" || return 1
+    conf=$(mktemp "$KNS_REQUEST_DIR/.curl.XXXXXX") || return 1; SB_OWNED_TEMP_FILES+=("$conf"); chmod 600 "$conf" || return 1
+    response=$(mktemp "$KNS_REQUEST_DIR/.ack.XXXXXX") || return 1; SB_OWNED_TEMP_FILES+=("$response"); chmod 600 "$response" || return 1
     jq -cn --arg job "$KNS_JOB_ID" --arg machine "$KNS_MACHINE_UUID" --arg runtime "$KNS_RUNTIME_ID" --arg command "$KNS_COMMAND" \
         --arg version "$KNS_ADAPTER_VERSION" --argjson node "${KNS_CLIENT:-null}" \
         '{schema:1,jobId:$job,machineUuid:$machine,status:"succeeded",runtime:{id:$runtime,engine:"sing-box"},instances:(if $command == "uninstall" then [] else [$node] end),artifactVersion:$version}' > "$payload" || return 1
@@ -5691,6 +5791,74 @@ kns_callback() {
         --request POST --data-binary "@$payload" --output "$response" --write-out '%{http_code}' "$KNS_CALLBACK_URL" 2>/dev/null) || return 1
     [[ "$http_code" =~ ^2[0-9][0-9]$ ]] || return 1
     return 0
+}
+
+kns_import_legacy() {
+    local matches inbound type port transport security sni cert_path method uuid password flow short_id public_key allow_insecure=false
+    local pub_var user_count
+    [ -n "$KNS_LEGACY_TAG" ] || { kns_emit_error invalid_request '旧节点导入必须指定 tag。'; return 1; }
+    require_config readonly || { kns_emit_error onebox_not_installed 'OneBox 配置不存在或不可读。'; return 1; }
+    load_secrets || { kns_emit_error secrets_unreadable '无法读取 OneBox 本地密钥文件。'; return 1; }
+    matches=$(jq -c --arg tag "$KNS_LEGACY_TAG" '[.inbounds[]? | select(.tag == $tag)]' "$CONFIG_FILE") || return 1
+    [ "$(jq 'length' <<< "$matches")" = 1 ] || { kns_emit_error legacy_node_not_found '指定 tag 不存在或重复，未导入。'; return 1; }
+    inbound=$(jq -c '.[0]' <<< "$matches") || return 1
+    type=$(jq -r '.type // ""' <<< "$inbound")
+    port=$(jq -r '.listen_port // 0' <<< "$inbound")
+    cert_path=$(jq -r '.tls.certificate_path // ""' <<< "$inbound")
+    user_count=$(jq -r '(.users // []) | length' <<< "$inbound")
+    transport=tcp; security=; sni=$(jq -r '.tls.server_name // empty' <<< "$inbound")
+    case "$type" in
+      vless)
+        [ "$(jq -r '.tls.reality.enabled // false' <<< "$inbound")" = true ] && [ "$(jq -r '.transport.type // "tcp"' <<< "$inbound")" != ws ] || { kns_emit_error unsupported_legacy_node '仅支持导入 VLESS Reality，不支持 WS/Argo。'; return 1; }
+        transport=tcp; security=reality ;;
+      hysteria2) transport=udp ;;
+      tuic) transport=udp ;;
+      anytls) transport=tcp ;;
+      shadowsocks) transport=tcp+udp ;;
+      *) kns_emit_error unsupported_legacy_node '该历史节点协议不受 KNS 导入支持。'; return 1 ;;
+    esac
+    [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || { kns_emit_error invalid_legacy_node '历史节点监听端口无效。'; return 1; }
+    if [ "$type" != shadowsocks ] && [ "$type" != vless ] && [ -z "$sni" ]; then
+        case "$cert_path" in
+          */real.cer)
+            sni=${REAL_DOMAIN:-}
+            if [ -z "$sni" ] && [ -s "$cert_path" ]; then
+                onebox_certificate_domain "$cert_path" && sni="$KNS_CERT_COMMON_NAME"
+            fi ;;
+          */self.cer) sni=${SELF_DOMAIN:-bing.com}; allow_insecure=true ;;
+        esac
+    fi
+    case "$cert_path" in */self.cer) allow_insecure=true ;; esac
+    [ "$type" = shadowsocks ] || { valid_host "$sni" || { kns_emit_error invalid_legacy_node '历史节点缺少有效 TLS SNI。'; return 1; }; }
+    [ "$KNS_PROTOCOL" = "$type" ] && [ "$KNS_LISTEN_PORT" = "$port" ] && [ "$KNS_NETWORK" = "$transport" ] && [ "$KNS_SECURITY" = "$security" ] && [ "$KNS_SNI" = "$sni" ] || { kns_emit_error legacy_node_changed '节点配置与最近一次发现结果不一致，请重新扫描。'; return 1; }
+    if [ "$type" != shadowsocks ] && [ "$user_count" != 1 ]; then kns_emit_error unsupported_legacy_node '只支持导入包含一个用户的历史节点。'; return 1; fi
+    method=$(jq -r '.method // empty' <<< "$inbound")
+    uuid=$(jq -r '.users[0].uuid // empty' <<< "$inbound")
+    password=$(jq -r 'if .type == "shadowsocks" then (.password // "") else (.users[0].password // "") end' <<< "$inbound")
+    flow=$(jq -r '.users[0].flow // ""' <<< "$inbound")
+    short_id=$(jq -r '.tls.reality.short_id[0] // ""' <<< "$inbound")
+    local alpn_json
+    alpn_json=$(jq -c '.tls.alpn // []' <<< "$inbound") || return 1
+    case "$type" in
+      vless)
+        [[ "$uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || { kns_emit_error invalid_legacy_node '历史 VLESS UUID 无效。'; return 1; }
+        [ -n "$short_id" ] || { kns_emit_error invalid_legacy_node '历史 Reality Short ID 缺失。'; return 1; }
+        pub_var="REALITY_PUB_${port}"; public_key=${!pub_var:-}
+        [ -n "$public_key" ] || { kns_emit_error invalid_legacy_node '历史 Reality 公钥未保存在 OneBox secrets 文件。'; return 1; }
+        KNS_CLIENT=$(jq -cn --arg id "$KNS_INSTANCE_ID" --arg tag "$KNS_LEGACY_TAG" --arg uuid "$uuid" --arg flow "${flow:-xtls-rprx-vision}" --arg sni "$sni" --arg pub "$public_key" --arg sid "$short_id" --argjson port "$port" --argjson alpn "$alpn_json" --arg transport "$transport" '{id:$id,legacyTag:$tag,protocol:"vless",listen:{port:$port,transport:$transport},tls:{security:"reality",sni:$sni,publicKey:$pub,shortId:$sid,alpn:$alpn},credential:{type:"uuid",value:$uuid,flow:$flow},resources:[{type:"legacyConfigFragment",id:$tag,owned:false,shared:true}]}') || return 1 ;;
+      tuic)
+        [[ "$uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] && [ -n "$password" ] || { kns_emit_error invalid_legacy_node '历史 TUIC 凭据缺失或无效。'; return 1; }
+        KNS_CLIENT=$(jq -cn --arg id "$KNS_INSTANCE_ID" --arg tag "$KNS_LEGACY_TAG" --arg uuid "$uuid" --arg password "$password" --arg sni "$sni" --argjson port "$port" --argjson alpn "$alpn_json" --argjson insecure "$allow_insecure" --arg transport "$transport" '{id:$id,legacyTag:$tag,protocol:"tuic",listen:{port:$port,transport:$transport},tls:{security:"tls",sni:$sni,alpn:$alpn,allowInsecure:$insecure},credential:{type:"uuid_password",uuid:$uuid,password:$password},resources:[{type:"legacyConfigFragment",id:$tag,owned:false,shared:true}]}') || return 1 ;;
+      shadowsocks)
+        case "$method" in aes-128-gcm|aes-256-gcm|chacha20-ietf-poly1305|2022-blake3-aes-128-gcm|2022-blake3-aes-256-gcm|2022-blake3-chacha20-poly1305) ;; *) kns_emit_error invalid_legacy_node '历史 Shadowsocks 加密方法不受支持。'; return 1 ;; esac
+        [ -n "$password" ] || { kns_emit_error invalid_legacy_node '历史 Shadowsocks 密码缺失。'; return 1; }
+        KNS_CLIENT=$(jq -cn --arg id "$KNS_INSTANCE_ID" --arg tag "$KNS_LEGACY_TAG" --arg method "$method" --arg password "$password" --argjson port "$port" --arg transport "$transport" '{id:$id,legacyTag:$tag,protocol:"shadowsocks",listen:{port:$port,transport:$transport},credential:{type:"shadowsocks",method:$method,value:$password},resources:[{type:"legacyConfigFragment",id:$tag,owned:false,shared:true}]}') || return 1 ;;
+      hysteria2|anytls)
+        [ -n "$password" ] || { kns_emit_error invalid_legacy_node '历史节点密码缺失。'; return 1; }
+        KNS_CLIENT=$(jq -cn --arg id "$KNS_INSTANCE_ID" --arg tag "$KNS_LEGACY_TAG" --arg protocol "$type" --arg password "$password" --arg sni "$sni" --argjson port "$port" --argjson alpn "$alpn_json" --argjson insecure "$allow_insecure" --arg transport "$transport" '{id:$id,legacyTag:$tag,protocol:$protocol,listen:{port:$port,transport:$transport},tls:{security:"tls",sni:$sni,alpn:$alpn,allowInsecure:$insecure},credential:{type:"password",value:$password},resources:[{type:"legacyConfigFragment",id:$tag,owned:false,shared:true}]}') || return 1 ;;
+    esac
+    kns_callback || { kns_emit_error callback_failed '历史节点导入回调失败；OneBox 配置未修改。'; return 1; }
+    printf 'KNS_IMPORT={"schema":1,"legacyTag":%s,"imported":true,"configChanged":false}\n' "$(jq -Rn --arg tag "$KNS_LEGACY_TAG" '$tag')"
 }
 
 kns_open_instance_firewall() {
@@ -5920,6 +6088,9 @@ kns_secure_state_dirs() {
 kns_dispatch() {
     case "$KNS_COMMAND" in
       schema) kns_schema ;;
+      discover)
+        if ! command -v jq >/dev/null 2>&1; then printf '{"schema":1,"adapterVersion":"%s","error":{"code":"missing_dependency"}}\n' "$KNS_ADAPTER_VERSION"; return 1; fi
+        kns_discover ;;
       list)
         if ! command -v jq >/dev/null 2>&1; then printf '{"schema":1,"adapterVersion":"%s","error":{"code":"missing_dependency"}}\n' "$KNS_ADAPTER_VERSION"; return 1; fi
         kns_list ;;
@@ -5932,6 +6103,11 @@ kns_dispatch() {
         kns_request_validate || return 1
         require_config || { kns_emit_error onebox_not_installed 'OneBox 配置不存在。'; return 1; }
         kns_uninstall ;;
+      import)
+        command -v jq >/dev/null 2>&1 && command -v curl >/dev/null 2>&1 || { kns_emit_error missing_dependency '旧节点导入需要 jq 和 curl；未安装依赖，也未修改 OneBox 配置。'; return 1; }
+        kns_request_validate || return 1
+        require_config readonly || { kns_emit_error onebox_not_installed 'OneBox 配置不存在或不可读。'; return 1; }
+        kns_import_legacy ;;
       enable|disable)
         ensure_deps jq curl || { kns_emit_error missing_dependency 'OneBox 需要 jq 和 curl。'; return 1; }
         kns_request_validate || return 1
@@ -5951,8 +6127,8 @@ kns_main() {
     shift || :
     KNS_COMMAND="$command" KNS_REQUEST_FILE="" KNS_INSTANCE_ID="" KNS_YES=0
     local -a forwarded=("$@")
-    case "$KNS_COMMAND" in schema|list) [ "$#" = 0 ] || { printf '{"success":false,"error":{"code":"invalid_arguments"}}\n'; return 2; } ;;
-      status|uninstall|install|reconfigure|reinstall|enable|disable) ;;
+    case "$KNS_COMMAND" in schema|list|discover) [ "$#" = 0 ] || { printf '{"success":false,"error":{"code":"invalid_arguments"}}\n'; return 2; } ;;
+      status|uninstall|install|reconfigure|reinstall|enable|disable|import) ;;
       *) printf '{"success":false,"error":{"code":"invalid_command"}}\n'; return 2 ;;
     esac
     while [ "$#" -gt 0 ]; do
@@ -5966,18 +6142,33 @@ kns_main() {
     done
     NON_INTERACTIVE=1
     case "$KNS_COMMAND" in
-      install|reconfigure|reinstall|enable|disable|uninstall) [ -n "$KNS_REQUEST_FILE" ] && [ -z "$KNS_INSTANCE_ID" ] || { printf '{"success":false,"error":{"code":"invalid_arguments"}}\n'; return 2; } ;;
+      install|reconfigure|reinstall|enable|disable|uninstall|import) [ -n "$KNS_REQUEST_FILE" ] && [ -z "$KNS_INSTANCE_ID" ] || { printf '{"success":false,"error":{"code":"invalid_arguments"}}\n'; return 2; } ;;
       status) [ -z "$KNS_REQUEST_FILE" ] && [[ "$KNS_INSTANCE_ID" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]] || { printf '{"success":false,"error":{"code":"invalid_arguments"}}\n'; return 2; } ;;
     esac
     detect_environment || return $?
     if [ "$KNS_COMMAND" = schema ]; then kns_schema; return $?; fi
-    if [ "$KNS_COMMAND" = status ] || [ "$KNS_COMMAND" = list ]; then kns_dispatch; return $?; fi
+    case "$KNS_COMMAND" in
+      discover|list)
+        onebox_require_pid_headroom 3 "KNS $KNS_COMMAND" || { printf '{"success":false,"error":{"code":"low_pid_headroom"}}\n'; return 1; }
+        onebox_require_memory_headroom $((16 * 1024 * 1024)) "KNS $KNS_COMMAND" || { printf '{"success":false,"error":{"code":"low_memory_headroom"}}\n'; return 1; } ;;
+      import)
+        onebox_require_pid_headroom 5 'KNS 旧节点导入' || { printf '{"success":false,"error":{"code":"low_pid_headroom"}}\n'; return 1; }
+        onebox_require_memory_headroom $((32 * 1024 * 1024)) 'KNS 旧节点导入' || { printf '{"success":false,"error":{"code":"low_memory_headroom"}}\n'; return 1; } ;;
+      install|reconfigure|reinstall|enable|disable|uninstall)
+        onebox_require_pid_headroom 8 "KNS $KNS_COMMAND" || { printf '{"success":false,"error":{"code":"low_pid_headroom"}}\n'; return 1; }
+        onebox_require_memory_headroom $((64 * 1024 * 1024)) "KNS $KNS_COMMAND" || { printf '{"success":false,"error":{"code":"low_memory_headroom"}}\n'; return 1; } ;;
+    esac
+    if [ "$KNS_COMMAND" = status ] || [ "$KNS_COMMAND" = list ] || [ "$KNS_COMMAND" = discover ]; then kns_dispatch; return $?; fi
     trap cleanup_on_exit EXIT
     trap cleanup_on_interrupt INT
     trap 'exit 143' TERM
     prepare_script_path "${BASH_SOURCE[0]}" || return 1
     if [ "${ONEBOX_LOCKED:-0}" != 1 ]; then
-        ensure_deps flock || { kns_emit_error missing_dependency '缺少 flock。'; return 1; }
+        if [ "$KNS_COMMAND" = import ]; then
+            command -v flock >/dev/null 2>&1 && flock --help 2>&1 | grep -q -- '--close' || { kns_emit_error missing_dependency '旧节点导入需要支持 --close 的 flock；未安装依赖，也未修改 OneBox 配置。'; return 1; }
+        else
+            ensure_deps flock || { kns_emit_error missing_dependency '缺少 flock。'; return 1; }
+        fi
         if ! flock --help 2>&1 | grep -q -- '--close'; then
             if [ "$PACKAGE_MANAGER" = apk ]; then install_packages flock || return 1
             else install_packages util-linux || return 1; fi
@@ -5991,7 +6182,7 @@ kns_main() {
     fi
     mkdir -p "$KNS_REQUEST_DIR" && chmod 700 "$KNS_REQUEST_DIR" || { kns_emit_error state_write_failed '无法准备 KNS 请求目录。'; return 1; }
     [ ! -L /run/onebox ] && [ ! -L /run/onebox/kns ] && [ ! -L "$KNS_REQUEST_DIR" ] && [ "$(stat -c '%u' "$KNS_REQUEST_DIR" 2>/dev/null)" = 0 ] && [ "$(stat -c '%a' "$KNS_REQUEST_DIR" 2>/dev/null)" = 700 ] || { kns_emit_error state_write_failed 'KNS 请求目录必须由 root 拥有、权限为 0700 且不能是符号链接。'; return 1; }
-    kns_secure_state_dirs || { kns_emit_error state_write_failed 'KNS 状态目录必须由 root 拥有、权限为 0700 且不能是符号链接。'; return 1; }
+    if [ "$KNS_COMMAND" != import ]; then kns_secure_state_dirs || { kns_emit_error state_write_failed 'KNS 状态目录必须由 root 拥有、权限为 0700 且不能是符号链接。'; return 1; }; fi
     KNS_REQUEST_FILE="${KNS_REQUEST_FILE:-}"
     kns_dispatch
 }
@@ -6079,14 +6270,25 @@ main() {
     case "$CLI_COMMAND" in
         status|doctor|logs) cli_dispatch; return $? ;;
     esac
+    case "$CLI_COMMAND" in
+        install|add|delete|update|uninstall|cert|outbound|bbr|start|stop|restart|update-script)
+            onebox_require_pid_headroom 8 "OneBox $CLI_COMMAND" || return 1
+            onebox_require_memory_headroom $((64 * 1024 * 1024)) "OneBox $CLI_COMMAND" || return 1 ;;
+    esac
     trap cleanup_on_exit EXIT
     trap cleanup_on_interrupt INT
     trap 'exit 143' TERM
     prepare_script_path "${BASH_SOURCE[0]}" || return 1
     # util-linux flock closes its lock fd before exec so daemons cannot inherit it.
     if [ "${ONEBOX_LOCKED:-0}" != 1 ]; then
+        if ! command -v flock >/dev/null 2>&1; then
+            onebox_require_pid_headroom 8 'flock 依赖安装' || return 1
+            onebox_require_memory_headroom $((64 * 1024 * 1024)) 'flock 依赖安装' || return 1
+        fi
         ensure_deps flock || return 1
         if ! flock --help 2>&1 | grep -q -- '--close'; then
+            onebox_require_pid_headroom 8 'flock 依赖更新' || return 1
+            onebox_require_memory_headroom $((64 * 1024 * 1024)) 'flock 依赖更新' || return 1
             if [ "$PACKAGE_MANAGER" = apk ]; then install_packages flock || return 1
             else install_packages util-linux || return 1; fi
             hash -r
