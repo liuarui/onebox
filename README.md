@@ -217,7 +217,7 @@ onebox add --protocol argo --tag argo-1 --port 18080 \
 
 ## Komari KNS 适配器
 
-`onebox kns` schema 1 适配器版本为 `1.1.1`，提供 Komari 插件调用的单实例安装、状态查询、启停、重装、重配置和卸载接口。它复用 OneBox 的 sing-box 服务，每个 KNS 节点使用独立配置片段；停用只从共享配置移除该实例的 inbound，卸载只删除该实例拥有的配置、登记和证书，不会停止或卸载共享服务。回调包含协议凭据和 TLS 参数（包括 ALPN）。
+`onebox kns` schema 1 适配器版本为 `1.2.0`，提供 Komari 插件调用的单实例安装、状态查询、启停、重装、重配置和卸载接口。它复用 OneBox 的 sing-box 服务，每个 KNS 节点使用独立配置片段；只读 `status` 返回资源归属、共享引用计数和卸载预览，要求插件在最近状态核查后展示确认。停用或卸载仅在共享配置不再引用对应端口/协议时清理防火墙规则；卸载不会停止或卸载共享服务，但会重载服务。回调包含协议凭据和 TLS 参数（包括 ALPN）。
 
 ```sh
 onebox kns schema

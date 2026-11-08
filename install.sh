@@ -107,7 +107,7 @@ KNS_STATE_DIR="$CONFIG_DIR/kns"
 KNS_INSTANCES_DIR="$KNS_STATE_DIR/instances"
 KNS_CERTS_DIR="$KNS_STATE_DIR/certs"
 KNS_REQUEST_DIR="/run/onebox/kns/requests"
-KNS_ADAPTER_VERSION="1.1.1"
+KNS_ADAPTER_VERSION="1.2.0"
 
 KERNEL_TMP_DIR=""
 declare -a SB_OWNED_TEMP_FILES=()
@@ -5418,7 +5418,7 @@ kns_instance_file() { printf '%s/%s.json\n' "$KNS_INSTANCES_DIR" "$1"; }
 
 kns_schema() {
     cat <<EOF
-{"schema":1,"adapterVersion":"$KNS_ADAPTER_VERSION","runtime":{"engine":"sing-box","id":"onebox-main"},"commands":["install","reconfigure","reinstall","enable","disable","status","uninstall","list","schema"],"actions":["install","reconfigure","reinstall","enable","disable","uninstall"],"protocols":{"vless":{"transports":["tcp"],"security":"reality"},"hysteria2":{"transports":["udp"]},"tuic":{"transports":["udp"]},"anytls":{"transports":["tcp"]},"shadowsocks":{"transports":["tcp+udp"]},"trojan":{"transports":["tcp"]},"vmess":{"transports":["tcp"]}},"request":{"required":["schema","jobId","machineUuid","action","runtime","instance","idempotencyKey","report"],"instance":{"required":["id","protocol","listenPort","transport","options"],"optional":{"listenAddress":"::, 0.0.0.0, 127.0.0.1, or ::1; default ::"},"options":{"security":"reality for vless","sni":"required for TLS protocols","method":"optional for shadowsocks"}}},"callback":{"method":"POST","contentType":"application/json","authorization":"Bearer report.oneTimeToken","successStatus":"any HTTP 2xx"},"result":{"stdout":"redacted JSON; never contains node credentials","callbackInstance":{"id":"string","protocol":"string","listen":{"port":"number","transport":"string"},"tls":"optional protocol TLS metadata","credential":"protocol-specific object","resources":"array of owned resources"}},"requestTransport":"root-owned mode-0600 JSON file"}
+{"schema":1,"adapterVersion":"$KNS_ADAPTER_VERSION","runtime":{"engine":"sing-box","id":"onebox-main"},"commands":["install","reconfigure","reinstall","enable","disable","status","uninstall","list","schema"],"actions":["install","reconfigure","reinstall","enable","disable","uninstall"],"protocols":{"vless":{"transports":["tcp"],"security":"reality"},"hysteria2":{"transports":["udp"]},"tuic":{"transports":["udp"]},"anytls":{"transports":["tcp"]},"shadowsocks":{"transports":["tcp+udp"]},"trojan":{"transports":["tcp"]},"vmess":{"transports":["tcp"]}},"request":{"required":["schema","jobId","machineUuid","action","runtime","instance","idempotencyKey","report"],"instance":{"required":["id","protocol","listenPort","transport","options"],"optional":{"listenAddress":"::, 0.0.0.0, 127.0.0.1, or ::1; default ::"},"options":{"security":"reality for vless","sni":"required for TLS protocols","method":"optional for shadowsocks"}}},"callback":{"method":"POST","contentType":"application/json","authorization":"Bearer report.oneTimeToken","successStatus":"any HTTP 2xx"},"result":{"stdout":"redacted JSON; never contains node credentials","callbackInstance":{"id":"string","protocol":"string","listen":{"port":"number","transport":"string"},"tls":"optional protocol TLS metadata","credential":"protocol-specific object","resources":"array with ownership and reference metadata"},"statusInstance":{"resources":"current config, firewall and service references","uninstallPreview":{"complete":"boolean","serviceImpact":"reload or unknown"}}},"requestTransport":"root-owned mode-0600 JSON file"}
 EOF
 }
 
@@ -5431,8 +5431,54 @@ kns_list() {
     done | jq -s --arg version "$KNS_ADAPTER_VERSION" '[.[] | . as $x | {id:$x.id,machineUuid:$x.machineUuid,runtimeId:$x.runtimeId,protocol:$x.protocol,tag:$x.tag,listen:$x.listen,updatedAt:$x.updatedAt}] | {schema:1,adapterVersion:$version,runtime:{engine:"sing-box",id:"onebox-main"},instances:.}'
 }
 
+kns_config_transport_references() {
+    local port="$1" network="$2"
+    [ -r "$CONFIG_FILE" ] || return 2
+    jq -er --argjson port "$port" --arg network "$network" '
+      [.inbounds[]? | select(.listen_port == $port) | select(
+        if $network == "tcp" then (.type != "hysteria2" and .type != "tuic")
+        elif $network == "udp" then (.type == "hysteria2" or .type == "tuic" or .type == "shadowsocks" or (.type != "vless" and .type != "trojan" and .type != "vmess" and .type != "anytls"))
+        else true end
+      )] | length' "$CONFIG_FILE"
+}
+
+kns_close_unused_firewall() {
+    local port="$1" network="$2" proto refs failed=0
+    case "$network" in tcp|udp) set -- "$network" ;; tcp+udp) set -- tcp udp ;; *) return 1 ;; esac
+    for proto in "$@"; do
+        refs=$(kns_config_transport_references "$port" "$proto") || return 1
+        if [ "$refs" -eq 0 ]; then
+            if ! close_fw_port "$port" "$proto" || ! remove_fw_record "$port" "$proto"; then failed=1; fi
+        fi
+    done
+    return "$failed"
+}
+
+kns_status_preview() {
+    local id="$1" tag="$2" port="$3" network="$4" config_present="$5"
+    local complete=false tcp_refs=0 udp_refs=0 total_refs=0 certificate_present=false
+    if [ -r "$CONFIG_FILE" ] && jq -e 'type == "object" and (.inbounds | type == "array")' "$CONFIG_FILE" >/dev/null 2>&1; then
+        complete=true
+        total_refs=$(jq -r '.inbounds | length' "$CONFIG_FILE") || return 1
+        tcp_refs=$(kns_config_transport_references "$port" tcp) || return 1
+        udp_refs=$(kns_config_transport_references "$port" udp) || return 1
+    fi
+    if [ -e "$KNS_CERTS_DIR/${id}.cer" ] || [ -e "$KNS_CERTS_DIR/${id}.key" ]; then certificate_present=true; fi
+    jq -cn --arg id "$id" --arg tag "$tag" --arg port "$port" --arg network "$network" \
+        --argjson complete "$complete" --argjson configPresent "$config_present" --argjson tcpRefs "$tcp_refs" \
+        --argjson udpRefs "$udp_refs" --argjson totalRefs "$total_refs" --argjson certificatePresent "$certificate_present" '
+      {complete:$complete,serviceImpact:"reload",resources:(
+        [{type:"instanceRecord",id:$id,owned:true,shared:false,present:true,referenceCount:1,action:"remove"},
+         {type:"configFragment",id:$tag,owned:true,shared:false,present:$configPresent,referenceCount:(if $configPresent then 1 else 0 end),action:(if $configPresent then "remove" else "already_absent" end)},
+         {type:"certificateFiles",id:$id,owned:true,shared:false,present:$certificatePresent,referenceCount:(if $certificatePresent then 1 else 0 end),action:(if $certificatePresent then "remove" else "already_absent" end)},
+         {type:"runtimeService",id:"onebox",owned:false,shared:true,present:true,referenceCount:$totalRefs,action:"reload"},
+         (if $network == "udp" or $network == "tcp+udp" then {type:"firewallRule",id:($port+"/udp"),owned:true,shared:($udpRefs>1),present:($udpRefs>0),referenceCount:$udpRefs,action:(if $udpRefs>1 then "preserve" elif $udpRefs==1 then "close" else "already_absent" end)} else null end),
+         (if $network == "tcp" or $network == "tcp+udp" then {type:"firewallRule",id:($port+"/tcp"),owned:true,shared:($tcpRefs>1),present:($tcpRefs>0),referenceCount:$tcpRefs,action:(if $tcpRefs>1 then "preserve" elif $tcpRefs==1 then "close" else "already_absent" end)} else null end)] | map(select(. != null))
+      )}'
+}
+
 kns_status() {
-    local file="$KNS_INSTANCE_FILE" tag port service health=L0 installed=false enabled=false config_present=false manifest_enabled=false
+    local file="$KNS_INSTANCE_FILE" tag port service health=L0 installed=false enabled=false config_present=false manifest_enabled=false preview
     [ -f "$file" ] && [ ! -L "$file" ] || { kns_emit_result status "$KNS_INSTANCE_ID" false false not_installed unknown; return 0; }
     tag=$(jq -er '.tag | strings' "$file") || { kns_emit_error invalid_state '实例登记文件无效。'; return 1; }
     port=$(jq -er '.listen.port | numbers' "$file") || { kns_emit_error invalid_state '实例监听端口无效。'; return 1; }
@@ -5444,8 +5490,9 @@ kns_status() {
     fi
     service=$(managed_service_state onebox 2>/dev/null || printf 'unknown')
     if [ "$installed" = true ] && [ "$enabled" = true ] && [ "$service" = active ] && command -v ss >/dev/null 2>&1 && ss -H -lntup "( sport = :$port )" 2>/dev/null | grep -q .; then health=L1; fi
-    jq -c --arg version "$KNS_ADAPTER_VERSION" --arg service "$service" --arg health "$health" --argjson enabled "$enabled" --argjson installed "$installed" \
-        '{schema:1,adapterVersion:$version,operation:"status",instance:{id,machineUuid,protocol,tag,listen,installed:$installed,enabled:$enabled,installState:(if $installed then (if $enabled then "installed" else "disabled" end) else "orphaned" end),serviceState:$service,healthLevel:$health,updatedAt},runtime:{engine:"sing-box",id:.runtimeId}}' "$file"
+    preview=$(kns_status_preview "$KNS_INSTANCE_ID" "$tag" "$port" "$(jq -er '.listen.transport | strings' "$file")" "$config_present") || preview='{"complete":false,"serviceImpact":"unknown","resources":[]}'
+    jq -c --arg version "$KNS_ADAPTER_VERSION" --arg service "$service" --arg health "$health" --argjson enabled "$enabled" --argjson installed "$installed" --argjson preview "$preview" \
+        '{schema:1,adapterVersion:$version,operation:"status",instance:{id,machineUuid,protocol,tag,listen,installed:$installed,enabled:$enabled,installState:(if $installed then (if $enabled then "installed" else "disabled" end) else "orphaned" end),serviceState:$service,healthLevel:$health,updatedAt,resources:$preview.resources,uninstallPreview:{complete:$preview.complete,serviceImpact:$preview.serviceImpact}} ,runtime:{engine:"sing-box",id:.runtimeId}}' "$file"
 }
 
 kns_request_validate() {
@@ -5797,7 +5844,7 @@ kns_uninstall() {
         kns_emit_error callback_failed '卸载结果回调失败；安装事务已尝试回滚。'; return 1
     fi
     kns_commit_after_callback
-    kns_close_instance_firewall "$port" "$network" || printf '[警告] 节点已卸载，但防火墙规则未能全部清理；请检查 OneBox 端口记录。\n' >&2
+    kns_close_unused_firewall "$port" "$network" || printf '[警告] 节点已卸载，但无法安全核对共享防火墙规则；请检查 OneBox 端口记录。\n' >&2
     kns_emit_result uninstall "$KNS_INSTANCE_ID" true false not_installed unknown
 }
 
@@ -5856,7 +5903,7 @@ kns_toggle() {
     if [ "$KNS_COMMAND" = enable ]; then
         kns_open_instance_firewall "$port" "$network" || printf '[警告] 无法为已启用实例放行监听端口 %s/%s。\n' "$port" "$network" >&2
     else
-        if ! jq -s -e --argjson port "$port" --arg network "$network" 'any(.[]; .enabled != false and .listen.port == $port and .listen.transport == $network)' "$KNS_INSTANCES_DIR"/*.json >/dev/null 2>&1; then kns_close_instance_firewall "$port" "$network" || printf '[警告] 无法清理已停用实例的防火墙规则。\n' >&2; fi
+        kns_close_unused_firewall "$port" "$network" || printf '[警告] 无法核对共享防火墙规则，已保留现有规则供人工检查。\n' >&2
     fi
     kns_emit_result "$KNS_COMMAND" "$KNS_INSTANCE_ID" true true "$([ "$updated" = true ] && printf installed || printf disabled)" L0
 }
