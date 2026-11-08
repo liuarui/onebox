@@ -108,7 +108,7 @@ KNS_STATE_DIR="$CONFIG_DIR/kns"
 KNS_INSTANCES_DIR="$KNS_STATE_DIR/instances"
 KNS_CERTS_DIR="$KNS_STATE_DIR/certs"
 KNS_REQUEST_DIR="/run/onebox/kns/requests"
-KNS_ADAPTER_VERSION="1.3.0"
+KNS_ADAPTER_VERSION="1.4.0"
 
 KERNEL_TMP_DIR=""
 declare -a SB_OWNED_TEMP_FILES=()
@@ -5446,7 +5446,7 @@ kns_instance_file() { printf '%s/%s.json\n' "$KNS_INSTANCES_DIR" "$1"; }
 
 kns_schema() {
     cat <<EOF
-{"schema":1,"adapterVersion":"$KNS_ADAPTER_VERSION","runtime":{"engine":"sing-box","id":"onebox-main"},"commands":["install","reconfigure","reinstall","enable","disable","status","uninstall","list","discover","import","schema"],"actions":["install","reconfigure","reinstall","enable","disable","uninstall","import"],"protocols":{"vless":{"transports":["tcp"],"security":"reality"},"hysteria2":{"transports":["udp"]},"tuic":{"transports":["udp"]},"anytls":{"transports":["tcp"]},"shadowsocks":{"transports":["tcp+udp"]},"trojan":{"transports":["tcp"]},"vmess":{"transports":["tcp"]}},"request":{"required":["schema","jobId","machineUuid","action","runtime","instance","idempotencyKey","report"],"instance":{"required":["id","protocol","listenPort","transport","options"],"optional":{"listenAddress":"::, 0.0.0.0, 127.0.0.1, or ::1; default ::","legacyTag":"existing inbound tag for read-only import"},"options":{"security":"reality for vless","sni":"required for TLS protocols","method":"optional for shadowsocks"}}},"callback":{"method":"POST","contentType":"application/json","authorization":"Bearer report.oneTimeToken","successStatus":"any HTTP 2xx"},"result":{"stdout":"redacted JSON; never contains node credentials","discovery":"metadata only; never contains credentials","callbackInstance":{"id":"string","protocol":"string","listen":{"port":"number","transport":"string"},"tls":"optional protocol TLS metadata","credential":"protocol-specific object","resources":"array with ownership and reference metadata"},"statusInstance":{"resources":"current config, firewall and service references","uninstallPreview":{"complete":"boolean","serviceImpact":"reload or unknown"}}},"requestTransport":"root-owned mode-0600 JSON file"}
+{"schema":1,"adapterVersion":"$KNS_ADAPTER_VERSION","runtime":{"engine":"sing-box","id":"onebox-main"},"commands":["install","reconfigure","reinstall","enable","disable","status","uninstall","list","discover","import","schema"],"actions":["install","reconfigure","reinstall","enable","disable","uninstall","import"],"protocols":{"vless":{"transports":["tcp"],"security":"reality"},"hysteria2":{"transports":["udp"]},"tuic":{"transports":["udp"]},"anytls":{"transports":["tcp"]},"shadowsocks":{"transports":["tcp+udp"]},"trojan":{"transports":["tcp"]},"vmess":{"transports":["tcp"]}},"request":{"required":["schema","jobId","machineUuid","action","runtime","instance","idempotencyKey","report"],"instance":{"required":["id","protocol","listenPort","transport","options"],"optional":{"listenAddress":"::, 0.0.0.0, 127.0.0.1, or ::1; default ::","legacyTag":"existing inbound tag for read-only import"},"options":{"security":"reality for vless","sni":"optional for VLESS Reality (automatically optimized by OneBox); required for other TLS protocols","method":"optional for shadowsocks"}}},"callback":{"method":"POST","contentType":"application/json","authorization":"Bearer report.oneTimeToken","successStatus":"any HTTP 2xx"},"result":{"stdout":"redacted JSON; never contains node credentials","discovery":"metadata only; never contains credentials","callbackInstance":{"id":"string","protocol":"string","listen":{"port":"number","transport":"string"},"tls":"optional protocol TLS metadata","credential":"protocol-specific object","resources":"array with ownership and reference metadata"},"statusInstance":{"resources":"current config, firewall and service references","uninstallPreview":{"complete":"boolean","serviceImpact":"reload or unknown"}}},"requestTransport":"root-owned mode-0600 JSON file"}
 EOF
 }
 
@@ -5654,7 +5654,13 @@ kns_request_validate() {
       *) kns_emit_error unsupported_protocol '协议、传输类型不受支持或不匹配。'; return 1 ;;
     esac
     case "$KNS_PROTOCOL" in vless|hysteria2|tuic|anytls|shadowsocks|trojan|vmess) ;; *) kns_emit_error unsupported_protocol '不支持该协议。'; return 1 ;; esac
-    case "$KNS_PROTOCOL" in vless|hysteria2|tuic|anytls|trojan|vmess)
+    case "$KNS_PROTOCOL" in
+      vless)
+        if [ -z "$KNS_SNI" ]; then
+            resolve_reality_sni KNS_SNI || { kns_emit_error sni_selection_failed 'OneBox 无法自动优选 Reality SNI。'; return 1; }
+        fi
+        valid_host "$KNS_SNI" || { kns_emit_error invalid_request 'Reality SNI 必须是有效域名。'; return 1; } ;;
+      hysteria2|tuic|anytls|trojan|vmess)
         valid_host "$KNS_SNI" || { kns_emit_error invalid_request '该协议需要有效的 TLS SNI 域名。'; return 1; } ;;
     esac
     if [ "$KNS_PROTOCOL" = shadowsocks ]; then
