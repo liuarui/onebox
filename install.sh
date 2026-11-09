@@ -109,7 +109,7 @@ KNS_INSTANCES_DIR="$KNS_STATE_DIR/instances"
 KNS_CERTS_DIR="$KNS_STATE_DIR/certs"
 KNS_REQUEST_DIR="/run/onebox/kns/requests"
 ONEBOX_SCRIPT_VERSION="1.0.1"
-KNS_ADAPTER_VERSION="1.6.0"
+KNS_ADAPTER_VERSION="1.7.0"
 
 KERNEL_TMP_DIR=""
 declare -a SB_OWNED_TEMP_FILES=()
@@ -5456,7 +5456,7 @@ kns_instance_file() { printf '%s/%s.json\n' "$KNS_INSTANCES_DIR" "$1"; }
 
 kns_schema() {
     cat <<EOF
-{"schema":1,"adapterVersion":"$KNS_ADAPTER_VERSION","scriptVersion":"$ONEBOX_SCRIPT_VERSION","runtime":{"engine":"sing-box","id":"onebox-main"},"commands":["install","reconfigure","reinstall","enable","disable","status","runtime-status","update-script","update-kernel","uninstall","list","discover","import","claim","schema"],"actions":["install","reconfigure","reinstall","enable","disable","uninstall","import","claim","update-script","update-kernel"],"protocols":{"vless":{"transports":["tcp"],"security":"reality"},"hysteria2":{"transports":["udp"]},"tuic":{"transports":["udp"]},"anytls":{"transports":["tcp"]},"shadowsocks":{"transports":["tcp+udp"]},"trojan":{"transports":["tcp"]},"vmess":{"transports":["tcp"]}},"request":{"required":["schema","jobId","machineUuid","action","runtime","idempotencyKey","report"],"instance":{"required":["id","protocol","listenPort","transport","options"],"optional":{"listenAddress":"::, 0.0.0.0, 127.0.0.1, or ::1; default ::","legacyTag":"existing inbound tag for read-only import or explicit claim"},"options":{"security":"reality for vless","sni":"optional for VLESS Reality (automatically optimized by OneBox); required for other TLS protocols","method":"optional for shadowsocks"}},"upgrade":{"update-script":{"scriptSha256":"fixed SHA-256 of the trusted installer artifact; instance is null"},"update-kernel":{"version":"latest stable sing-box release; instance is null"}}},"callback":{"method":"POST","contentType":"application/json","authorization":"Bearer report.oneTimeToken","successStatus":"any HTTP 2xx"},"result":{"stdout":"redacted JSON; never contains node credentials","discovery":"metadata only; never contains credentials","runtimeStatus":{"oneboxScriptVersion":"string","oneboxScriptSha256":"sha256","singBoxVersion":"semver","serviceState":"active, inactive, or unknown"},"operationResult":"script or kernel upgrade result with versions and checksums"},"requestTransport":"root-owned mode-0600 JSON file"}
+{"schema":1,"adapterVersion":"$KNS_ADAPTER_VERSION","scriptVersion":"$ONEBOX_SCRIPT_VERSION","runtime":{"engine":"sing-box","id":"onebox-main"},"commands":["install","reconfigure","reinstall","enable","disable","status","runtime-status","update-script","update-kernel","uninstall","list","discover","import","claim","schema"],"actions":["install","reconfigure","reinstall","enable","disable","uninstall","import","claim","update-script","update-kernel"],"protocols":{"vless":{"transports":["tcp"],"security":"reality"},"hysteria2":{"transports":["udp"]},"tuic":{"transports":["udp"]},"anytls":{"transports":["tcp"]},"shadowsocks":{"transports":["tcp+udp"]},"trojan":{"transports":["tcp"]},"vmess":{"transports":["tcp"]}},"request":{"required":["schema","jobId","machineUuid","action","runtime","idempotencyKey","report"],"instance":{"required":["id","protocol","listenPort","transport","options"],"optional":{"listenAddress":"::, 0.0.0.0, 127.0.0.1, or ::1; default ::","legacyTag":"existing inbound tag for read-only import or explicit claim"},"options":{"security":"reality for vless","sni":"optional for VLESS Reality (automatically optimized by OneBox); required for other TLS protocols","method":"optional for shadowsocks","alpn":"optional TLS ALPN array","allowInsecure":"optional client skip-cert-verify boolean","flow":"optional VLESS flow, default xtls-rprx-vision","fingerprint":"optional Reality client fingerprint","spiderX":"optional Reality spiderX path","upMbps":"optional Hysteria2 upload Mbps","downMbps":"optional Hysteria2 download Mbps","obfs":"optional Hysteria2 obfs type (salamander)","obfsPassword":"optional Hysteria2 obfs password","alterId":"optional VMess alterId, default 0","cipher":"optional VMess cipher, default auto","congestionControl":"optional TUIC congestion control, default bbr","udpRelayMode":"optional TUIC UDP relay mode, default native"}},"upgrade":{"update-script":{"scriptSha256":"fixed SHA-256 of the trusted installer artifact; instance is null"},"update-kernel":{"version":"latest stable sing-box release; instance is null"}}},"callback":{"method":"POST","contentType":"application/json","authorization":"Bearer report.oneTimeToken","successStatus":"any HTTP 2xx"},"result":{"stdout":"redacted JSON; never contains node credentials","discovery":"metadata only; never contains credentials","runtimeStatus":{"oneboxScriptVersion":"string","oneboxScriptSha256":"sha256","singBoxVersion":"semver","serviceState":"active, inactive, or unknown"},"operationResult":"script or kernel upgrade result with versions and checksums"},"requestTransport":"root-owned mode-0600 JSON file"}
 EOF
 }
 
@@ -5732,7 +5732,7 @@ kns_request_validate() {
          ((.instance.listenAddress // "::") | type == "string" and length > 0 and length <= 45) and
          (.instance.transport as $transport | (["tcp","udp","tcp+udp"] | index($transport)) != null) and
          (if ($action == "import" or $action == "claim") then (.instance.legacyTag | type == "string" and test("^[A-Za-z0-9._:-]{1,128}$")) else ((.instance | has("legacyTag")) | not) end) and
-         (.instance.options | type == "object" and ((keys - ["security","sni","method"]) | length == 0))
+         (.instance.options | type == "object" and ((keys - ["security","sni","method","alpn","allowInsecure","flow","fingerprint","spiderX","upMbps","downMbps","obfs","obfsPassword","alterId","cipher","congestionControl","udpRelayMode"]) | length == 0))
        end) and
       (.report | type == "object" and ((keys - ["callback","oneTimeToken"]) | length == 0)) and
       (.report.callback | type == "string" and test("^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?/[A-Za-z0-9._~/-]*$")) and
@@ -5751,6 +5751,19 @@ kns_request_validate() {
     KNS_NETWORK=$(jq -r '.instance.transport // empty' "$request")
     KNS_SNI=$(jq -r '.instance.options.sni // empty' "$request")
     KNS_METHOD=$(jq -r '.instance.options.method // "aes-128-gcm"' "$request")
+    KNS_ALPN_JSON=$(jq -c '.instance.options.alpn // empty' "$request")
+    KNS_ALLOW_INSECURE=$(jq -r '.instance.options.allowInsecure // empty' "$request")
+    KNS_FLOW=$(jq -r '.instance.options.flow // "xtls-rprx-vision"' "$request")
+    KNS_FINGERPRINT=$(jq -r '.instance.options.fingerprint // "chrome"' "$request")
+    KNS_SPIDER_X=$(jq -r '.instance.options.spiderX // empty' "$request")
+    KNS_UP_MBPS=$(jq -r '.instance.options.upMbps // 0' "$request")
+    KNS_DOWN_MBPS=$(jq -r '.instance.options.downMbps // 0' "$request")
+    KNS_OBFS=$(jq -r '.instance.options.obfs // empty' "$request")
+    KNS_OBFS_PASSWORD=$(jq -r '.instance.options.obfsPassword // empty' "$request")
+    KNS_ALTER_ID=$(jq -r '.instance.options.alterId // 0' "$request")
+    KNS_VMESS_SECURITY=$(jq -r '.instance.options.cipher // "auto"' "$request")
+    KNS_CONGESTION=$(jq -r '.instance.options.congestionControl // "bbr"' "$request")
+    KNS_UDP_RELAY=$(jq -r '.instance.options.udpRelayMode // "native"' "$request")
     KNS_LEGACY_TAG=$(jq -r '.instance.legacyTag // empty' "$request")
     KNS_CALLBACK_URL=$(jq -r '.report.callback' "$request")
     KNS_CALLBACK_TOKEN=$(jq -r '.report.oneTimeToken' "$request")
@@ -5785,6 +5798,22 @@ kns_request_validate() {
     if [ "$KNS_PROTOCOL" = shadowsocks ]; then
         case "$KNS_METHOD" in aes-128-gcm|aes-256-gcm|chacha20-ietf-poly1305|2022-blake3-aes-128-gcm|2022-blake3-aes-256-gcm|2022-blake3-chacha20-poly1305) ;; *) kns_emit_error invalid_request 'Shadowsocks method 不受支持。'; return 1 ;; esac
     fi
+    if [ -n "$KNS_ALPN_JSON" ]; then
+        printf '%s' "$KNS_ALPN_JSON" | jq -e 'type == "array" and length <= 8 and all(.[]; type == "string" and test("^[A-Za-z0-9._/-]{1,32}$"))' >/dev/null 2>&1 || { kns_emit_error invalid_request 'alpn 必须是 1–8 个合法字符串。'; return 1; }
+    fi
+    case "$KNS_ALLOW_INSECURE" in ''|true|false) ;; *) kns_emit_error invalid_request 'allowInsecure 必须是布尔值。'; return 1 ;; esac
+    case "$KNS_FLOW" in ''|xtls-rprx-vision) ;; *) kns_emit_error invalid_request 'flow 只支持 xtls-rprx-vision 或留空。'; return 1 ;; esac
+    case "$KNS_FINGERPRINT" in chrome|firefox|safari|ios|android|edge|360|qq|random) ;; *) kns_emit_error invalid_request 'fingerprint 不受支持。'; return 1 ;; esac
+    if [ -n "$KNS_SPIDER_X" ] && [ "${#KNS_SPIDER_X}" -gt 256 ]; then kns_emit_error invalid_request 'spiderX 过长。'; return 1; fi
+    case "$KNS_UP_MBPS" in ''|*[!0-9]*) kns_emit_error invalid_request 'upMbps 必须是非负整数。'; return 1 ;; esac
+    case "$KNS_DOWN_MBPS" in ''|*[!0-9]*) kns_emit_error invalid_request 'downMbps 必须是非负整数。'; return 1 ;; esac
+    case "$KNS_OBFS" in ''|salamander) ;; *) kns_emit_error invalid_request 'obfs 只支持 salamander 或留空。'; return 1 ;; esac
+    if [ "$KNS_OBFS" = salamander ] && [ -z "$KNS_OBFS_PASSWORD" ]; then kns_emit_error invalid_request 'obfs=salamander 需要 obfsPassword。'; return 1; fi
+    if [ -n "$KNS_OBFS_PASSWORD" ] && [ "${#KNS_OBFS_PASSWORD}" -gt 256 ]; then kns_emit_error invalid_request 'obfsPassword 过长。'; return 1; fi
+    case "$KNS_ALTER_ID" in ''|*[!0-9]*) kns_emit_error invalid_request 'alterId 必须是非负整数。'; return 1 ;; esac
+    case "$KNS_VMESS_SECURITY" in auto|aes-128-gcm|chacha20-poly1305|zero|none) ;; *) kns_emit_error invalid_request 'VMess cipher 不受支持。'; return 1 ;; esac
+    case "$KNS_CONGESTION" in bbr|cubic|new_reno) ;; *) kns_emit_error invalid_request 'congestionControl 不受支持。'; return 1 ;; esac
+    case "$KNS_UDP_RELAY" in native|quic) ;; *) kns_emit_error invalid_request 'udpRelayMode 不受支持。'; return 1 ;; esac
     return 0
 }
 
@@ -5828,6 +5857,14 @@ kns_generate_node() {
     local uuid password keys private_key public_key short_id tag="$KNS_TAG" port="$KNS_LISTEN_PORT"
     KNS_CERT_SECURE=true
     kns_prepare_certificate || return 1
+    if [ -n "$KNS_ALLOW_INSECURE" ]; then KNS_CLIENT_INSECURE="$KNS_ALLOW_INSECURE"; else [ "$KNS_CERT_SECURE" = true ] && KNS_CLIENT_INSECURE=false || KNS_CLIENT_INSECURE=true; fi
+    KNS_ALPN_EFFECTIVE="$KNS_ALPN_JSON"
+    if [ -z "$KNS_ALPN_EFFECTIVE" ]; then
+        case "$KNS_PROTOCOL" in
+            hysteria2|tuic) KNS_ALPN_EFFECTIVE='["h3"]' ;;
+            *) KNS_ALPN_EFFECTIVE='["h2","http/1.1"]' ;;
+        esac
+    fi
     case "$KNS_PROTOCOL" in
       vless)
         uuid=$(kns_previous_value vless '.client.credential.value') || uuid=$(/usr/local/lib/onebox/sing-box generate uuid 2>/dev/null) || return 1
@@ -5841,19 +5878,19 @@ kns_generate_node() {
             short_id=$(/usr/local/lib/onebox/sing-box generate rand --hex 4 2>/dev/null) || return 1
         fi
         [ -n "$private_key" ] && [ -n "$public_key" ] && [ -n "$short_id" ] || return 1
-        KNS_INBOUND=$(jq -cn --arg tag "$tag" --arg addr "$KNS_LISTEN_ADDR" --arg uuid "$uuid" --arg sni "$KNS_SNI" --arg pk "$private_key" --arg sid "$short_id" --argjson p "$port" '{type:"vless",tag:$tag,listen:$addr,listen_port:$p,users:[{uuid:$uuid,flow:"xtls-rprx-vision"}],tls:{enabled:true,server_name:$sni,reality:{enabled:true,handshake:{server:$sni,server_port:443},private_key:$pk,short_id:[$sid]}}}') || return 1
-        KNS_CLIENT=$(jq -cn --arg uuid "$uuid" --arg sni "$KNS_SNI" --arg pub "$public_key" --arg sid "$short_id" '{credentials:{uuid:$uuid,flow:"xtls-rprx-vision"},tls:{enabled:true,security:"reality",server_name:$sni,public_key:$pub,short_id:$sid}}') || return 1
+        KNS_INBOUND=$(jq -cn --arg tag "$tag" --arg addr "$KNS_LISTEN_ADDR" --arg uuid "$uuid" --arg sni "$KNS_SNI" --arg pk "$private_key" --arg sid "$short_id" --arg flow "$KNS_FLOW" --argjson alpn "$KNS_ALPN_EFFECTIVE" --argjson p "$port" '{type:"vless",tag:$tag,listen:$addr,listen_port:$p,users:[{uuid:$uuid,flow:$flow}],tls:{enabled:true,server_name:$sni,alpn:$alpn,reality:{enabled:true,handshake:{server:$sni,server_port:443},private_key:$pk,short_id:[$sid]}}}') || return 1
+        KNS_CLIENT=$(jq -cn --arg uuid "$uuid" --arg sni "$KNS_SNI" --arg pub "$public_key" --arg sid "$short_id" --arg flow "$KNS_FLOW" --argjson alpn "$KNS_ALPN_EFFECTIVE" '{credentials:{uuid:$uuid,flow:$flow},tls:{enabled:true,security:"reality",server_name:$sni,public_key:$pub,short_id:$sid,alpn:$alpn}}') || return 1
         ;;
       hysteria2)
         password=$(kns_previous_value hysteria2 '.client.credential.value') || password=$(/usr/local/lib/onebox/sing-box generate rand --hex 16 2>/dev/null) || return 1
-        KNS_INBOUND=$(jq -cn --arg tag "$tag" --arg addr "$KNS_LISTEN_ADDR" --arg pass "$password" --arg cert "$KNS_CERT" --arg key "$KNS_KEY" --argjson p "$port" '{type:"hysteria2",tag:$tag,listen:$addr,listen_port:$p,users:[{password:$pass}],tls:{enabled:true,alpn:["h3"],certificate_path:$cert,key_path:$key}}') || return 1
-        KNS_CLIENT=$(jq -cn --arg pass "$password" --arg sni "$KNS_SNI" --argjson secure "$KNS_CERT_SECURE" '{credentials:{password:$pass},tls:{enabled:true,server_name:$sni,alpn:["h3"],allow_insecure:(($secure|not))}}') || return 1
+        KNS_INBOUND=$(jq -cn --arg tag "$tag" --arg addr "$KNS_LISTEN_ADDR" --arg pass "$password" --arg cert "$KNS_CERT" --arg key "$KNS_KEY" --argjson p "$port" --argjson up "$KNS_UP_MBPS" --argjson down "$KNS_DOWN_MBPS" --arg obfs "$KNS_OBFS" --arg obfsPass "$KNS_OBFS_PASSWORD" --argjson alpn "$KNS_ALPN_EFFECTIVE" '({type:"hysteria2",tag:$tag,listen:$addr,listen_port:$p,users:[{password:$pass}],up_mbps:$up,down_mbps:$down,tls:{enabled:true,alpn:$alpn,certificate_path:$cert,key_path:$key}} + (if $obfs == "salamander" then {obfs:{type:"salamander",password:$obfsPass}} else {} end))') || return 1
+        KNS_CLIENT=$(jq -cn --arg pass "$password" --arg sni "$KNS_SNI" --argjson insecure "$KNS_CLIENT_INSECURE" --argjson alpn "$KNS_ALPN_EFFECTIVE" '{credentials:{password:$pass},tls:{enabled:true,server_name:$sni,alpn:$alpn,allow_insecure:$insecure}}') || return 1
         ;;
       tuic)
         uuid=$(kns_previous_value tuic '.client.credential.uuid') || uuid=$(/usr/local/lib/onebox/sing-box generate uuid 2>/dev/null) || return 1
         password=$(kns_previous_value tuic '.client.credential.password') || password=$(/usr/local/lib/onebox/sing-box generate rand --hex 16 2>/dev/null) || return 1
-        KNS_INBOUND=$(jq -cn --arg tag "$tag" --arg addr "$KNS_LISTEN_ADDR" --arg uuid "$uuid" --arg pass "$password" --arg cert "$KNS_CERT" --arg key "$KNS_KEY" --argjson p "$port" '{type:"tuic",tag:$tag,listen:$addr,listen_port:$p,users:[{uuid:$uuid,password:$pass}],congestion_control:"bbr",tls:{enabled:true,alpn:["h3"],certificate_path:$cert,key_path:$key}}') || return 1
-        KNS_CLIENT=$(jq -cn --arg uuid "$uuid" --arg pass "$password" --arg sni "$KNS_SNI" --argjson secure "$KNS_CERT_SECURE" '{credentials:{uuid:$uuid,password:$pass},tls:{enabled:true,server_name:$sni,alpn:["h3"],allow_insecure:(($secure|not))}}') || return 1
+        KNS_INBOUND=$(jq -cn --arg tag "$tag" --arg addr "$KNS_LISTEN_ADDR" --arg uuid "$uuid" --arg pass "$password" --arg cert "$KNS_CERT" --arg key "$KNS_KEY" --argjson p "$port" --arg cc "$KNS_CONGESTION" --argjson alpn "$KNS_ALPN_EFFECTIVE" '{type:"tuic",tag:$tag,listen:$addr,listen_port:$p,users:[{uuid:$uuid,password:$pass}],congestion_control:$cc,tls:{enabled:true,alpn:$alpn,certificate_path:$cert,key_path:$key}}') || return 1
+        KNS_CLIENT=$(jq -cn --arg uuid "$uuid" --arg pass "$password" --arg sni "$KNS_SNI" --argjson insecure "$KNS_CLIENT_INSECURE" --argjson alpn "$KNS_ALPN_EFFECTIVE" '{credentials:{uuid:$uuid,password:$pass},tls:{enabled:true,server_name:$sni,alpn:$alpn,allow_insecure:$insecure}}') || return 1
         ;;
       anytls|trojan|vmess)
         if [ "$KNS_PROTOCOL" = vmess ]; then
@@ -5862,16 +5899,16 @@ kns_generate_node() {
             password=$(kns_previous_value "$KNS_PROTOCOL" '.client.credential.value') || password=$(/usr/local/lib/onebox/sing-box generate rand --hex 16 2>/dev/null) || return 1
         fi
         case "$KNS_PROTOCOL" in
-          anytls) KNS_INBOUND=$(jq -cn --arg tag "$tag" --arg addr "$KNS_LISTEN_ADDR" --arg pass "$password" --arg cert "$KNS_CERT" --arg key "$KNS_KEY" --argjson p "$port" '{type:"anytls",tag:$tag,listen:$addr,listen_port:$p,users:[{password:$pass}],tls:{enabled:true,alpn:["h2","http/1.1"],certificate_path:$cert,key_path:$key}}') || return 1 ;;
-          trojan) KNS_INBOUND=$(jq -cn --arg tag "$tag" --arg addr "$KNS_LISTEN_ADDR" --arg pass "$password" --arg cert "$KNS_CERT" --arg key "$KNS_KEY" --argjson p "$port" '{type:"trojan",tag:$tag,listen:$addr,listen_port:$p,users:[{name:"kns",password:$pass}],tls:{enabled:true,alpn:["h2","http/1.1"],certificate_path:$cert,key_path:$key}}') || return 1 ;;
-          vmess) KNS_INBOUND=$(jq -cn --arg tag "$tag" --arg addr "$KNS_LISTEN_ADDR" --arg uuid "$uuid" --arg cert "$KNS_CERT" --arg key "$KNS_KEY" --argjson p "$port" '{type:"vmess",tag:$tag,listen:$addr,listen_port:$p,users:[{name:"kns",uuid:$uuid,alter_id:0,security:"auto"}],tls:{enabled:true,alpn:["h2","http/1.1"],certificate_path:$cert,key_path:$key}}') || return 1 ;;
+          anytls) KNS_INBOUND=$(jq -cn --arg tag "$tag" --arg addr "$KNS_LISTEN_ADDR" --arg pass "$password" --arg cert "$KNS_CERT" --arg key "$KNS_KEY" --argjson p "$port" --argjson alpn "$KNS_ALPN_EFFECTIVE" '{type:"anytls",tag:$tag,listen:$addr,listen_port:$p,users:[{password:$pass}],tls:{enabled:true,alpn:$alpn,certificate_path:$cert,key_path:$key}}') || return 1 ;;
+          trojan) KNS_INBOUND=$(jq -cn --arg tag "$tag" --arg addr "$KNS_LISTEN_ADDR" --arg pass "$password" --arg cert "$KNS_CERT" --arg key "$KNS_KEY" --argjson p "$port" --argjson alpn "$KNS_ALPN_EFFECTIVE" '{type:"trojan",tag:$tag,listen:$addr,listen_port:$p,users:[{name:"kns",password:$pass}],tls:{enabled:true,alpn:$alpn,certificate_path:$cert,key_path:$key}}') || return 1 ;;
+          vmess) KNS_INBOUND=$(jq -cn --arg tag "$tag" --arg addr "$KNS_LISTEN_ADDR" --arg uuid "$uuid" --arg cert "$KNS_CERT" --arg key "$KNS_KEY" --argjson p "$port" --arg alter "$KNS_ALTER_ID" --arg vmesssec "$KNS_VMESS_SECURITY" --argjson alpn "$KNS_ALPN_EFFECTIVE" '{type:"vmess",tag:$tag,listen:$addr,listen_port:$p,users:[{name:"kns",uuid:$uuid,alter_id:($alter|tonumber),security:$vmesssec}],tls:{enabled:true,alpn:$alpn,certificate_path:$cert,key_path:$key}}') || return 1 ;;
         esac
         if [ "$KNS_PROTOCOL" = vmess ]; then
-            KNS_CLIENT=$(jq -cn --arg uuid "$uuid" --arg sni "$KNS_SNI" --argjson secure "$KNS_CERT_SECURE" '{credentials:{uuid:$uuid,alter_id:0,security:"auto"},tls:{enabled:true,server_name:$sni,allow_insecure:(($secure|not))}}') || return 1
+            KNS_CLIENT=$(jq -cn --arg uuid "$uuid" --arg sni "$KNS_SNI" --arg alter "$KNS_ALTER_ID" --arg vmesssec "$KNS_VMESS_SECURITY" --argjson insecure "$KNS_CLIENT_INSECURE" --argjson alpn "$KNS_ALPN_EFFECTIVE" '{credentials:{uuid:$uuid,alter_id:($alter|tonumber),security:$vmesssec},tls:{enabled:true,server_name:$sni,alpn:$alpn,allow_insecure:$insecure}}') || return 1
         elif [ "$KNS_PROTOCOL" = trojan ]; then
-            KNS_CLIENT=$(jq -cn --arg pass "$password" --arg sni "$KNS_SNI" --argjson secure "$KNS_CERT_SECURE" '{credentials:{password:$pass},tls:{enabled:true,server_name:$sni,allow_insecure:(($secure|not))}}') || return 1
+            KNS_CLIENT=$(jq -cn --arg pass "$password" --arg sni "$KNS_SNI" --argjson insecure "$KNS_CLIENT_INSECURE" --argjson alpn "$KNS_ALPN_EFFECTIVE" '{credentials:{password:$pass},tls:{enabled:true,server_name:$sni,alpn:$alpn,allow_insecure:$insecure}}') || return 1
         else
-            KNS_CLIENT=$(jq -cn --arg pass "$password" --arg sni "$KNS_SNI" --argjson secure "$KNS_CERT_SECURE" '{credentials:{password:$pass},tls:{enabled:true,server_name:$sni,allow_insecure:(($secure|not))}}') || return 1
+            KNS_CLIENT=$(jq -cn --arg pass "$password" --arg sni "$KNS_SNI" --argjson insecure "$KNS_CLIENT_INSECURE" --argjson alpn "$KNS_ALPN_EFFECTIVE" '{credentials:{password:$pass},tls:{enabled:true,server_name:$sni,alpn:$alpn,allow_insecure:$insecure}}') || return 1
         fi
         ;;
       shadowsocks)
