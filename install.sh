@@ -108,7 +108,8 @@ KNS_STATE_DIR="$CONFIG_DIR/kns"
 KNS_INSTANCES_DIR="$KNS_STATE_DIR/instances"
 KNS_CERTS_DIR="$KNS_STATE_DIR/certs"
 KNS_REQUEST_DIR="/run/onebox/kns/requests"
-KNS_ADAPTER_VERSION="1.4.0"
+ONEBOX_SCRIPT_VERSION="1.0.1"
+KNS_ADAPTER_VERSION="1.5.0"
 
 KERNEL_TMP_DIR=""
 declare -a SB_OWNED_TEMP_FILES=()
@@ -1079,9 +1080,17 @@ download_kernel_archive() {
             actual=$(sha256sum "$d/archive") || return 1
             [ "${actual%% *}" = "$digest" ] || { echo '[错误] 下载包 SHA-256 校验失败。' >&2; return 1; }
         else
+            if [ "${KNS_REQUIRE_KERNEL_DIGEST:-0}" = 1 ]; then
+                echo '[错误] 此发行包未提供可验证的 GitHub SHA-256 摘要。' >&2
+                return 1
+            fi
             echo '[提示] 此发行包未提供 GitHub SHA-256 摘要，已通过 HTTPS 下载。' >&2
         fi
     else
+        if [ "${KNS_REQUIRE_KERNEL_DIGEST:-0}" = 1 ]; then
+            echo '[错误] 无法读取发行摘要，拒绝执行 KNS 内核升级。' >&2
+            return 1
+        fi
         echo '[提示] 无法读取发行摘要（网络/API 限额）；已通过 HTTPS 下载。' >&2
     fi
 }
@@ -1091,7 +1100,7 @@ install_kernel() {
     [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]] || return 1
     (
         umask 077
-        local d newbin config_backup='' config_staged='' active=0 touched=0 done_ok=0 new_is_112=0 kernel_tx_owner="$BASHPID"
+        local d newbin config_backup='' config_staged='' active=0 touched=0 done_ok=0 new_is_112=0 kernel_tx_owner="$BASHPID" service_before
         mkdir -p /usr/local/lib/onebox || exit 1
         d=$(mktemp -d /usr/local/lib/onebox/.kernel-tx.XXXXXX) || exit 1
         kernel_tx_finish() {
@@ -1131,11 +1140,8 @@ install_kernel() {
         trap kernel_tx_finish EXIT
         trap 'exit 130' INT
         trap 'exit 143' TERM
-        if [ "$SERVICE_MANAGER" = openrc ]; then
-            rc-service onebox status >/dev/null 2>&1 && active=1
-        else
-            systemctl is-active --quiet onebox && active=1
-        fi
+        service_before=$(managed_service_state onebox 2>/dev/null) || service_before=unknown
+        [ "$service_before" = active ] && active=1
         if [ -e /usr/local/lib/onebox/sing-box ]; then cp -p /usr/local/lib/onebox/sing-box "$d/old" || exit 1; fi
         if [ -f "$CONFIG_FILE" ]; then
             config_backup=$(mktemp "$CONFIG_DIR/.kernel-backup.XXXXXX") || exit 1
@@ -1167,7 +1173,19 @@ install_kernel() {
         if [ -n "$config_staged" ]; then
             mv -f "$config_staged" "$CONFIG_FILE" || exit 1
         fi
-        if [ "$mode" != norestart ]; then run_step "启动并检查服务" restart_service || exit 1; fi
+        if [ "$mode" = restart ] || { [ "$mode" = preserve ] && [ "$active" = 1 ]; }; then
+            run_step "启动并检查服务" restart_service || exit 1
+        fi
+        local installed_version actual_service expected_service
+        installed_version=$(kns_current_kernel_version) || { printf '[错误] 无法读取刚安装的 sing-box 版本。\n' >&2; exit 1; }
+        [ "$installed_version" = "$ver" ] || { printf '[错误] 安装后的 sing-box 版本与目标不一致。\n' >&2; exit 1; }
+        actual_service=$(managed_service_state onebox 2>/dev/null) || actual_service=unknown
+        case "$actual_service" in active|inactive|not-installed) ;; stopped) actual_service=inactive ;; *) actual_service=unknown ;; esac
+        if [ "$mode" = restart ]; then expected_service=active
+        else
+            case "$service_before" in active) expected_service=active ;; inactive|stopped) expected_service=inactive ;; not-installed) expected_service=not-installed ;; *) expected_service=unknown ;; esac
+        fi
+        [ "$actual_service" = "$expected_service" ] || { printf '[错误] 内核安装后的服务状态未保持预期（期望 %s，当前 %s）。\n' "$expected_service" "$actual_service" >&2; exit 1; }
         done_ok=1
         printf '==> 内核 v%s 安装完毕！\n' "$ver"
     )
@@ -5446,7 +5464,7 @@ kns_instance_file() { printf '%s/%s.json\n' "$KNS_INSTANCES_DIR" "$1"; }
 
 kns_schema() {
     cat <<EOF
-{"schema":1,"adapterVersion":"$KNS_ADAPTER_VERSION","runtime":{"engine":"sing-box","id":"onebox-main"},"commands":["install","reconfigure","reinstall","enable","disable","status","uninstall","list","discover","import","schema"],"actions":["install","reconfigure","reinstall","enable","disable","uninstall","import"],"protocols":{"vless":{"transports":["tcp"],"security":"reality"},"hysteria2":{"transports":["udp"]},"tuic":{"transports":["udp"]},"anytls":{"transports":["tcp"]},"shadowsocks":{"transports":["tcp+udp"]},"trojan":{"transports":["tcp"]},"vmess":{"transports":["tcp"]}},"request":{"required":["schema","jobId","machineUuid","action","runtime","instance","idempotencyKey","report"],"instance":{"required":["id","protocol","listenPort","transport","options"],"optional":{"listenAddress":"::, 0.0.0.0, 127.0.0.1, or ::1; default ::","legacyTag":"existing inbound tag for read-only import"},"options":{"security":"reality for vless","sni":"optional for VLESS Reality (automatically optimized by OneBox); required for other TLS protocols","method":"optional for shadowsocks"}}},"callback":{"method":"POST","contentType":"application/json","authorization":"Bearer report.oneTimeToken","successStatus":"any HTTP 2xx"},"result":{"stdout":"redacted JSON; never contains node credentials","discovery":"metadata only; never contains credentials","callbackInstance":{"id":"string","protocol":"string","listen":{"port":"number","transport":"string"},"tls":"optional protocol TLS metadata","credential":"protocol-specific object","resources":"array with ownership and reference metadata"},"statusInstance":{"resources":"current config, firewall and service references","uninstallPreview":{"complete":"boolean","serviceImpact":"reload or unknown"}}},"requestTransport":"root-owned mode-0600 JSON file"}
+{"schema":1,"adapterVersion":"$KNS_ADAPTER_VERSION","scriptVersion":"$ONEBOX_SCRIPT_VERSION","runtime":{"engine":"sing-box","id":"onebox-main"},"commands":["install","reconfigure","reinstall","enable","disable","status","runtime-status","update-script","update-kernel","uninstall","list","discover","import","schema"],"actions":["install","reconfigure","reinstall","enable","disable","uninstall","import","update-script","update-kernel"],"protocols":{"vless":{"transports":["tcp"],"security":"reality"},"hysteria2":{"transports":["udp"]},"tuic":{"transports":["udp"]},"anytls":{"transports":["tcp"]},"shadowsocks":{"transports":["tcp+udp"]},"trojan":{"transports":["tcp"]},"vmess":{"transports":["tcp"]}},"request":{"required":["schema","jobId","machineUuid","action","runtime","idempotencyKey","report"],"instance":{"required":["id","protocol","listenPort","transport","options"],"optional":{"listenAddress":"::, 0.0.0.0, 127.0.0.1, or ::1; default ::","legacyTag":"existing inbound tag for read-only import"},"options":{"security":"reality for vless","sni":"optional for VLESS Reality (automatically optimized by OneBox); required for other TLS protocols","method":"optional for shadowsocks"}},"upgrade":{"update-script":{"scriptSha256":"fixed SHA-256 of the trusted installer artifact; instance is null"},"update-kernel":{"version":"latest stable sing-box release; instance is null"}}},"callback":{"method":"POST","contentType":"application/json","authorization":"Bearer report.oneTimeToken","successStatus":"any HTTP 2xx"},"result":{"stdout":"redacted JSON; never contains node credentials","discovery":"metadata only; never contains credentials","runtimeStatus":{"oneboxScriptVersion":"string","oneboxScriptSha256":"sha256","singBoxVersion":"semver","serviceState":"active, inactive, or unknown"},"operationResult":"script or kernel upgrade result with versions and checksums"},"requestTransport":"root-owned mode-0600 JSON file"}
 EOF
 }
 
@@ -5514,7 +5532,11 @@ kns_discover() {
        (if $type == "vless" then (if $inbound.tls.reality.enabled? == true and $transport == "tcp" then "reality" else "unsupported" end)
         elif $type == "shadowsocks" then "none" else "tls" end) as $security |
        (if $type == "vless" then $security else "" end) as $optionSecurity |
-       ($inbound.tls.server_name // (if (($inbound.tls.certificate_path // "") | endswith("/real.cer")) then $real elif (($inbound.tls.certificate_path // "") | endswith("/self.cer")) then $self else "" end)) as $sni |
+       ([ $inbound.tls.server_name,
+          (if $type == "vless" then $inbound.tls.reality.handshake.server else null end),
+          (if (($inbound.tls.certificate_path // "") | endswith("/real.cer")) then $real else null end),
+          (if (($inbound.tls.certificate_path // "") | endswith("/self.cer")) then $self else null end) ]
+        | map(select(type == "string" and length > 0)) | .[0] // "") as $sni |
        (($registered | index($inbound.tag)) != null) as $managed |
        (if $type == "vless" then ($security == "reality" and ($users|length) == 1 and (($users[0].uuid // "")|test("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")) and (($inbound.tls.reality.short_id[0] // "")|length) > 0 and (($inbound.listen_port // 0) > 0) and (($publicKeyPorts | index($port)) != null))
         elif $type == "shadowsocks" then ((["aes-128-gcm","aes-256-gcm","chacha20-ietf-poly1305","2022-blake3-aes-128-gcm","2022-blake3-aes-256-gcm","2022-blake3-chacha20-poly1305"] | index($inbound.method // "")) != null and (($inbound.password // "")|length) > 0 and $transport == "tcp+udp" and ($port > 0))
@@ -5523,7 +5545,7 @@ kns_discover() {
         else false end) as $credentialShape |
        (($inbound.listen // "::") as $listenAddr |
         {tag:$inbound.tag,protocol:$type,listen:{port:(if ($port|type)=="number" then $port else 0 end),address:$listenAddr,transport:$transport},managed:$managed,
-         importable:($credentialShape and ($managed|not) and ($inbound.tag|test("^[A-Za-z0-9._:-]{1,128}$")) and ((["::","0.0.0.0"] | index($listenAddr)) != null) and ($type == "shadowsocks" or $sni != "" or $type == "vless")),
+         importable:($credentialShape and ($managed|not) and ($inbound.tag|test("^[A-Za-z0-9._:-]{1,128}$")) and ((["::","0.0.0.0"] | index($listenAddr)) != null) and ($type == "shadowsocks" or $sni != "")),
          options:{security:$optionSecurity,sni:$sni,method:($inbound.method // "")},
          reason:(if $managed then "already_managed" elif (["::","0.0.0.0"] | index($listenAddr)) == null then "unsupported_listen_address" elif (($inbound.tag|test("^[A-Za-z0-9._:-]{1,128}$"))|not) then "invalid_tag" elif (["vless","hysteria2","tuic","anytls","shadowsocks"] | index($type)) == null then "unsupported_protocol" elif ($users|length) > 1 then "multiple_users" elif $type != "shadowsocks" and $sni == "" then "missing_sni" elif $credentialShape then "" else "unsupported_or_incomplete_config" end)})]
       | {schema:1,adapterVersion:$version,runtime:{engine:"sing-box",id:"onebox-main"},instances:.}' "$CONFIG_FILE"
@@ -5593,6 +5615,100 @@ kns_status() {
         '{schema:1,adapterVersion:$version,operation:"status",instance:{id,machineUuid,protocol,tag,listen,installed:$installed,enabled:$enabled,installState:(if $installed then (if $enabled then "installed" else "disabled" end) else "orphaned" end),serviceState:$service,healthLevel:$health,updatedAt,resources:$preview.resources,uninstallPreview:{complete:$preview.complete,serviceImpact:$preview.serviceImpact}} ,runtime:{engine:"sing-box",id:.runtimeId}}' "$file"
 }
 
+kns_current_kernel_version() {
+    local output version
+    [ -x /usr/local/lib/onebox/sing-box ] || return 1
+    output=$(/usr/local/lib/onebox/sing-box version 2>/dev/null) || return 1
+    version=$(sed -n '1{s/^sing-box version //; s/[[:space:]].*$//; p;}' <<< "$output")
+    [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]] || return 1
+    printf '%s\n' "$version"
+}
+
+kns_runtime_status() {
+    local installed_script=/usr/local/bin/onebox script_version=unversioned script_sha256='' kernel_version=unknown service_state=unknown
+    require_config readonly || { kns_emit_error onebox_not_installed 'OneBox 配置不存在或不可读。'; return 1; }
+    if [ -f "$installed_script" ] && [ ! -L "$installed_script" ]; then
+        script_sha256=$(sha256sum "$installed_script" | awk '{print $1}') || return 1
+        script_version=$(sed -n 's/^ONEBOX_SCRIPT_VERSION="\([0-9A-Za-z.-]*\)"$/\1/p' "$installed_script" | head -n 1)
+        [ -n "$script_version" ] || script_version=unversioned
+    fi
+    kernel_version=$(kns_current_kernel_version 2>/dev/null) || kernel_version=unknown
+    service_state=$(managed_service_state onebox 2>/dev/null) || service_state=unknown
+    case "$service_state" in active) ;; inactive|stopped) service_state=inactive ;; *) service_state=unknown ;; esac
+    jq -cn --arg adapter "$KNS_ADAPTER_VERSION" --arg scriptVersion "$script_version" --arg scriptSha256 "$script_sha256" \
+        --arg kernelVersion "$kernel_version" --arg serviceState "$service_state" \
+        '{schema:1,adapterVersion:$adapter,runtime:{engine:"sing-box",id:"onebox-main",oneboxScriptVersion:$scriptVersion,oneboxScriptSha256:$scriptSha256,singBoxVersion:$kernelVersion,serviceState:$serviceState}}'
+}
+
+kns_restore_script_backup() {
+    local backup="$1" original_mode="$2"
+    [ -f "$backup" ] && [ ! -L "$backup" ] || return 1
+    [[ "$original_mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    chmod "$original_mode" "$backup" && mv -f -- "$backup" /usr/local/bin/onebox
+}
+
+kns_update_script() {
+    local expected source actual backup='' current changed=false original_mode
+    expected=$(jq -r '.upgrade.scriptSha256' "$KNS_REQUEST_FILE") || return 1
+    [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || { kns_emit_error invalid_request '固定的 OneBox 脚本 SHA-256 无效。'; return 1; }
+    source=$(readlink -f -- "${BASH_SOURCE[0]}") || { kns_emit_error script_source_unavailable '无法定位已校验的 OneBox 安装脚本。'; return 1; }
+    [ -f "$source" ] && [ ! -L "$source" ] && valid_script_file "$source" || { kns_emit_error script_source_invalid '已校验的 OneBox 脚本结构或语法无效。'; return 1; }
+    actual=$(sha256sum "$source" | awk '{print $1}') || return 1
+    [ "$actual" = "$expected" ] || { kns_emit_error script_digest_mismatch 'OneBox 脚本与 KNS 固定 SHA-256 不匹配。'; return 1; }
+    [ -f /usr/local/bin/onebox ] && [ ! -L /usr/local/bin/onebox ] || { kns_emit_error onebox_script_missing '未找到可安全替换的 /usr/local/bin/onebox 管理脚本。'; return 1; }
+    original_mode=$(stat -c '%a' -- /usr/local/bin/onebox) || { kns_emit_error onebox_script_mode_unavailable '无法读取现有 OneBox 管理脚本权限。'; return 1; }
+    current=$(sha256sum /usr/local/bin/onebox | awk '{print $1}') || return 1
+    if [ "$current" != "$expected" ]; then
+        backup=$(mktemp /usr/local/bin/.onebox.rollback.XXXXXX) || return 1
+        cp -p /usr/local/bin/onebox "$backup" && chmod 700 "$backup" || { rm -f -- "$backup"; return 1; }
+        if ! fetch_script "$source"; then
+            kns_restore_script_backup "$backup" "$original_mode" || kns_emit_error script_rollback_failed '脚本更新失败，旧脚本恢复失败；请使用 OneBox 管理脚本恢复记录。'
+            return 1
+        fi
+        actual=$(sha256sum /usr/local/bin/onebox | awk '{print $1}') || actual=''
+        if [ "$actual" != "$expected" ]; then
+            kns_restore_script_backup "$backup" "$original_mode" || kns_emit_error script_rollback_failed '脚本校验失败，旧脚本恢复失败；请使用 OneBox 管理脚本恢复记录。'
+            kns_emit_error script_verification_failed 'OneBox 管理脚本更新后 SHA-256 核验失败，已尝试恢复旧脚本。'
+            return 1
+        fi
+        changed=true
+    fi
+    KNS_OPERATION_RESULT=$(jq -cn --arg version "$ONEBOX_SCRIPT_VERSION" --arg before "$current" --arg after "$expected" --argjson changed "$changed" \
+        '{type:"script_update",version:$version,previousSha256:$before,scriptSha256:$after,changed:$changed}') || return 1
+    if ! kns_callback; then
+        if [ -n "$backup" ] && ! kns_restore_script_backup "$backup" "$original_mode"; then
+            kns_emit_error script_rollback_failed '更新回调失败，旧管理脚本恢复失败；请检查 /usr/local/bin/.onebox.rollback.*。'
+        fi
+        kns_emit_error callback_failed 'OneBox 管理脚本更新结果未能回报 KNS；如果本次有更改，已尝试恢复原脚本。'
+        return 1
+    fi
+    [ -z "$backup" ] || rm -f -- "$backup"
+    printf 'KNS_OPERATION_RESULT=%s\n' "$KNS_OPERATION_RESULT"
+}
+
+kns_update_kernel() {
+    local requested version previous service_before service_after current
+    requested=$(jq -r '.upgrade.version' "$KNS_REQUEST_FILE") || return 1
+    [ "$requested" = latest ] || { kns_emit_error invalid_request 'KNS 只接受经过确认的稳定版 latest 目标。'; return 1; }
+    previous=$(kns_current_kernel_version) || { kns_emit_error kernel_version_unavailable '无法读取当前 sing-box 内核版本。'; return 1; }
+    service_before=$(managed_service_state onebox 2>/dev/null) || { kns_emit_error service_state_unavailable '无法核实 OneBox 共享服务状态。'; return 1; }
+    case "$service_before" in active) service_before=active ;; inactive|stopped) service_before=inactive ;; *) kns_emit_error service_state_unavailable 'OneBox 共享服务状态不明确，拒绝升级。'; return 1 ;; esac
+    version=$(get_latest_version) || version=''
+    [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]] || { kns_emit_error latest_version_unavailable '无法取得有效的 sing-box 稳定版版本号。'; return 1; }
+    if [ "$version" != "$previous" ]; then
+        KNS_REQUIRE_KERNEL_DIGEST=1 install_kernel "$version" preserve || { kns_emit_error kernel_upgrade_failed 'sing-box 升级失败；OneBox 更新器已尝试恢复旧内核与配置，请核查机器状态。'; return 1; }
+    fi
+    current=$(kns_current_kernel_version) || { kns_emit_error kernel_version_unavailable '升级后无法读取 sing-box 内核版本。'; return 1; }
+    service_after=$(managed_service_state onebox 2>/dev/null) || service_after=unknown
+    case "$service_after" in active) ;; inactive|stopped) service_after=inactive ;; *) service_after=unknown ;; esac
+    [ "$current" = "$version" ] || { kns_emit_error kernel_version_mismatch '升级后 sing-box 版本与目标不一致。'; return 1; }
+    [ "$service_after" = "$service_before" ] || { kns_emit_error kernel_service_state_changed '内核安装后的共享服务状态与升级前不一致；请先核查机器状态。'; return 1; }
+    KNS_OPERATION_RESULT=$(jq -cn --arg requested "$requested" --arg previous "$previous" --arg current "$current" --arg service "$service_after" \
+        '{type:"kernel_update",requestedVersion:$requested,previousVersion:$previous,singBoxVersion:$current,serviceState:$service}') || return 1
+    kns_callback || { kns_emit_error callback_failed '内核已更新，但结果未能回报 KNS；请通过只读版本核查确认。'; return 1; }
+    printf 'KNS_OPERATION_RESULT=%s\n' "$KNS_OPERATION_RESULT"
+}
+
 kns_request_validate() {
     local request="$KNS_REQUEST_FILE" mode owner callback_authority callback_host callback_port request_parent
     [[ "$request" == "$KNS_REQUEST_DIR"/* && "$request" != *'/../'* && "$request" != *'/./'* ]] || { kns_emit_error invalid_request '请求文件必须位于 OneBox 受保护的 KNS requests 目录。'; return 1; }
@@ -5604,41 +5720,51 @@ kns_request_validate() {
     [ "$owner" = 0 ] && { [ "$mode" = 600 ] || [ "$mode" = 400 ]; } || { kns_emit_error invalid_request '请求文件必须由 root 拥有且权限为 0600 或 0400。'; return 1; }
     [ "$(wc -c < "$request" | tr -d ' ')" -le 65536 ] || { kns_emit_error invalid_request '请求文件超过 64 KiB。'; return 1; }
     jq -e --arg action "$KNS_COMMAND" '
-      type == "object" and
-      ((keys - ["schema","jobId","machineUuid","action","runtime","instance","idempotencyKey","report"]) | length == 0) and
+      if type != "object" then false else
+      ((keys - ["schema","jobId","machineUuid","action","runtime","instance","upgrade","idempotencyKey","report"]) | length == 0) and
       .schema == 1 and .action == $action and
       (.jobId | type == "string" and test("^[A-Za-z0-9._:-]{1,128}$")) and
       (.machineUuid | type == "string" and test("^[A-Za-z0-9._:-]{1,128}$")) and
       (.idempotencyKey | type == "string" and test("^[A-Za-z0-9._:-]{1,256}$")) and
       (.runtime | type == "object" and ((keys - ["engine","id"]) | length == 0) and .engine == "sing-box" and (.id | type == "string" and test("^[A-Za-z0-9_-]{1,64}$"))) and
-      (.instance | type == "object" and ((keys - ["id","protocol","listenPort","listenAddress","transport","options","legacyTag"]) | length == 0)) and
-      (.instance.id | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")) and
-      (.instance.protocol | type == "string" and length > 0 and length <= 32) and
-      (.instance.listenPort | type == "number" and floor == . and . >= 1 and . <= 65535) and
-      ((.instance.listenAddress // "::") | type == "string" and length > 0 and length <= 45) and
-      (.instance.transport as $transport | (["tcp","udp","tcp+udp"] | index($transport)) != null) and
-      (if $action == "import" then (.instance.legacyTag | type == "string" and test("^[A-Za-z0-9._:-]{1,128}$")) else ((.instance | has("legacyTag")) | not) end) and
-      (.instance.options | type == "object" and ((keys - ["security","sni","method"]) | length == 0)) and
+      (if $action == "update-script" then
+         .instance == null and (.upgrade | type == "object" and ((keys - ["scriptSha256"]) | length == 0) and (.scriptSha256 | type == "string" and test("^[0-9a-f]{64}$")))
+       elif $action == "update-kernel" then
+         .instance == null and (.upgrade | type == "object" and ((keys - ["version"]) | length == 0) and .version == "latest")
+       else
+         (.upgrade? == null) and
+         (.instance | type == "object" and ((keys - ["id","protocol","listenPort","listenAddress","transport","options","legacyTag"]) | length == 0)) and
+         (.instance.id | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")) and
+         (.instance.protocol | type == "string" and length > 0 and length <= 32) and
+         (.instance.listenPort | type == "number" and floor == . and . >= 1 and . <= 65535) and
+         ((.instance.listenAddress // "::") | type == "string" and length > 0 and length <= 45) and
+         (.instance.transport as $transport | (["tcp","udp","tcp+udp"] | index($transport)) != null) and
+         (if $action == "import" then (.instance.legacyTag | type == "string" and test("^[A-Za-z0-9._:-]{1,128}$")) else ((.instance | has("legacyTag")) | not) end) and
+         (.instance.options | type == "object" and ((keys - ["security","sni","method"]) | length == 0))
+       end) and
       (.report | type == "object" and ((keys - ["callback","oneTimeToken"]) | length == 0)) and
       (.report.callback | type == "string" and test("^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?/[A-Za-z0-9._~/-]*$")) and
       (.report.oneTimeToken | type == "string" and test("^[A-Za-z0-9._~-]{32,512}$"))
+      end
     ' "$request" >/dev/null 2>&1 || { kns_emit_error invalid_request '请求字段、类型或格式不符合 KNS 任务 schema 1。'; return 1; }
     KNS_JOB_ID=$(jq -r '.jobId' "$request")
     KNS_MACHINE_UUID=$(jq -r '.machineUuid' "$request")
-    KNS_INSTANCE_ID=$(jq -r '.instance.id' "$request")
+    KNS_INSTANCE_ID=$(jq -r '.instance.id // empty' "$request")
     KNS_RUNTIME_ID=$(jq -r '.runtime.id' "$request")
     KNS_IDEMPOTENCY_KEY=$(jq -r '.idempotencyKey' "$request")
-    KNS_PROTOCOL=$(jq -r '.instance.protocol' "$request")
+    KNS_PROTOCOL=$(jq -r '.instance.protocol // empty' "$request")
     KNS_SECURITY=$(jq -r '.instance.options.security // empty' "$request")
     KNS_LISTEN_ADDR=$(jq -r '.instance.listenAddress // "::"' "$request")
-    KNS_LISTEN_PORT=$(jq -r '.instance.listenPort' "$request")
-    KNS_NETWORK=$(jq -r '.instance.transport' "$request")
+    KNS_LISTEN_PORT=$(jq -r '.instance.listenPort // 0' "$request")
+    KNS_NETWORK=$(jq -r '.instance.transport // empty' "$request")
     KNS_SNI=$(jq -r '.instance.options.sni // empty' "$request")
     KNS_METHOD=$(jq -r '.instance.options.method // "aes-128-gcm"' "$request")
     KNS_LEGACY_TAG=$(jq -r '.instance.legacyTag // empty' "$request")
     KNS_CALLBACK_URL=$(jq -r '.report.callback' "$request")
     KNS_CALLBACK_TOKEN=$(jq -r '.report.oneTimeToken' "$request")
     KNS_INSTANCE_FILE=$(kns_instance_file "$KNS_INSTANCE_ID")
+    KNS_UPDATE_VERSION=$(jq -r '.upgrade.version // empty' "$request")
+    KNS_TARGET_SCRIPT_SHA256=$(jq -r '.upgrade.scriptSha256 // empty' "$request")
     callback_authority="${KNS_CALLBACK_URL#https://}"; callback_authority="${callback_authority%%/*}"; callback_host="${callback_authority%%:*}"
     if [[ "$callback_authority" == *:* ]]; then
         callback_port="${callback_authority#*:}"
@@ -5646,6 +5772,7 @@ kns_request_validate() {
     fi
     valid_host "$callback_host" || { kns_emit_error invalid_request '回调主机名格式错误。'; return 1; }
     case "$callback_host" in localhost|*.localhost|*.local) kns_emit_error invalid_request '回调必须使用可验证的 HTTPS 公网域名。'; return 1 ;; esac
+    case "$KNS_COMMAND" in update-script|update-kernel) return 0 ;; esac
     case "$KNS_LISTEN_ADDR" in '::'|'0.0.0.0'|'127.0.0.1'|'::1') ;; *) kns_emit_error invalid_request 'listen.address 仅允许 ::、0.0.0.0、127.0.0.1 或 ::1。'; return 1 ;; esac
     case "$KNS_PROTOCOL:$KNS_SECURITY:$KNS_NETWORK" in
       vless:reality:tcp) ;;
@@ -5790,8 +5917,8 @@ kns_callback() {
     conf=$(mktemp "$KNS_REQUEST_DIR/.curl.XXXXXX") || return 1; SB_OWNED_TEMP_FILES+=("$conf"); chmod 600 "$conf" || return 1
     response=$(mktemp "$KNS_REQUEST_DIR/.ack.XXXXXX") || return 1; SB_OWNED_TEMP_FILES+=("$response"); chmod 600 "$response" || return 1
     jq -cn --arg job "$KNS_JOB_ID" --arg machine "$KNS_MACHINE_UUID" --arg runtime "$KNS_RUNTIME_ID" --arg command "$KNS_COMMAND" \
-        --arg version "$KNS_ADAPTER_VERSION" --argjson node "${KNS_CLIENT:-null}" \
-        '{schema:1,jobId:$job,machineUuid:$machine,status:"succeeded",runtime:{id:$runtime,engine:"sing-box"},instances:(if $command == "uninstall" then [] else [$node] end),artifactVersion:$version}' > "$payload" || return 1
+        --arg version "$KNS_ADAPTER_VERSION" --argjson node "${KNS_CLIENT:-null}" --argjson operation "${KNS_OPERATION_RESULT:-null}" \
+        '{schema:1,jobId:$job,machineUuid:$machine,status:"succeeded",runtime:{id:$runtime,engine:"sing-box"},instances:(if ($command == "uninstall" or $command == "update-script" or $command == "update-kernel") then [] else [$node] end),operationResult:$operation,artifactVersion:$version}' > "$payload" || return 1
     printf 'header = "Authorization: Bearer %s"\nheader = "Content-Type: application/json"\n' "$KNS_CALLBACK_TOKEN" > "$conf" || return 1
     http_code=$(curl --config "$conf" --proto '=https' --max-redirs 0 --fail --silent --show-error --connect-timeout 5 --max-time 15 \
         --request POST --data-binary "@$payload" --output "$response" --write-out '%{http_code}' "$KNS_CALLBACK_URL" 2>/dev/null) || return 1
@@ -5812,7 +5939,7 @@ kns_import_legacy() {
     port=$(jq -r '.listen_port // 0' <<< "$inbound")
     cert_path=$(jq -r '.tls.certificate_path // ""' <<< "$inbound")
     user_count=$(jq -r '(.users // []) | length' <<< "$inbound")
-    transport=tcp; security=; sni=$(jq -r '.tls.server_name // empty' <<< "$inbound")
+    transport=tcp; security=; sni=$(jq -r '[.tls.server_name, .tls.reality.handshake.server] | map(select(type == "string" and length > 0)) | .[0] // empty' <<< "$inbound")
     case "$type" in
       vless)
         [ "$(jq -r '.tls.reality.enabled // false' <<< "$inbound")" = true ] && [ "$(jq -r '.transport.type // "tcp"' <<< "$inbound")" != ws ] || { kns_emit_error unsupported_legacy_node '仅支持导入 VLESS Reality，不支持 WS/Argo。'; return 1; }
@@ -6104,6 +6231,19 @@ kns_dispatch() {
         KNS_INSTANCE_FILE=$(kns_instance_file "$KNS_INSTANCE_ID")
         if ! command -v jq >/dev/null 2>&1; then printf '{"schema":1,"adapterVersion":"%s","error":{"code":"missing_dependency"}}\n' "$KNS_ADAPTER_VERSION"; return 1; fi
         kns_status ;;
+      runtime-status)
+        if ! command -v jq >/dev/null 2>&1 || ! command -v sha256sum >/dev/null 2>&1; then printf '{"schema":1,"adapterVersion":"%s","error":{"code":"missing_dependency"}}\n' "$KNS_ADAPTER_VERSION"; return 1; fi
+        kns_runtime_status ;;
+      update-script)
+        ensure_deps jq curl sha256sum || { kns_emit_error missing_dependency 'OneBox 脚本升级需要 jq、curl 和 sha256sum。'; return 1; }
+        kns_request_validate || return 1
+        require_config readonly || { kns_emit_error onebox_not_installed 'OneBox 配置不存在或不可读。'; return 1; }
+        kns_update_script ;;
+      update-kernel)
+        ensure_deps jq curl wget tar gzip sha256sum || { kns_emit_error missing_dependency 'sing-box 内核升级需要 jq、curl/wget、tar、gzip 和 sha256sum。'; return 1; }
+        kns_request_validate || return 1
+        require_config || { kns_emit_error onebox_not_installed 'OneBox 配置不存在。'; return 1; }
+        kns_update_kernel ;;
       uninstall)
         ensure_deps jq curl || { kns_emit_error missing_dependency 'OneBox 需要 jq 和 curl。'; return 1; }
         kns_request_validate || return 1
@@ -6133,8 +6273,8 @@ kns_main() {
     shift || :
     KNS_COMMAND="$command" KNS_REQUEST_FILE="" KNS_INSTANCE_ID="" KNS_YES=0
     local -a forwarded=("$@")
-    case "$KNS_COMMAND" in schema|list|discover) [ "$#" = 0 ] || { printf '{"success":false,"error":{"code":"invalid_arguments"}}\n'; return 2; } ;;
-      status|uninstall|install|reconfigure|reinstall|enable|disable|import) ;;
+    case "$KNS_COMMAND" in schema|list|discover|runtime-status) [ "$#" = 0 ] || { printf '{"success":false,"error":{"code":"invalid_arguments"}}\n'; return 2; } ;;
+      status|uninstall|install|reconfigure|reinstall|enable|disable|import|update-script|update-kernel) ;;
       *) printf '{"success":false,"error":{"code":"invalid_command"}}\n'; return 2 ;;
     esac
     while [ "$#" -gt 0 ]; do
@@ -6148,7 +6288,7 @@ kns_main() {
     done
     NON_INTERACTIVE=1
     case "$KNS_COMMAND" in
-      install|reconfigure|reinstall|enable|disable|uninstall|import) [ -n "$KNS_REQUEST_FILE" ] && [ -z "$KNS_INSTANCE_ID" ] || { printf '{"success":false,"error":{"code":"invalid_arguments"}}\n'; return 2; } ;;
+      install|reconfigure|reinstall|enable|disable|uninstall|import|update-script|update-kernel) [ -n "$KNS_REQUEST_FILE" ] && [ -z "$KNS_INSTANCE_ID" ] || { printf '{"success":false,"error":{"code":"invalid_arguments"}}\n'; return 2; } ;;
       status) [ -z "$KNS_REQUEST_FILE" ] && [[ "$KNS_INSTANCE_ID" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]] || { printf '{"success":false,"error":{"code":"invalid_arguments"}}\n'; return 2; } ;;
     esac
     detect_environment || return $?
@@ -6160,11 +6300,11 @@ kns_main() {
       import)
         onebox_require_pid_headroom 5 'KNS 旧节点导入' || { printf '{"schema":1,"adapterVersion":"%s","error":{"code":"low_pid_headroom"}}\n' "$KNS_ADAPTER_VERSION"; return 1; }
         onebox_require_memory_headroom $((32 * 1024 * 1024)) 'KNS 旧节点导入' || { printf '{"schema":1,"adapterVersion":"%s","error":{"code":"low_memory_headroom"}}\n' "$KNS_ADAPTER_VERSION"; return 1; } ;;
-      install|reconfigure|reinstall|enable|disable|uninstall)
+      install|reconfigure|reinstall|enable|disable|uninstall|update-script|update-kernel)
         onebox_require_pid_headroom 8 "KNS $KNS_COMMAND" || { printf '{"schema":1,"adapterVersion":"%s","error":{"code":"low_pid_headroom"}}\n' "$KNS_ADAPTER_VERSION"; return 1; }
         onebox_require_memory_headroom $((64 * 1024 * 1024)) "KNS $KNS_COMMAND" || { printf '{"schema":1,"adapterVersion":"%s","error":{"code":"low_memory_headroom"}}\n' "$KNS_ADAPTER_VERSION"; return 1; } ;;
     esac
-    if [ "$KNS_COMMAND" = status ] || [ "$KNS_COMMAND" = list ] || [ "$KNS_COMMAND" = discover ]; then kns_dispatch; return $?; fi
+    if [ "$KNS_COMMAND" = status ] || [ "$KNS_COMMAND" = list ] || [ "$KNS_COMMAND" = discover ] || [ "$KNS_COMMAND" = runtime-status ]; then kns_dispatch; return $?; fi
     trap cleanup_on_exit EXIT
     trap cleanup_on_interrupt INT
     trap 'exit 143' TERM
