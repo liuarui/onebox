@@ -109,7 +109,7 @@ KNS_INSTANCES_DIR="$KNS_STATE_DIR/instances"
 KNS_CERTS_DIR="$KNS_STATE_DIR/certs"
 KNS_REQUEST_DIR="/run/onebox/kns/requests"
 ONEBOX_SCRIPT_VERSION="1.0.1"
-KNS_ADAPTER_VERSION="1.7.0"
+KNS_ADAPTER_VERSION="1.8.0"
 
 KERNEL_TMP_DIR=""
 declare -a SB_OWNED_TEMP_FILES=()
@@ -5456,7 +5456,7 @@ kns_instance_file() { printf '%s/%s.json\n' "$KNS_INSTANCES_DIR" "$1"; }
 
 kns_schema() {
     cat <<EOF
-{"schema":1,"adapterVersion":"$KNS_ADAPTER_VERSION","scriptVersion":"$ONEBOX_SCRIPT_VERSION","runtime":{"engine":"sing-box","id":"onebox-main"},"commands":["install","reconfigure","reinstall","enable","disable","status","runtime-status","update-script","update-kernel","uninstall","list","discover","import","claim","schema"],"actions":["install","reconfigure","reinstall","enable","disable","uninstall","import","claim","update-script","update-kernel"],"protocols":{"vless":{"transports":["tcp"],"security":"reality"},"hysteria2":{"transports":["udp"]},"tuic":{"transports":["udp"]},"anytls":{"transports":["tcp"]},"shadowsocks":{"transports":["tcp+udp"]},"trojan":{"transports":["tcp"]},"vmess":{"transports":["tcp"]}},"request":{"required":["schema","jobId","machineUuid","action","runtime","idempotencyKey","report"],"instance":{"required":["id","protocol","listenPort","transport","options"],"optional":{"listenAddress":"::, 0.0.0.0, 127.0.0.1, or ::1; default ::","legacyTag":"existing inbound tag for read-only import or explicit claim"},"options":{"security":"reality for vless","sni":"optional for VLESS Reality (automatically optimized by OneBox); required for other TLS protocols","method":"optional for shadowsocks","alpn":"optional TLS ALPN array","allowInsecure":"optional client skip-cert-verify boolean","flow":"optional VLESS flow, default xtls-rprx-vision","fingerprint":"optional Reality client fingerprint","spiderX":"optional Reality spiderX path","upMbps":"optional Hysteria2 upload Mbps","downMbps":"optional Hysteria2 download Mbps","obfs":"optional Hysteria2 obfs type (salamander)","obfsPassword":"optional Hysteria2 obfs password","alterId":"optional VMess alterId, default 0","cipher":"optional VMess cipher, default auto","congestionControl":"optional TUIC congestion control, default bbr","udpRelayMode":"optional TUIC UDP relay mode, default native"}},"upgrade":{"update-script":{"scriptSha256":"fixed SHA-256 of the trusted installer artifact; instance is null"},"update-kernel":{"version":"latest stable sing-box release; instance is null"}}},"callback":{"method":"POST","contentType":"application/json","authorization":"Bearer report.oneTimeToken","successStatus":"any HTTP 2xx"},"result":{"stdout":"redacted JSON; never contains node credentials","discovery":"metadata only; never contains credentials","runtimeStatus":{"oneboxScriptVersion":"string","oneboxScriptSha256":"sha256","singBoxVersion":"semver","serviceState":"active, inactive, or unknown"},"operationResult":"script or kernel upgrade result with versions and checksums"},"requestTransport":"root-owned mode-0600 JSON file"}
+{"schema":1,"adapterVersion":"$KNS_ADAPTER_VERSION","scriptVersion":"$ONEBOX_SCRIPT_VERSION","runtime":{"engine":"sing-box","id":"onebox-main"},"commands":["install","reconfigure","reinstall","enable","disable","status","runtime-status","update-script","update-kernel","uninstall","list","discover","import","claim","schema"],"actions":["install","reconfigure","reinstall","enable","disable","uninstall","import","claim","update-script","update-kernel"],"protocols":{"vless":{"transports":["tcp"],"security":"reality"},"hysteria2":{"transports":["udp"]},"tuic":{"transports":["udp"]},"anytls":{"transports":["tcp"]},"shadowsocks":{"transports":["tcp+udp"]},"trojan":{"transports":["tcp"]},"vmess":{"transports":["tcp"]}},"request":{"required":["schema","jobId","machineUuid","action","runtime","idempotencyKey","report"],"instance":{"required":["id","protocol","listenPort","transport","options"],"optional":{"listenAddress":"::, 0.0.0.0, 127.0.0.1, or ::1; default ::","legacyTag":"existing inbound tag for read-only import or explicit claim"},"options":{"security":"reality for vless","sni":"optional for VLESS Reality (automatically optimized by OneBox); required for other TLS protocols","method":"optional for shadowsocks","alpn":"optional TLS ALPN array","allowInsecure":"optional client skip-cert-verify boolean","flow":"optional VLESS flow, default xtls-rprx-vision","fingerprint":"optional Reality client fingerprint","spiderX":"optional Reality spiderX path","handshakeServer":"optional Reality handshake server host","handshakePort":"optional Reality handshake server port","upMbps":"optional Hysteria2 upload Mbps","downMbps":"optional Hysteria2 download Mbps","obfs":"optional Hysteria2 obfs type (salamander)","obfsPassword":"optional Hysteria2 obfs password","alterId":"optional VMess alterId, default 0","cipher":"optional VMess cipher, default auto","congestionControl":"optional TUIC congestion control, default bbr","udpRelayMode":"optional TUIC UDP relay mode, default native"}},"upgrade":{"update-script":{"scriptSha256":"fixed SHA-256 of the trusted installer artifact; instance is null"},"update-kernel":{"version":"latest stable sing-box release; instance is null"}}},"callback":{"method":"POST","contentType":"application/json","authorization":"Bearer report.oneTimeToken","successStatus":"any HTTP 2xx"},"result":{"stdout":"redacted JSON; never contains node credentials","discovery":"metadata only; never contains credentials","runtimeStatus":{"oneboxScriptVersion":"string","oneboxScriptSha256":"sha256","singBoxVersion":"semver","serviceState":"active, inactive, or unknown"},"operationResult":"script or kernel upgrade result with versions and checksums"},"requestTransport":"root-owned mode-0600 JSON file"}
 EOF
 }
 
@@ -5732,7 +5732,7 @@ kns_request_validate() {
          ((.instance.listenAddress // "::") | type == "string" and length > 0 and length <= 45) and
          (.instance.transport as $transport | (["tcp","udp","tcp+udp"] | index($transport)) != null) and
          (if ($action == "import" or $action == "claim") then (.instance.legacyTag | type == "string" and test("^[A-Za-z0-9._:-]{1,128}$")) else ((.instance | has("legacyTag")) | not) end) and
-         (.instance.options | type == "object" and ((keys - ["security","sni","method","alpn","allowInsecure","flow","fingerprint","spiderX","upMbps","downMbps","obfs","obfsPassword","alterId","cipher","congestionControl","udpRelayMode"]) | length == 0))
+         (.instance.options | type == "object" and ((keys - ["security","sni","method","alpn","allowInsecure","flow","fingerprint","spiderX","handshakeServer","handshakePort","upMbps","downMbps","obfs","obfsPassword","alterId","cipher","congestionControl","udpRelayMode"]) | length == 0))
        end) and
       (.report | type == "object" and ((keys - ["callback","oneTimeToken"]) | length == 0)) and
       (.report.callback | type == "string" and test("^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?/[A-Za-z0-9._~/-]*$")) and
@@ -5756,6 +5756,8 @@ kns_request_validate() {
     KNS_FLOW=$(jq -r '.instance.options.flow // "xtls-rprx-vision"' "$request")
     KNS_FINGERPRINT=$(jq -r '.instance.options.fingerprint // "chrome"' "$request")
     KNS_SPIDER_X=$(jq -r '.instance.options.spiderX // empty' "$request")
+    KNS_HANDSHAKE_SERVER=$(jq -r '.instance.options.handshakeServer // empty' "$request")
+    KNS_HANDSHAKE_PORT=$(jq -r '.instance.options.handshakePort // 443' "$request")
     KNS_UP_MBPS=$(jq -r '.instance.options.upMbps // 0' "$request")
     KNS_DOWN_MBPS=$(jq -r '.instance.options.downMbps // 0' "$request")
     KNS_OBFS=$(jq -r '.instance.options.obfs // empty' "$request")
@@ -5805,6 +5807,9 @@ kns_request_validate() {
     case "$KNS_FLOW" in ''|xtls-rprx-vision) ;; *) kns_emit_error invalid_request 'flow 只支持 xtls-rprx-vision 或留空。'; return 1 ;; esac
     case "$KNS_FINGERPRINT" in chrome|firefox|safari|ios|android|edge|360|qq|random) ;; *) kns_emit_error invalid_request 'fingerprint 不受支持。'; return 1 ;; esac
     if [ -n "$KNS_SPIDER_X" ] && [ "${#KNS_SPIDER_X}" -gt 256 ]; then kns_emit_error invalid_request 'spiderX 过长。'; return 1; fi
+    if [ -n "$KNS_HANDSHAKE_SERVER" ]; then valid_host "$KNS_HANDSHAKE_SERVER" || { kns_emit_error invalid_request 'handshakeServer 必须是有效域名或 IP。'; return 1; }; fi
+    case "$KNS_HANDSHAKE_PORT" in ''|*[!0-9]*) kns_emit_error invalid_request 'handshakePort 必须是 1–65535 的整数。'; return 1 ;; esac
+    [ "$KNS_HANDSHAKE_PORT" -ge 1 ] && [ "$KNS_HANDSHAKE_PORT" -le 65535 ] || { kns_emit_error invalid_request 'handshakePort 必须是 1–65535 的整数。'; return 1; }
     case "$KNS_UP_MBPS" in ''|*[!0-9]*) kns_emit_error invalid_request 'upMbps 必须是非负整数。'; return 1 ;; esac
     case "$KNS_DOWN_MBPS" in ''|*[!0-9]*) kns_emit_error invalid_request 'downMbps 必须是非负整数。'; return 1 ;; esac
     case "$KNS_OBFS" in ''|salamander) ;; *) kns_emit_error invalid_request 'obfs 只支持 salamander 或留空。'; return 1 ;; esac
@@ -5878,7 +5883,7 @@ kns_generate_node() {
             short_id=$(/usr/local/lib/onebox/sing-box generate rand --hex 4 2>/dev/null) || return 1
         fi
         [ -n "$private_key" ] && [ -n "$public_key" ] && [ -n "$short_id" ] || return 1
-        KNS_INBOUND=$(jq -cn --arg tag "$tag" --arg addr "$KNS_LISTEN_ADDR" --arg uuid "$uuid" --arg sni "$KNS_SNI" --arg pk "$private_key" --arg sid "$short_id" --arg flow "$KNS_FLOW" --argjson alpn "$KNS_ALPN_EFFECTIVE" --argjson p "$port" '{type:"vless",tag:$tag,listen:$addr,listen_port:$p,users:[{uuid:$uuid,flow:$flow}],tls:{enabled:true,server_name:$sni,alpn:$alpn,reality:{enabled:true,handshake:{server:$sni,server_port:443},private_key:$pk,short_id:[$sid]}}}') || return 1
+        KNS_INBOUND=$(jq -cn --arg tag "$tag" --arg addr "$KNS_LISTEN_ADDR" --arg uuid "$uuid" --arg sni "$KNS_SNI" --arg pk "$private_key" --arg sid "$short_id" --arg flow "$KNS_FLOW" --argjson alpn "$KNS_ALPN_EFFECTIVE" --arg hs "$KNS_HANDSHAKE_SERVER" --argjson hp "$KNS_HANDSHAKE_PORT" --argjson p "$port" '{type:"vless",tag:$tag,listen:$addr,listen_port:$p,users:[{uuid:$uuid,flow:$flow}],tls:{enabled:true,server_name:$sni,alpn:$alpn,reality:{enabled:true,handshake:{server:(if $hs == "" then $sni else $hs end),server_port:$hp},private_key:$pk,short_id:[$sid]}}}') || return 1
         KNS_CLIENT=$(jq -cn --arg uuid "$uuid" --arg sni "$KNS_SNI" --arg pub "$public_key" --arg sid "$short_id" --arg flow "$KNS_FLOW" --argjson alpn "$KNS_ALPN_EFFECTIVE" '{credentials:{uuid:$uuid,flow:$flow},tls:{enabled:true,security:"reality",server_name:$sni,public_key:$pub,short_id:$sid,alpn:$alpn}}') || return 1
         ;;
       hysteria2)

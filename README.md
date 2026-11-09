@@ -216,7 +216,7 @@ onebox add --protocol argo --tag argo-1 --port 18080 \
 
 ## Komari KNS 适配器
 
-`onebox kns` schema 1 适配器版本为 `1.7.0`，支持历史节点只读发现、只读凭据导入、显式接管，以及 KNS 节点安装/状态/启停/重装/重配置/卸载和 Runtime 维护。`discover` 只返回 tag、协议、监听和可导入性，不返回凭据；`import` 只读取支持的旧节点并交给 KNS 加密保存，不修改 OneBox 配置。`claim` 会把一个受支持的旧入站迁移到 KNS 专属 tag 并写入受限权限的实例清单，保留原协议、端口、凭据和 TLS 配置；配置校验、共享服务重载或一次性 HTTPS 回调失败时会尝试回滚。接管后可通过 KNS 重配置、启停、重装和卸载该实例。接管和卸载都会重载共享 sing-box 服务，可能短暂影响同机其他节点；卸载只删除该 KNS 实例，不会停止或移除共享服务。只读 `status` 返回资源归属、共享引用计数和卸载预览。当前支持单用户 VLESS Reality、Hysteria2、TUIC、AnyTLS 和 Shadowsocks；VLESS WS/Argo、多用户节点和不完整配置会显示为暂不支持。停用或卸载仅在共享配置不再引用对应端口/协议时清理防火墙规则。回调包含协议凭据和 TLS 参数（包括 ALPN）。
+`onebox kns` schema 1 适配器版本为 `1.8.0`，支持历史节点只读发现、只读凭据导入、显式接管，以及 KNS 节点安装/状态/启停/重装/重配置/卸载和 Runtime 维护。`discover` 只返回 tag、协议、监听和可导入性，不返回凭据；`import` 只读取支持的旧节点并交给 KNS 加密保存，不修改 OneBox 配置。`claim` 会把一个受支持的旧入站迁移到 KNS 专属 tag 并写入受限权限的实例清单，保留原协议、端口、凭据和 TLS 配置；配置校验、共享服务重载或一次性 HTTPS 回调失败时会尝试回滚。接管后可通过 KNS 重配置、启停、重装和卸载该实例。接管和卸载都会重载共享 sing-box 服务，可能短暂影响同机其他节点；卸载只删除该 KNS 实例，不会停止或移除共享服务。只读 `status` 返回资源归属、共享引用计数和卸载预览。当前支持单用户 VLESS Reality、Hysteria2、TUIC、AnyTLS 和 Shadowsocks；VLESS WS/Argo、多用户节点和不完整配置会显示为暂不支持。停用或卸载仅在共享配置不再引用对应端口/协议时清理防火墙规则。回调包含协议凭据和 TLS 参数（包括 ALPN）。
 
 小内存或低 PID 限额 LXC 会优先走串行路径：Reality 自动检测按可见 cgroup PID/内存余量降到单任务；旧节点发现批量读取端口元数据，避免每个 inbound 单独启动 jq；证书域名优先使用 OneBox secrets/配置，缺失时最多启动一个 openssl 进程读取证书 CN，不再启动多进程管道。检测到的剩余 PID 少于 3 时跳过 KNS 发现，导入少于 5 时跳过，安装/依赖变更少于 8 时跳过；可见可用内存低于 16/32/64 MiB 时，也会分别跳过发现/导入/安装和依赖变更，避免在余量不足时启动重操作。Linux cgroup 的 `pids.current` 统计内核 task，包含线程，因此 20–30 的总额度还要扣除容器 init、Komari Agent、sing-box 和其他进程/线程。剩余额度是启动前采样，不是预留；其他系统进程仍可能抢占，隐藏的宿主机限制也无法探测，因此预检不是硬资源保证。运行仍需要 Bash 4+、jq（导入还需 curl 与支持 `--close` 的 flock），并要求 systemd 或 OpenRC；在无 init 容器或依赖缺失且无法预装的环境中不保证可用。
 
@@ -267,7 +267,7 @@ install -o root -g root -m 0600 /dev/null /run/onebox/kns/requests/job-001.json
 }
 ```
 
-当前支持 VLESS + Reality（TCP）、Hysteria 2（UDP）、TUIC（UDP）、AnyTLS（TCP）、Trojan（TCP）、VMess（TCP）和 Shadowsocks（TCP + UDP）。VLESS 的 `options.security` 固定为 `reality`；需要 TLS 的其他协议须提供有效的 `options.sni`。Shadowsocks 可通过 `options.method` 指定加密方法。可选参数：`alpn`（1–8 个字符串）、`allowInsecure`（布尔）；VLESS 另支持 `flow`、`fingerprint`、`spiderX`；Hysteria2 另支持 `upMbps`、`downMbps`、`obfs`、`obfsPassword`；VMess 另支持 `alterId`、`cipher`；TUIC 另支持 `congestionControl`、`udpRelayMode`。
+当前支持 VLESS + Reality（TCP）、Hysteria 2（UDP）、TUIC（UDP）、AnyTLS（TCP）、Trojan（TCP）、VMess（TCP）和 Shadowsocks（TCP + UDP）。VLESS 的 `options.security` 固定为 `reality`；需要 TLS 的其他协议须提供有效的 `options.sni`。Shadowsocks 可通过 `options.method` 指定加密方法。可选参数：`alpn`（1–8 个字符串）、`allowInsecure`（布尔）；VLESS 另支持 `flow`、`fingerprint`、`spiderX`、`handshakeServer`、`handshakePort`；Hysteria2 另支持 `upMbps`、`downMbps`、`obfs`、`obfsPassword`；VMess 另支持 `alterId`、`cipher`；TUIC 另支持 `congestionControl`、`udpRelayMode`。
 
 可选的 `instance.listenAddress` 仅支持 `::`、`0.0.0.0`、`127.0.0.1` 或 `::1`，默认 `::`。它控制本机监听接口；订阅发布使用的公网域名或地址由 Komari 插件另行配置。
 
