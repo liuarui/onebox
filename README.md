@@ -84,22 +84,21 @@ sh install.sh install --version 1.14.3
 
 自动优选支持快速检测、全部候选、分类多选、地区推荐或自定义域名/网址列表，也可调整次数、超时和并发。检测成功时从通过的结果中选择；检测范围或结果菜单的 `0` 取消本次操作，不会触发预设回退。预设不代表已通过本机测速或 Reality 连接验证，选择后仍需确认实际连接。
 
-内置 **91 个候选、10 类分类、9 个地区**。域名、分类和地区集中维护在 `install.sh` 的 `reality_sni_catalog()`，运行时无需下载或执行外部检测脚本。内置列表、自定义列表和显式指定的 Reality SNI 均排除 `apple.com`、`icloud.com`、`mzstatic.com` 及其子域名。
+内置 **83 个候选、9 类分类、9 个地区**。域名、分类和地区集中维护在 `install.sh` 的 `reality_sni_catalog()`，运行时无需下载或执行外部检测脚本。内置列表、自定义列表和显式指定的 Reality SNI 均排除 `apple.com`、`icloud.com`、`mzstatic.com` 及其子域名。
 
 | 分类键 | 分类 | 数量 |
 | --- | --- | --- |
 | `cdn` | 全球 CDN / anycast | 2 |
-| `cloud` | 云 / 开发基础设施 | 10 |
+| `cloud` | 云 / 开发基础设施 | 8 |
 | `tech` | 科技 / 半导体大厂 | 14 |
-| `fin` | 金融 / 支付 / 银行 | 10 |
-| `edu` | 大学 / 教育机构 | 23 |
+| `fin` | 金融 / 支付 / 银行 | 9 |
+| `edu` | 大学 / 教育机构 | 20 |
 | `media` | 流媒体 / 内容 | 1 |
-| `social` | 社交平台 | 2 |
 | `gaming` | 游戏平台 | 8 |
 | `ecom` | 电商 / 零售 / 品牌 | 10 |
 | `region` | 区域锚点 | 11 |
 
-快速检测取 `cdn,cloud,tech`，共 26 个站点。地区键为 `global`（全球通用）、`us`（美国/北美）、`eu`（欧洲）、`jp`（日本）、`hk`（香港）、`sg`（东南亚/新加坡）、`cn`（中国大陆）、`au`（澳洲）、`kr`（韩国）。选择某地区会检测该区站点加全球通用站；`global` 只测全球通用站，`all` 不限制地区。地区标签按站点归属分类，韩国包括 Samsung、LG；标签不是站点 IP 地理定位，也不保证请求实际落在该地区。
+快速检测取 `cdn,cloud,tech`，共 24 个站点。地区键为 `global`（全球通用）、`us`（美国/北美）、`eu`（欧洲）、`jp`（日本）、`hk`（香港）、`sg`（东南亚/新加坡）、`cn`（中国大陆）、`au`（澳洲）、`kr`（韩国）。选择某地区会检测该区站点加全球通用站；`global` 只测全球通用站，`all` 不限制地区。地区标签按站点归属分类，韩国包括 Samsung、LG；标签不是站点 IP 地理定位，也不保证请求实际落在该地区。
 
 每站使用 curl 检查 TLS 1.3、X25519、证书主机名/信任及实际 HTTP/2（h2）响应，不再启动 `openssl s_client`。HTTP 状态码为 403 等不影响 TLS 筛选。需要 curl ≥ 7.73、OpenSSL ≥ 1.1.1 TLS 后端和 HTTP2 支持；缺失依赖会自动安装，现有 curl 功能不足则提示并回退到预设，也可通过系统软件源升级 curl 或显式指定 `--sni`。curl ≥ 7.88 时统计服务端提供的证书链长度；旧版标为链长度未知，排在已知链之后。
 
@@ -109,7 +108,7 @@ sh install.sh install --version 1.14.3
 
 通过检查的短链站点（不超过 3 层）优先，同组按握手完成耗时排序；长链站点标为备选。耗时使用 `curl time_appconnect`，包含 DNS、TCP 和 TLS，不是纯 TLS 用时。自动推荐要求目标能返回 HTTP/2 响应，只有 TLS 握手成功而 HTTP 请求异常的站点不会入选。自动检测是 TLS 条件筛选，不能替代真实客户端的 Reality 连接验证；结果只代表服务器当前网络。
 
-无交互模式省略 `--sni` 时自动检测 **全部 91 个候选**并选择排名第一的站点，不等待输入；检测失败或资源不足时自动使用第一个预设 `www.intel.com`，并提示未经本机测速。显式指定 `--sni DOMAIN` 可跳过自动检测；请将 `DOMAIN` 替换为你确认可用的域名。
+无交互模式省略 `--sni` 时自动检测 **全部 83 个候选**并选择排名第一的站点，不等待输入；检测失败或资源不足时自动使用第一个预设 `www.intel.com`，并提示未经本机测速。显式指定 `--sni DOMAIN` 可跳过自动检测；请将 `DOMAIN` 替换为你确认可用的域名。
 
 ```sh
 # 日本地区站点＋全球通用站，自动选择第一名
@@ -217,7 +216,7 @@ onebox add --protocol argo --tag argo-1 --port 18080 \
 
 ## Komari KNS 适配器
 
-`onebox kns` schema 1 适配器版本为 `1.5.0`，提供历史节点只读发现与凭据导入、KNS 节点安装/状态/启停/重装/重配置/卸载，以及两个独立的 Runtime 维护操作：更新 OneBox 管理脚本和升级 sing-box 内核。`discover` 只返回 tag、协议、监听和可导入性，不返回凭据；`import` 要求一次性 HTTPS 回调，只读取支持的旧节点配置并交给 KNS 加密保存，不改写 OneBox 配置或服务。导入实例标记为外部只读资源，不能通过 KNS 重配置、停用或卸载。当前支持单用户 VLESS Reality、Hysteria2、TUIC、AnyTLS 和 Shadowsocks；VLESS WS/Argo、多用户节点和不完整配置会显示为不可导入。管理操作复用 OneBox 的 sing-box 服务；只读 `status` 返回资源归属、共享引用计数和卸载预览。停用或卸载仅在共享配置不再引用对应端口/协议时清理防火墙规则；卸载不会停止或卸载共享服务，但会重载服务。回调包含协议凭据和 TLS 参数（包括 ALPN）。
+`onebox kns` schema 1 适配器版本为 `1.6.0`，支持历史节点只读发现、只读凭据导入、显式接管，以及 KNS 节点安装/状态/启停/重装/重配置/卸载和 Runtime 维护。`discover` 只返回 tag、协议、监听和可导入性，不返回凭据；`import` 只读取支持的旧节点并交给 KNS 加密保存，不修改 OneBox 配置。`claim` 会把一个受支持的旧入站迁移到 KNS 专属 tag 并写入受限权限的实例清单，保留原协议、端口、凭据和 TLS 配置；配置校验、共享服务重载或一次性 HTTPS 回调失败时会尝试回滚。接管后可通过 KNS 重配置、启停、重装和卸载该实例。接管和卸载都会重载共享 sing-box 服务，可能短暂影响同机其他节点；卸载只删除该 KNS 实例，不会停止或移除共享服务。只读 `status` 返回资源归属、共享引用计数和卸载预览。当前支持单用户 VLESS Reality、Hysteria2、TUIC、AnyTLS 和 Shadowsocks；VLESS WS/Argo、多用户节点和不完整配置会显示为暂不支持。停用或卸载仅在共享配置不再引用对应端口/协议时清理防火墙规则。回调包含协议凭据和 TLS 参数（包括 ALPN）。
 
 小内存或低 PID 限额 LXC 会优先走串行路径：Reality 自动检测按可见 cgroup PID/内存余量降到单任务；旧节点发现批量读取端口元数据，避免每个 inbound 单独启动 jq；证书域名优先使用 OneBox secrets/配置，缺失时最多启动一个 openssl 进程读取证书 CN，不再启动多进程管道。检测到的剩余 PID 少于 3 时跳过 KNS 发现，导入少于 5 时跳过，安装/依赖变更少于 8 时跳过；可见可用内存低于 16/32/64 MiB 时，也会分别跳过发现/导入/安装和依赖变更，避免在余量不足时启动重操作。Linux cgroup 的 `pids.current` 统计内核 task，包含线程，因此 20–30 的总额度还要扣除容器 init、Komari Agent、sing-box 和其他进程/线程。剩余额度是启动前采样，不是预留；其他系统进程仍可能抢占，隐藏的宿主机限制也无法探测，因此预检不是硬资源保证。运行仍需要 Bash 4+、jq（导入还需 curl 与支持 `--close` 的 flock），并要求 systemd 或 OpenRC；在无 init 容器或依赖缺失且无法预装的环境中不保证可用。
 
@@ -231,6 +230,7 @@ onebox kns update-script --request-file /run/onebox/kns/requests/script-update.j
 onebox kns update-kernel --request-file /run/onebox/kns/requests/kernel-update.json
 onebox kns install --request-file /run/onebox/kns/requests/job-001.json
 onebox kns import --request-file /run/onebox/kns/requests/import-001.json
+onebox kns claim --request-file /run/onebox/kns/requests/claim-001.json
 onebox kns reconfigure --request-file /run/onebox/kns/requests/job-002.json
 onebox kns reinstall --request-file /run/onebox/kns/requests/job-003.json
 onebox kns disable --request-file /run/onebox/kns/requests/job-004.json
