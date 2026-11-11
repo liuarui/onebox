@@ -108,7 +108,7 @@ KNS_STATE_DIR="$CONFIG_DIR/kns"
 KNS_INSTANCES_DIR="$KNS_STATE_DIR/instances"
 KNS_CERTS_DIR="$KNS_STATE_DIR/certs"
 KNS_REQUEST_DIR="/run/onebox/kns/requests"
-ONEBOX_SCRIPT_VERSION="1.0.2"
+ONEBOX_SCRIPT_VERSION="1.0.3"
 KNS_ADAPTER_VERSION="1.8.0"
 
 KERNEL_TMP_DIR=""
@@ -1964,8 +1964,10 @@ onebox_require_memory_headroom() {
     local minimum="$1" operation="$2"
     onebox_probe_memory_budget
     if [ "$sni_memory_headroom" -ge 0 ] && [ "$sni_memory_headroom" -lt "$minimum" ]; then
+        KNS_MEMORY_AVAILABLE_MIB=$((sni_memory_headroom / 1024 / 1024))
+        KNS_MEMORY_REQUIRED_MIB=$(((minimum + 1024 * 1024 - 1) / 1024 / 1024))
         printf '[错误] 可用内存不足，已跳过 %s（约 %s MiB，至少需要 %s MiB；来源：%s）。请稍后重试或提高容器内存限额。\n' \
-            "$operation" "$((sni_memory_headroom / 1024 / 1024))" "$((minimum / 1024 / 1024))" "$sni_memory_source" >&2
+            "$operation" "$KNS_MEMORY_AVAILABLE_MIB" "$KNS_MEMORY_REQUIRED_MIB" "$sni_memory_source" >&2
         return 1
     fi
     return 0
@@ -6443,13 +6445,16 @@ kns_main() {
     case "$KNS_COMMAND" in
       discover|list)
         onebox_require_pid_headroom 3 "KNS $KNS_COMMAND" || { printf '{"schema":1,"adapterVersion":"%s","error":{"code":"low_pid_headroom"}}\n' "$KNS_ADAPTER_VERSION"; return 1; }
-        onebox_require_memory_headroom $((16 * 1024 * 1024)) "KNS $KNS_COMMAND" || { printf '{"schema":1,"adapterVersion":"%s","error":{"code":"low_memory_headroom"}}\n' "$KNS_ADAPTER_VERSION"; return 1; } ;;
+        onebox_require_memory_headroom $((8 * 1024 * 1024)) "KNS $KNS_COMMAND" || { printf '{"schema":1,"adapterVersion":"%s","error":{"code":"low_memory_headroom","availableMiB":%s,"requiredMiB":%s}}\n' "$KNS_ADAPTER_VERSION" "$KNS_MEMORY_AVAILABLE_MIB" "$KNS_MEMORY_REQUIRED_MIB"; return 1; } ;;
       import)
         onebox_require_pid_headroom 5 'KNS 旧节点导入' || { printf '{"schema":1,"adapterVersion":"%s","error":{"code":"low_pid_headroom"}}\n' "$KNS_ADAPTER_VERSION"; return 1; }
-        onebox_require_memory_headroom $((32 * 1024 * 1024)) 'KNS 旧节点导入' || { printf '{"schema":1,"adapterVersion":"%s","error":{"code":"low_memory_headroom"}}\n' "$KNS_ADAPTER_VERSION"; return 1; } ;;
-      install|reconfigure|reinstall|enable|disable|uninstall|claim|update-script|update-kernel)
+        onebox_require_memory_headroom $((32 * 1024 * 1024)) 'KNS 旧节点导入' || { printf '{"schema":1,"adapterVersion":"%s","error":{"code":"low_memory_headroom","availableMiB":%s,"requiredMiB":%s}}\n' "$KNS_ADAPTER_VERSION" "$KNS_MEMORY_AVAILABLE_MIB" "$KNS_MEMORY_REQUIRED_MIB"; return 1; } ;;
+      update-kernel)
         onebox_require_pid_headroom 8 "KNS $KNS_COMMAND" || { printf '{"schema":1,"adapterVersion":"%s","error":{"code":"low_pid_headroom"}}\n' "$KNS_ADAPTER_VERSION"; return 1; }
-        onebox_require_memory_headroom $((64 * 1024 * 1024)) "KNS $KNS_COMMAND" || { printf '{"schema":1,"adapterVersion":"%s","error":{"code":"low_memory_headroom"}}\n' "$KNS_ADAPTER_VERSION"; return 1; } ;;
+        onebox_require_memory_headroom $((64 * 1024 * 1024)) "KNS $KNS_COMMAND" || { printf '{"schema":1,"adapterVersion":"%s","error":{"code":"low_memory_headroom","availableMiB":%s,"requiredMiB":%s}}\n' "$KNS_ADAPTER_VERSION" "$KNS_MEMORY_AVAILABLE_MIB" "$KNS_MEMORY_REQUIRED_MIB"; return 1; } ;;
+      install|reconfigure|reinstall|enable|disable|uninstall|claim|update-script)
+        onebox_require_pid_headroom 8 "KNS $KNS_COMMAND" || { printf '{"schema":1,"adapterVersion":"%s","error":{"code":"low_pid_headroom"}}\n' "$KNS_ADAPTER_VERSION"; return 1; }
+        onebox_require_memory_headroom $((32 * 1024 * 1024)) "KNS $KNS_COMMAND" || { printf '{"schema":1,"adapterVersion":"%s","error":{"code":"low_memory_headroom","availableMiB":%s,"requiredMiB":%s}}\n' "$KNS_ADAPTER_VERSION" "$KNS_MEMORY_AVAILABLE_MIB" "$KNS_MEMORY_REQUIRED_MIB"; return 1; } ;;
     esac
     if [ "$KNS_COMMAND" = status ] || [ "$KNS_COMMAND" = list ] || [ "$KNS_COMMAND" = discover ] || [ "$KNS_COMMAND" = runtime-status ]; then kns_dispatch; return $?; fi
     trap cleanup_on_exit EXIT

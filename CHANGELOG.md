@@ -2,6 +2,12 @@
 
 本文件记录 OneBox 的正式版本变更。
 
+## [1.0.3] - 2026-11-11
+
+- Lower KNS memory preflight thresholds for read-only discovery and routine node changes so small-memory LXC probes are less likely to be blocked.
+- Keep a separate 64 MiB reserve for sing-box kernel upgrades and first-time dependency initialization.
+- Include measured available memory and the operation threshold in KNS resource errors.
+
 ## [1.0.2] - 2026-11-11
 
 - 默认根据 OneBox 当前公网出口 IP 所在地区优选 Reality SNI 候选。
