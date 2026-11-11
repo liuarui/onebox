@@ -108,7 +108,7 @@ KNS_STATE_DIR="$CONFIG_DIR/kns"
 KNS_INSTANCES_DIR="$KNS_STATE_DIR/instances"
 KNS_CERTS_DIR="$KNS_STATE_DIR/certs"
 KNS_REQUEST_DIR="/run/onebox/kns/requests"
-ONEBOX_SCRIPT_VERSION="1.0.1"
+ONEBOX_SCRIPT_VERSION="1.0.2"
 KNS_ADAPTER_VERSION="1.8.0"
 
 KERNEL_TMP_DIR=""
@@ -1645,6 +1645,29 @@ valid_reality_sni_region() {
     case "$1" in all|global|us|eu|jp|hk|sg|cn|au|kr) return 0 ;; *) return 1 ;; esac
 }
 
+reality_sni_region_from_country() {
+    case "${1^^}" in
+        HK) printf 'hk\n' ;;
+        JP) printf 'jp\n' ;;
+        SG|MY|TH|ID|PH|VN|KH|LA|MM|BN|TL) printf 'sg\n' ;;
+        CN) printf 'cn\n' ;;
+        AU|NZ) printf 'au\n' ;;
+        KR) printf 'kr\n' ;;
+        US|CA|MX) printf 'us\n' ;;
+        AD|AL|AT|BA|BE|BG|BY|CH|CY|CZ|DE|DK|EE|ES|FI|FR|GB|GR|HR|HU|IE|IS|IT|LI|LT|LU|LV|MC|MD|ME|MK|MT|NL|NO|PL|PT|RO|RS|SE|SI|SK|SM|UA|VA|XK) printf 'eu\n' ;;
+        *) printf 'global\n' ;;
+    esac
+}
+
+detect_reality_sni_region() {
+    local response country_code
+    command -v jq >/dev/null 2>&1 || return 1
+    response=$(curl -q --noproxy '*' -fsS --connect-timeout 2 --max-time 3 \
+        'https://ipwho.is/?fields=success,country_code' 2>/dev/null) || return 1
+    country_code=$(printf '%s' "$response" | jq -er 'select(.success == true and (.country_code | type == "string")) | .country_code | ascii_upcase' 2>/dev/null) || return 1
+    reality_sni_region_from_country "$country_code"
+}
+
 valid_reality_sni_categories() {
     local key input="${1//,/ }"
     local -a keys=()
@@ -1734,9 +1757,9 @@ configure_reality_sni_scan() {
     local mode selection key label count item categories candidate_text
     local -a keys=() entries=()
     while true; do
-        printf '\nSNI 检测范围：\n 1) 快速检测（CDN、云、科技）\n 2) 全部候选（默认）\n 3) 按分类检测（可多选）\n 4) 按地区推荐\n 5) 自定义域名/网址列表\n 6) 检测设置（次数=%s，超时=%ss，并发=%s）\n 0) 取消\n' "$sni_samples" "$sni_timeout" "$sni_jobs" >&2
-        ask '请选择 [0-6，默认: 2]: ' mode
-        case "${mode:-2}" in
+        printf '\nSNI 检测范围：\n 1) 快速检测（CDN、云、科技）\n 2) 全部候选\n 3) 按分类检测（可多选）\n 4) 按地区推荐\n 5) 自定义域名/网址列表\n 6) 检测设置（次数=%s，超时=%ss，并发=%s）\n 7) 自动识别当前出口 IP 地区（默认）\n 0) 取消\n' "$sni_samples" "$sni_timeout" "$sni_jobs" >&2
+        ask '请选择 [0-7，默认: 7]: ' mode
+        case "${mode:-7}" in
             0) return 130 ;;
             1) sni_region=all; sni_categories=cdn,cloud,tech; sni_hosts=""; return 0 ;;
             2) sni_region=all; sni_categories=all; sni_hosts=""; return 0 ;;
@@ -1763,7 +1786,7 @@ configure_reality_sni_scan() {
                 printf '[提示] 分类无效，请重新选择。\n' >&2 ;;
             4)
                 keys=()
-                printf '地区为静态归属标签；检测该区站点＋全球通用站，不进行 IP 地理定位。\n' >&2
+                printf '地区菜单按站点静态归属标签筛选；自动识别按本机出口 IP 选地区候选，不定位候选站点的 IP。\n' >&2
                 while read -r key label; do
                     keys+=("$key")
                     candidate_text=$(reality_sni_candidates "$key") || return 1
@@ -1787,6 +1810,7 @@ configure_reality_sni_scan() {
                 prompt_sni_integer '每站测速次数（1–5，取最小值）' "$sni_samples" 5 sni_samples || return 1
                 prompt_sni_integer '单次请求超时秒数（1–15）' "$sni_timeout" 15 sni_timeout || return 1
                 prompt_sni_integer '并发检测上限（1–16，按 PID/内存额度下调）' "$sni_jobs" 16 sni_jobs || return 1 ;;
+            7) sni_region=auto; sni_categories=all; sni_hosts=""; return 0 ;;
             *) printf '[提示] 请输入有效编号。\n' >&2 ;;
         esac
     done
@@ -2083,12 +2107,14 @@ run_reality_sni_selection() {
     trap - EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
-    local answer host score chain ranked index=0 slot batch_start=0 position completed=0 tier result scan_rc probe_rc
+    local answer host score chain ranked index=0 slot batch_start=0 position completed=0 tier region_priority candidate_region result scan_rc probe_rc
     local sni_effective_jobs sni_pid_headroom sni_pid_source sni_memory_headroom sni_memory_source sni_resource_reason sni_curl_certinfo worker launched pending last_jobs=0 sni_launch_abort=0
+    local category sni_detected_region
     local -a deadlines=()
     local sni_region="${CLI_SNI_REGION:-all}" sni_categories="${CLI_SNI_CATEGORIES:-all}" sni_hosts="${CLI_SNI_HOSTS:-}"
     local sni_samples="${CLI_SNI_SAMPLES:-3}" sni_timeout="${CLI_SNI_TIMEOUT:-5}" sni_jobs="${CLI_SNI_JOBS:-8}"
     local -a candidates=() matches=() hosts=()
+    local -A sni_host_regions=()
     # Persist in this isolated shell until its EXIT trap runs after function return.
     sni_work_dir=""; sni_pids=(); sni_poll_open=0
     trap cleanup_reality_sni_workers EXIT
@@ -2099,6 +2125,8 @@ run_reality_sni_selection() {
     if [ "$NON_INTERACTIVE" = 0 ]; then
         configure_reality_sni_scan; scan_rc=$?
         [ "$scan_rc" = 0 ] || return "$scan_rc"
+    elif [ "${CLI_SNI_REGION_EXPLICIT:-0}" != 1 ] && [ -z "$sni_hosts" ]; then
+        sni_region=auto
     fi
     # Check before dependency/candidate subprocesses, then recalculate for every batch.
     if ! onebox_safe_sni_jobs "$sni_jobs"; then
@@ -2109,6 +2137,15 @@ run_reality_sni_selection() {
         printf '[提示] 检测依赖不可用，无法自动优选 SNI。\n' >&2
         return 1
     fi
+    if [ "$sni_region" = auto ]; then
+        if sni_detected_region=$(detect_reality_sni_region); then
+            sni_region="$sni_detected_region"
+            printf '[提示] 根据当前出口 IP 地区选择候选组：%s；全球通用站作为备选。\n' "$sni_region" >&2
+        else
+            sni_region=all
+            printf '[提示] 无法识别当前出口 IP 地区，改为扫描全部地区候选。\n' >&2
+        fi
+    fi
     sni_work_dir=$(mktemp -d "${TMPDIR:-/tmp}/onebox-sni.XXXXXX") || return 1
     if ! check_reality_sni_curl; then
         return 1
@@ -2116,6 +2153,9 @@ run_reality_sni_selection() {
     result=$(reality_sni_candidates "$sni_region" "$sni_categories" "$sni_hosts") || return 1
     [ -n "$result" ] || { printf '[错误] 所选地区与分类没有候选，请调整筛选条件。\n' >&2; return 1; }
     mapfile -t candidates <<< "$result"
+    while read -r category candidate_region host; do
+        [ -n "$host" ] && sni_host_regions["$host"]="$candidate_region"
+    done < <(reality_sni_catalog)
     mkfifo "$sni_work_dir/poll" || return 1
     exec 9<>"$sni_work_dir/poll" || return 1
     sni_poll_open=1
@@ -2178,7 +2218,9 @@ run_reality_sni_selection() {
                 if [ "$probe_rc" = 0 ] && [[ "$score" =~ ^[0-9]+$ && "$chain" =~ ^[0-9]+$ ]]; then
                     tier=0; [ "$chain" -le 3 ] || tier=1
                     [ "$chain" != 0 ] || tier=2
-                    matches+=("$tier"$'\t'"$score"$'\t'"$chain"$'\t'"$host")
+                    region_priority=0
+                    if [ "$sni_region" != all ] && [ "${sni_host_regions[$host]:-}" != "$sni_region" ]; then region_priority=1; fi
+                    matches+=("$tier"$'\t'"$region_priority"$'\t'"$score"$'\t'"$chain"$'\t'"$host")
                     result="$chain 层"; [ "$chain" != 0 ] || result=未知
                     printf ' [%s/%s] %s：通过（证书链 %s）\n' "$completed" "${#candidates[@]}" "$host" "$result" >&2
                 else
@@ -2198,14 +2240,18 @@ run_reality_sni_selection() {
         printf '[提示] 没有候选通过全部检测。\n' >&2
         return 1
     fi
-    ranked=$(printf '%s\n' "${matches[@]}" | LC_ALL=C sort -k1,1n -k2,2n -k4,4) || return 1
-    printf '\n候选 SNI（短证书链优先，同组按多次 TCP/TLS 建连最小耗时排序；通过 %s/%s）：\n' "${#matches[@]}" "${#candidates[@]}" >&2
-    while IFS=$'\t' read -r tier score chain host; do
+    ranked=$(printf '%s\n' "${matches[@]}" | LC_ALL=C sort -k1,1n -k2,2n -k3,3n -k5,5) || return 1
+    printf '\n候选 SNI（短证书链优先；同链等级优先同地区候选，再按耗时排序；通过 %s/%s）：\n' "${#matches[@]}" "${#candidates[@]}" >&2
+    while IFS=$'\t' read -r tier region_priority score chain host; do
         hosts+=("$host"); index=$((index+1))
         result="约 $score ms"; [ "$score" != 2147483647 ] || result='耗时未测得'
         answer='短链'
         case "$tier" in 1) answer='长链备选，需验证兼容性' ;; 2) answer='链长度未知，需验证兼容性'; chain='未知' ;; esac
-        printf ' %s) %s（%s，链 %s 层，%s）\n' "$index" "$host" "$result" "$chain" "$answer" >&2
+        candidate_region=''
+        if [ "$sni_region" != all ]; then
+            [ "$region_priority" = 0 ] && candidate_region='地区匹配' || candidate_region='全球/其他备选'
+        fi
+        printf ' %s) %s（%s，链 %s 层，%s%s）\n' "$index" "$host" "$result" "$chain" "$answer" "${candidate_region:+，$candidate_region}" >&2
     done <<< "$ranked"
     if [ "$NON_INTERACTIVE" = 1 ]; then
         printf '[完成] 自动选择排名第一的 SNI：%s。检测仅代表本机当前网络。\n' "${hosts[0]}" >&2
@@ -5108,7 +5154,7 @@ add 选项:
                                无交互省略则自动优选，失败使用第一个预设
                                自签证书域名默认 bing.com
 Reality SNI 自动检测选项（仅 add --protocol reality）:
-  --sni-region all|global|us|eu|jp|hk|sg|cn|au|kr（默认 all）
+  --sni-region all|global|us|eu|jp|hk|sg|cn|au|kr（省略时自动识别出口 IP 地区）
   --sni-category all|cdn,cloud,tech,fin,edu,media,social,gaming,ecom,region
                                默认 all；与地区筛选取交集，地区包含全球通用站
   --sni-hosts 'HOST URL ...'    自定义列表替代内置列表，空格/逗号分隔
@@ -5140,7 +5186,7 @@ parse_cli() {
     CLI_COMMAND="" CLI_PROTOCOL="" CLI_TAG="" CLI_PORT="" CLI_UUID=""
     CLI_PASSWORD="${SB_PASSWORD:-}" CLI_TUNNEL_TOKEN="${SB_TUNNEL_TOKEN:-}"
     CLI_CERT=self CLI_METHOD=aes-128-gcm CLI_SNI="" CLI_DOMAIN=""
-    CLI_SNI_REGION=all CLI_SNI_CATEGORIES=all CLI_SNI_HOSTS=""
+    CLI_SNI_REGION=all CLI_SNI_REGION_EXPLICIT=0 CLI_SNI_CATEGORIES=all CLI_SNI_HOSTS=""
     CLI_SNI_JOBS=8 CLI_SNI_SAMPLES=3 CLI_SNI_TIMEOUT=5
     CLI_VERSION=latest CLI_VALIDATION=dns CLI_HTTP01_READY=0 CLI_ADDRESS=""
     CLI_FIREWALL=y CLI_EDGE="" CLI_STRATEGY="" CLI_RESTORE_BBR=1
@@ -5172,7 +5218,7 @@ parse_cli() {
                     --cert) CLI_CERT="$value" ;;
                     --method) CLI_METHOD="$value" ;;
                     --sni) CLI_SNI="$value" ;;
-                    --sni-region) CLI_SNI_REGION="$value" ;;
+                    --sni-region) CLI_SNI_REGION="$value"; CLI_SNI_REGION_EXPLICIT=1 ;;
                     --sni-category) CLI_SNI_CATEGORIES="$value" ;;
                     --sni-hosts) CLI_SNI_HOSTS="$value" ;;
                     --sni-jobs) CLI_SNI_JOBS="$value" ;;
