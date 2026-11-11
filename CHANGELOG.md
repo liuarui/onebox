@@ -2,6 +2,11 @@
 
 本文件记录 OneBox 的正式版本变更。
 
+## [1.0.5] - 2026-11-11
+
+- Remove fixed RAM/swap preflight thresholds from maintenance, node, and dependency operations; report failures from the actual command.
+- Keep PID headroom checks and RAM-based SNI concurrency adjustment.
+
 ## [1.0.4] - 2026-11-11
 
 - Include available swap in maintenance preflight, constrained by visible cgroup v2 swap or cgroup v1 memory+swap limits.

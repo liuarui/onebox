@@ -108,7 +108,7 @@ KNS_STATE_DIR="$CONFIG_DIR/kns"
 KNS_INSTANCES_DIR="$KNS_STATE_DIR/instances"
 KNS_CERTS_DIR="$KNS_STATE_DIR/certs"
 KNS_REQUEST_DIR="/run/onebox/kns/requests"
-ONEBOX_SCRIPT_VERSION="1.0.4"
+ONEBOX_SCRIPT_VERSION="1.0.5"
 KNS_ADAPTER_VERSION="1.8.0"
 
 KERNEL_TMP_DIR=""
@@ -1270,7 +1270,6 @@ ensure_cron() {
 
 init_base() {
     onebox_require_pid_headroom 8 'OneBox 初始化/依赖安装' || return 1
-    onebox_require_memory_headroom $((64 * 1024 * 1024)) 'OneBox 初始化/依赖安装' || return 1
     ensure_deps curl wget jq tar gzip openssl ss sha256sum base64 flock || return 1
 
     if ! kernel_ok; then
@@ -1898,25 +1897,18 @@ onebox_require_pid_headroom() {
     return 0
 }
 
-# Keep RAM-only headroom for SNI worker sizing; maintenance gates use RAM+swap.
+# RAM headroom only reduces SNI scan concurrency; it never blocks maintenance.
 onebox_probe_memory_budget() {
     local proc_root="${1:-/proc}" key value unit id controllers path v2_path='' v1_path=''
     local line fstype source options left a b mount_root mount_dir relative directory limit usage free
-    local host_ram=-1 host_swap=-1 cgroup_ram=-1 cgroup_swap=-1 cgroup_memsw=-1
-    local cgroup_v2_memory_seen=0 cgroup_v2_swap_seen=0
-    local swap_headroom total_headroom
+    local host_ram=-1 cgroup_ram=-1
     sni_memory_headroom=-1
-    sni_memory_swap_headroom=0
-    sni_memory_total_headroom=-1
     sni_memory_source='未发现可见的内存额度'
     if [ -r "$proc_root/meminfo" ]; then
         while read -r key value unit _; do
-            case "$key" in
-                MemAvailable:)
-                    if [[ "$value" =~ ^[0-9]{1,12}$ ]] && [ "$unit" = kB ]; then host_ram=$((10#$value*1024)); fi ;;
-                SwapFree:)
-                    if [[ "$value" =~ ^[0-9]{1,12}$ ]] && [ "$unit" = kB ]; then host_swap=$((10#$value*1024)); fi ;;
-            esac
+            [ "$key" = MemAvailable: ] || continue
+            if [[ "$value" =~ ^[0-9]{1,12}$ ]] && [ "$unit" = kB ]; then host_ram=$((10#$value*1024)); fi
+            break
         done < "$proc_root/meminfo"
     fi
     if [ -r "$proc_root/self/cgroup" ] && [ -r "$proc_root/self/mountinfo" ]; then
@@ -1960,20 +1952,9 @@ onebox_probe_memory_budget() {
                     [ ! -r "$directory/memory.max" ] || read -r limit < "$directory/memory.max"
                     [ ! -r "$directory/memory.current" ] || read -r usage < "$directory/memory.current"
                     if [ -r "$directory/memory.max" ] && [ -r "$directory/memory.current" ]; then
-                        cgroup_v2_memory_seen=1
                         if [[ "$limit" =~ ^[0-9]{1,15}$ && "$usage" =~ ^[0-9]{1,15}$ ]]; then
                             free=$((10#$limit-10#$usage)); [ "$free" -ge 0 ] || free=0
                             if [ "$cgroup_ram" -lt 0 ] || [ "$free" -lt "$cgroup_ram" ]; then cgroup_ram="$free"; fi
-                        fi
-                    fi
-                    limit=''; usage=''
-                    [ ! -r "$directory/memory.swap.max" ] || read -r limit < "$directory/memory.swap.max"
-                    [ ! -r "$directory/memory.swap.current" ] || read -r usage < "$directory/memory.swap.current"
-                    if [ -r "$directory/memory.swap.max" ] && [ -r "$directory/memory.swap.current" ]; then
-                        cgroup_v2_swap_seen=1
-                        if [[ "$limit" =~ ^[0-9]{1,15}$ && "$usage" =~ ^[0-9]{1,15}$ ]]; then
-                            free=$((10#$limit-10#$usage)); [ "$free" -ge 0 ] || free=0
-                            if [ "$cgroup_swap" -lt 0 ] || [ "$free" -lt "$cgroup_swap" ]; then cgroup_swap="$free"; fi
                         fi
                     fi
                 else
@@ -1984,15 +1965,6 @@ onebox_probe_memory_budget() {
                         if [[ "$limit" =~ ^[0-9]{1,15}$ && "$usage" =~ ^[0-9]{1,15}$ ]]; then
                             free=$((10#$limit-10#$usage)); [ "$free" -ge 0 ] || free=0
                             if [ "$cgroup_ram" -lt 0 ] || [ "$free" -lt "$cgroup_ram" ]; then cgroup_ram="$free"; fi
-                        fi
-                    fi
-                    limit=''; usage=''
-                    [ ! -r "$directory/memory.memsw.limit_in_bytes" ] || read -r limit < "$directory/memory.memsw.limit_in_bytes"
-                    [ ! -r "$directory/memory.memsw.usage_in_bytes" ] || read -r usage < "$directory/memory.memsw.usage_in_bytes"
-                    if [ -r "$directory/memory.memsw.limit_in_bytes" ] && [ -r "$directory/memory.memsw.usage_in_bytes" ]; then
-                        if [[ "$limit" =~ ^[0-9]{1,15}$ && "$usage" =~ ^[0-9]{1,15}$ ]]; then
-                            free=$((10#$limit-10#$usage)); [ "$free" -ge 0 ] || free=0
-                            if [ "$cgroup_memsw" -lt 0 ] || [ "$free" -lt "$cgroup_memsw" ]; then cgroup_memsw="$free"; fi
                         fi
                     fi
                 fi
@@ -2010,38 +1982,6 @@ onebox_probe_memory_budget() {
         sni_memory_source='cgroup RAM'
     elif [ "$sni_memory_headroom" -ge 0 ]; then
         sni_memory_source='MemAvailable'
-    fi
-    swap_headroom="$host_swap"
-    if [ "$swap_headroom" -lt 0 ]; then swap_headroom="$cgroup_swap"; fi
-    [ "$swap_headroom" -ge 0 ] || swap_headroom=0
-    if [ "$cgroup_v2_memory_seen" = 1 ]; then
-        if [ "$cgroup_v2_swap_seen" = 1 ] && [ "$cgroup_swap" -ge 0 ] && [ "$cgroup_swap" -lt "$swap_headroom" ]; then
-            swap_headroom="$cgroup_swap"
-        fi
-    fi
-    sni_memory_swap_headroom="$swap_headroom"
-    if [ "$sni_memory_headroom" -ge 0 ]; then
-        total_headroom=$((sni_memory_headroom+sni_memory_swap_headroom))
-        if [ "$cgroup_memsw" -ge 0 ] && [ "$cgroup_memsw" -lt "$total_headroom" ]; then
-            total_headroom="$cgroup_memsw"
-            sni_memory_source='cgroup memsw'
-        elif [ "$sni_memory_swap_headroom" -gt 0 ]; then
-            sni_memory_source="$sni_memory_source + 可用 swap"
-        fi
-        sni_memory_total_headroom="$total_headroom"
-    fi
-    return 0
-}
-
-onebox_require_memory_headroom() {
-    local minimum="$1" operation="$2"
-    onebox_probe_memory_budget
-    if [ "$sni_memory_total_headroom" -ge 0 ] && [ "$sni_memory_total_headroom" -lt "$minimum" ]; then
-        KNS_MEMORY_AVAILABLE_MIB=$((sni_memory_total_headroom / 1024 / 1024))
-        KNS_MEMORY_REQUIRED_MIB=$(((minimum + 1024 * 1024 - 1) / 1024 / 1024))
-        printf '[错误] 有效 RAM+swap 余量不足，已跳过 %s（约 %s MiB，至少需要 %s MiB；来源：%s）。请稍后重试或检查容器内存/swap 限额。\n' \
-            "$operation" "$KNS_MEMORY_AVAILABLE_MIB" "$KNS_MEMORY_REQUIRED_MIB" "$sni_memory_source" >&2
-        return 1
     fi
     return 0
 }
@@ -6517,17 +6457,13 @@ kns_main() {
     if [ "$KNS_COMMAND" = schema ]; then kns_schema; return $?; fi
     case "$KNS_COMMAND" in
       discover|list)
-        onebox_require_pid_headroom 3 "KNS $KNS_COMMAND" || { printf '{"schema":1,"adapterVersion":"%s","error":{"code":"low_pid_headroom"}}\n' "$KNS_ADAPTER_VERSION"; return 1; }
-        onebox_require_memory_headroom $((8 * 1024 * 1024)) "KNS $KNS_COMMAND" || { printf '{"schema":1,"adapterVersion":"%s","error":{"code":"low_memory_headroom","availableMiB":%s,"requiredMiB":%s}}\n' "$KNS_ADAPTER_VERSION" "$KNS_MEMORY_AVAILABLE_MIB" "$KNS_MEMORY_REQUIRED_MIB"; return 1; } ;;
+        onebox_require_pid_headroom 3 "KNS $KNS_COMMAND" || { printf '{"schema":1,"adapterVersion":"%s","error":{"code":"low_pid_headroom"}}\n' "$KNS_ADAPTER_VERSION"; return 1; } ;;
       import)
-        onebox_require_pid_headroom 5 'KNS 旧节点导入' || { printf '{"schema":1,"adapterVersion":"%s","error":{"code":"low_pid_headroom"}}\n' "$KNS_ADAPTER_VERSION"; return 1; }
-        onebox_require_memory_headroom $((32 * 1024 * 1024)) 'KNS 旧节点导入' || { printf '{"schema":1,"adapterVersion":"%s","error":{"code":"low_memory_headroom","availableMiB":%s,"requiredMiB":%s}}\n' "$KNS_ADAPTER_VERSION" "$KNS_MEMORY_AVAILABLE_MIB" "$KNS_MEMORY_REQUIRED_MIB"; return 1; } ;;
+        onebox_require_pid_headroom 5 'KNS 旧节点导入' || { printf '{"schema":1,"adapterVersion":"%s","error":{"code":"low_pid_headroom"}}\n' "$KNS_ADAPTER_VERSION"; return 1; } ;;
       update-kernel)
-        onebox_require_pid_headroom 8 "KNS $KNS_COMMAND" || { printf '{"schema":1,"adapterVersion":"%s","error":{"code":"low_pid_headroom"}}\n' "$KNS_ADAPTER_VERSION"; return 1; }
-        onebox_require_memory_headroom $((64 * 1024 * 1024)) "KNS $KNS_COMMAND" || { printf '{"schema":1,"adapterVersion":"%s","error":{"code":"low_memory_headroom","availableMiB":%s,"requiredMiB":%s}}\n' "$KNS_ADAPTER_VERSION" "$KNS_MEMORY_AVAILABLE_MIB" "$KNS_MEMORY_REQUIRED_MIB"; return 1; } ;;
+        onebox_require_pid_headroom 8 "KNS $KNS_COMMAND" || { printf '{"schema":1,"adapterVersion":"%s","error":{"code":"low_pid_headroom"}}\n' "$KNS_ADAPTER_VERSION"; return 1; } ;;
       install|reconfigure|reinstall|enable|disable|uninstall|claim|update-script)
-        onebox_require_pid_headroom 8 "KNS $KNS_COMMAND" || { printf '{"schema":1,"adapterVersion":"%s","error":{"code":"low_pid_headroom"}}\n' "$KNS_ADAPTER_VERSION"; return 1; }
-        onebox_require_memory_headroom $((32 * 1024 * 1024)) "KNS $KNS_COMMAND" || { printf '{"schema":1,"adapterVersion":"%s","error":{"code":"low_memory_headroom","availableMiB":%s,"requiredMiB":%s}}\n' "$KNS_ADAPTER_VERSION" "$KNS_MEMORY_AVAILABLE_MIB" "$KNS_MEMORY_REQUIRED_MIB"; return 1; } ;;
+        onebox_require_pid_headroom 8 "KNS $KNS_COMMAND" || { printf '{"schema":1,"adapterVersion":"%s","error":{"code":"low_pid_headroom"}}\n' "$KNS_ADAPTER_VERSION"; return 1; } ;;
     esac
     if [ "$KNS_COMMAND" = status ] || [ "$KNS_COMMAND" = list ] || [ "$KNS_COMMAND" = discover ] || [ "$KNS_COMMAND" = runtime-status ]; then kns_dispatch; return $?; fi
     trap cleanup_on_exit EXIT
@@ -6643,8 +6579,7 @@ main() {
     esac
     case "$CLI_COMMAND" in
         install|add|delete|update|uninstall|cert|outbound|bbr|start|stop|restart|update-script)
-            onebox_require_pid_headroom 8 "OneBox $CLI_COMMAND" || return 1
-            onebox_require_memory_headroom $((32 * 1024 * 1024)) "OneBox $CLI_COMMAND" || return 1 ;;
+            onebox_require_pid_headroom 8 "OneBox $CLI_COMMAND" || return 1 ;;
     esac
     trap cleanup_on_exit EXIT
     trap cleanup_on_interrupt INT
@@ -6654,12 +6589,10 @@ main() {
     if [ "${ONEBOX_LOCKED:-0}" != 1 ]; then
         if ! command -v flock >/dev/null 2>&1; then
             onebox_require_pid_headroom 8 'flock 依赖安装' || return 1
-            onebox_require_memory_headroom $((64 * 1024 * 1024)) 'flock 依赖安装' || return 1
         fi
         ensure_deps flock || return 1
         if ! flock --help 2>&1 | grep -q -- '--close'; then
             onebox_require_pid_headroom 8 'flock 依赖更新' || return 1
-            onebox_require_memory_headroom $((64 * 1024 * 1024)) 'flock 依赖更新' || return 1
             if [ "$PACKAGE_MANAGER" = apk ]; then install_packages flock || return 1
             else install_packages util-linux || return 1; fi
             hash -r
