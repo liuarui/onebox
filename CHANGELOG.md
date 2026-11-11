@@ -2,6 +2,12 @@
 
 本文件记录 OneBox 的正式版本变更。
 
+## [1.0.4] - 2026-11-11
+
+- Include available swap in maintenance preflight, constrained by visible cgroup v2 swap or cgroup v1 memory+swap limits.
+- Lower ordinary OneBox node commands to a 32 MiB RAM+swap gate; keep 64 MiB for kernel upgrades and first-time dependency setup.
+- Keep SNI worker sizing RAM-only so swap does not increase scan concurrency.
+
 ## [1.0.3] - 2026-11-11
 
 - Lower KNS memory preflight thresholds for read-only discovery and routine node changes so small-memory LXC probes are less likely to be blocked.

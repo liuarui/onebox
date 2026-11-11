@@ -108,7 +108,7 @@ KNS_STATE_DIR="$CONFIG_DIR/kns"
 KNS_INSTANCES_DIR="$KNS_STATE_DIR/instances"
 KNS_CERTS_DIR="$KNS_STATE_DIR/certs"
 KNS_REQUEST_DIR="/run/onebox/kns/requests"
-ONEBOX_SCRIPT_VERSION="1.0.3"
+ONEBOX_SCRIPT_VERSION="1.0.4"
 KNS_ADAPTER_VERSION="1.8.0"
 
 KERNEL_TMP_DIR=""
@@ -1898,75 +1898,148 @@ onebox_require_pid_headroom() {
     return 0
 }
 
+# Keep RAM-only headroom for SNI worker sizing; maintenance gates use RAM+swap.
 onebox_probe_memory_budget() {
     local proc_root="${1:-/proc}" key value unit id controllers path v2_path='' v1_path=''
     local line fstype source options left a b mount_root mount_dir relative directory limit usage free
+    local host_ram=-1 host_swap=-1 cgroup_ram=-1 cgroup_swap=-1 cgroup_memsw=-1
+    local cgroup_v2_memory_seen=0 cgroup_v2_swap_seen=0
+    local swap_headroom total_headroom
     sni_memory_headroom=-1
+    sni_memory_swap_headroom=0
+    sni_memory_total_headroom=-1
     sni_memory_source='未发现可见的内存额度'
     if [ -r "$proc_root/meminfo" ]; then
         while read -r key value unit _; do
-            if [ "$key" = MemAvailable: ]; then
-                if [[ "$value" =~ ^[0-9]{1,12}$ ]] && [ "$unit" = kB ]; then
-                    sni_memory_headroom=$((10#$value*1024))
-                    sni_memory_source='MemAvailable'
-                fi
-                break
-            fi
+            case "$key" in
+                MemAvailable:)
+                    if [[ "$value" =~ ^[0-9]{1,12}$ ]] && [ "$unit" = kB ]; then host_ram=$((10#$value*1024)); fi ;;
+                SwapFree:)
+                    if [[ "$value" =~ ^[0-9]{1,12}$ ]] && [ "$unit" = kB ]; then host_swap=$((10#$value*1024)); fi ;;
+            esac
         done < "$proc_root/meminfo"
     fi
-    [ -r "$proc_root/self/cgroup" ] && [ -r "$proc_root/self/mountinfo" ] || return 0
-    while IFS=: read -r id controllers path; do
-        if [ "$id" = 0 ] && [ -z "$controllers" ]; then v2_path="$path"; fi
-        case ",$controllers," in *,memory,*) v1_path="$path" ;; esac
-    done < "$proc_root/self/cgroup"
-    while IFS= read -r line; do
-        read -r fstype source options _ <<< "${line#* - }"
-        case "$fstype" in
-            cgroup2) path="$v2_path" ;;
-            cgroup) case ",$options," in *,memory,*) path="$v1_path" ;; *) continue ;; esac ;;
-            *) continue ;;
-        esac
-        [ -n "$path" ] || continue
-        left="${line%% - *}"
-        read -r id a b mount_root mount_dir _ <<< "$left"
-        printf -v mount_root '%b' "$mount_root"
-        printf -v mount_dir '%b' "$mount_dir"
-        case "$path" in
-            "$mount_root") relative='' ;;
-            "$mount_root"/*) relative="${path#"$mount_root"}" ;;
-            *) relative="$path" ;;
-        esac
-        directory="${mount_dir%/}/${relative#/}"; directory="${directory%/}"
-        while :; do
-            limit=''; usage=''
-            if [ "$fstype" = cgroup2 ]; then
-                [ ! -r "$directory/memory.max" ] || read -r limit < "$directory/memory.max"
-                [ ! -r "$directory/memory.current" ] || read -r usage < "$directory/memory.current"
+    if [ -r "$proc_root/self/cgroup" ] && [ -r "$proc_root/self/mountinfo" ]; then
+        while IFS=: read -r id controllers path; do
+            if [ "$id" = 0 ] && [ -z "$controllers" ]; then v2_path="$path"; fi
+            case ",$controllers," in *,memory,*) v1_path="$path" ;; esac
+        done < "$proc_root/self/cgroup"
+        while IFS= read -r line; do
+            read -r fstype source options _ <<< "${line#* - }"
+            case "$fstype" in
+                cgroup2) path="$v2_path" ;;
+                cgroup) case ",$options," in *,memory,*) path="$v1_path" ;; *) continue ;; esac ;;
+                *) continue ;;
+            esac
+            [ -n "$path" ] || continue
+            left="${line%% - *}"
+            read -r id a b mount_root mount_dir _ <<< "$left"
+            printf -v mount_root '%b' "$mount_root"
+            printf -v mount_dir '%b' "$mount_dir"
+            case "$mount_root" in ''|/) mount_root='/' ;; *) mount_root="${mount_root%/}" ;; esac
+            case "$mount_dir" in ''|/) mount_dir='/' ;; *) mount_dir="${mount_dir%/}" ;; esac
+            if [ "$mount_root" = '/' ]; then
+                relative="${path#/}"
             else
-                [ ! -r "$directory/memory.limit_in_bytes" ] || read -r limit < "$directory/memory.limit_in_bytes"
-                [ ! -r "$directory/memory.usage_in_bytes" ] || read -r usage < "$directory/memory.usage_in_bytes"
+                case "$path" in
+                    "$mount_root") relative='' ;;
+                    "$mount_root"/*) relative="${path#"$mount_root"/}" ;;
+                    *) continue ;;
+                esac
             fi
-            # Ignore unlimited v1 sentinels and reject unsafe arithmetic inputs.
-            if [[ "$limit" =~ ^[0-9]{1,15}$ && "$usage" =~ ^[0-9]{1,15}$ ]]; then
-                free=$((10#$limit-10#$usage)); [ "$free" -ge 0 ] || free=0
-                if [ "$sni_memory_headroom" -lt 0 ] || [ "$free" -lt "$sni_memory_headroom" ]; then
-                    sni_memory_headroom="$free"; sni_memory_source="$directory"
+            if [ "$mount_dir" = '/' ]; then
+                if [ -n "$relative" ]; then directory="/$relative"; else directory='/'; fi
+            elif [ -n "$relative" ]; then
+                directory="$mount_dir/$relative"
+            else
+                directory="$mount_dir"
+            fi
+            while :; do
+                if [ "$fstype" = cgroup2 ]; then
+                    limit=''; usage=''
+                    [ ! -r "$directory/memory.max" ] || read -r limit < "$directory/memory.max"
+                    [ ! -r "$directory/memory.current" ] || read -r usage < "$directory/memory.current"
+                    if [ -r "$directory/memory.max" ] && [ -r "$directory/memory.current" ]; then
+                        cgroup_v2_memory_seen=1
+                        if [[ "$limit" =~ ^[0-9]{1,15}$ && "$usage" =~ ^[0-9]{1,15}$ ]]; then
+                            free=$((10#$limit-10#$usage)); [ "$free" -ge 0 ] || free=0
+                            if [ "$cgroup_ram" -lt 0 ] || [ "$free" -lt "$cgroup_ram" ]; then cgroup_ram="$free"; fi
+                        fi
+                    fi
+                    limit=''; usage=''
+                    [ ! -r "$directory/memory.swap.max" ] || read -r limit < "$directory/memory.swap.max"
+                    [ ! -r "$directory/memory.swap.current" ] || read -r usage < "$directory/memory.swap.current"
+                    if [ -r "$directory/memory.swap.max" ] && [ -r "$directory/memory.swap.current" ]; then
+                        cgroup_v2_swap_seen=1
+                        if [[ "$limit" =~ ^[0-9]{1,15}$ && "$usage" =~ ^[0-9]{1,15}$ ]]; then
+                            free=$((10#$limit-10#$usage)); [ "$free" -ge 0 ] || free=0
+                            if [ "$cgroup_swap" -lt 0 ] || [ "$free" -lt "$cgroup_swap" ]; then cgroup_swap="$free"; fi
+                        fi
+                    fi
+                else
+                    limit=''; usage=''
+                    [ ! -r "$directory/memory.limit_in_bytes" ] || read -r limit < "$directory/memory.limit_in_bytes"
+                    [ ! -r "$directory/memory.usage_in_bytes" ] || read -r usage < "$directory/memory.usage_in_bytes"
+                    if [ -r "$directory/memory.limit_in_bytes" ] && [ -r "$directory/memory.usage_in_bytes" ]; then
+                        if [[ "$limit" =~ ^[0-9]{1,15}$ && "$usage" =~ ^[0-9]{1,15}$ ]]; then
+                            free=$((10#$limit-10#$usage)); [ "$free" -ge 0 ] || free=0
+                            if [ "$cgroup_ram" -lt 0 ] || [ "$free" -lt "$cgroup_ram" ]; then cgroup_ram="$free"; fi
+                        fi
+                    fi
+                    limit=''; usage=''
+                    [ ! -r "$directory/memory.memsw.limit_in_bytes" ] || read -r limit < "$directory/memory.memsw.limit_in_bytes"
+                    [ ! -r "$directory/memory.memsw.usage_in_bytes" ] || read -r usage < "$directory/memory.memsw.usage_in_bytes"
+                    if [ -r "$directory/memory.memsw.limit_in_bytes" ] && [ -r "$directory/memory.memsw.usage_in_bytes" ]; then
+                        if [[ "$limit" =~ ^[0-9]{1,15}$ && "$usage" =~ ^[0-9]{1,15}$ ]]; then
+                            free=$((10#$limit-10#$usage)); [ "$free" -ge 0 ] || free=0
+                            if [ "$cgroup_memsw" -lt 0 ] || [ "$free" -lt "$cgroup_memsw" ]; then cgroup_memsw="$free"; fi
+                        fi
+                    fi
                 fi
-            fi
-            [ "$directory" != "$mount_dir" ] && [[ "$directory" == "$mount_dir"/* ]] || break
-            directory="${directory%/*}"
-        done
-    done < "$proc_root/self/mountinfo"
+                [ "$directory" != "$mount_dir" ] || break
+                if [ "$mount_dir" = '/' ]; then [[ "$directory" == /* ]] || break
+                else [[ "$directory" == "$mount_dir"/* ]] || break; fi
+                directory="${directory%/*}"
+                [ -n "$directory" ] || directory='/'
+            done
+        done < "$proc_root/self/mountinfo"
+    fi
+    sni_memory_headroom="$host_ram"
+    if [ "$cgroup_ram" -ge 0 ] && { [ "$sni_memory_headroom" -lt 0 ] || [ "$cgroup_ram" -lt "$sni_memory_headroom" ]; }; then
+        sni_memory_headroom="$cgroup_ram"
+        sni_memory_source='cgroup RAM'
+    elif [ "$sni_memory_headroom" -ge 0 ]; then
+        sni_memory_source='MemAvailable'
+    fi
+    swap_headroom="$host_swap"
+    if [ "$swap_headroom" -lt 0 ]; then swap_headroom="$cgroup_swap"; fi
+    [ "$swap_headroom" -ge 0 ] || swap_headroom=0
+    if [ "$cgroup_v2_memory_seen" = 1 ]; then
+        if [ "$cgroup_v2_swap_seen" = 1 ] && [ "$cgroup_swap" -ge 0 ] && [ "$cgroup_swap" -lt "$swap_headroom" ]; then
+            swap_headroom="$cgroup_swap"
+        fi
+    fi
+    sni_memory_swap_headroom="$swap_headroom"
+    if [ "$sni_memory_headroom" -ge 0 ]; then
+        total_headroom=$((sni_memory_headroom+sni_memory_swap_headroom))
+        if [ "$cgroup_memsw" -ge 0 ] && [ "$cgroup_memsw" -lt "$total_headroom" ]; then
+            total_headroom="$cgroup_memsw"
+            sni_memory_source='cgroup memsw'
+        elif [ "$sni_memory_swap_headroom" -gt 0 ]; then
+            sni_memory_source="$sni_memory_source + 可用 swap"
+        fi
+        sni_memory_total_headroom="$total_headroom"
+    fi
     return 0
 }
 
 onebox_require_memory_headroom() {
     local minimum="$1" operation="$2"
     onebox_probe_memory_budget
-    if [ "$sni_memory_headroom" -ge 0 ] && [ "$sni_memory_headroom" -lt "$minimum" ]; then
-        KNS_MEMORY_AVAILABLE_MIB=$((sni_memory_headroom / 1024 / 1024))
+    if [ "$sni_memory_total_headroom" -ge 0 ] && [ "$sni_memory_total_headroom" -lt "$minimum" ]; then
+        KNS_MEMORY_AVAILABLE_MIB=$((sni_memory_total_headroom / 1024 / 1024))
         KNS_MEMORY_REQUIRED_MIB=$(((minimum + 1024 * 1024 - 1) / 1024 / 1024))
-        printf '[错误] 可用内存不足，已跳过 %s（约 %s MiB，至少需要 %s MiB；来源：%s）。请稍后重试或提高容器内存限额。\n' \
+        printf '[错误] 有效 RAM+swap 余量不足，已跳过 %s（约 %s MiB，至少需要 %s MiB；来源：%s）。请稍后重试或检查容器内存/swap 限额。\n' \
             "$operation" "$KNS_MEMORY_AVAILABLE_MIB" "$KNS_MEMORY_REQUIRED_MIB" "$sni_memory_source" >&2
         return 1
     fi
@@ -6571,7 +6644,7 @@ main() {
     case "$CLI_COMMAND" in
         install|add|delete|update|uninstall|cert|outbound|bbr|start|stop|restart|update-script)
             onebox_require_pid_headroom 8 "OneBox $CLI_COMMAND" || return 1
-            onebox_require_memory_headroom $((64 * 1024 * 1024)) "OneBox $CLI_COMMAND" || return 1 ;;
+            onebox_require_memory_headroom $((32 * 1024 * 1024)) "OneBox $CLI_COMMAND" || return 1 ;;
     esac
     trap cleanup_on_exit EXIT
     trap cleanup_on_interrupt INT
