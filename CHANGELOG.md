@@ -2,10 +2,16 @@
 
 本文件记录 OneBox 的正式版本变更。
 
+## [1.0.8] - 2026-11-14
+
+- Rank selected-region candidates ahead of global fallback endpoints within the same certificate-chain tier.
+- Keep global endpoints as lower-priority fallback candidates instead of competing with regional institutions by latency.
+- Keep the 27-domain SNI catalog unchanged; no domains were added or restored.
+
 ## [1.0.7] - 2026-11-14
 
 - Correct the affiliation-region labels for Waikato, NCKU, and NCU.
-- Prioritize a selected region's institutional candidates within the same certificate-chain tier; keep global endpoints as the fallback when every regional candidate fails.
+- Prioritize a selected region's institutional candidates within the same certificate-chain tier; keep global endpoints as lower-priority fallback.
 - Add an explicit Taiwan region for NCKU and NCU instead of grouping Taiwan under Southeast Asia/Singapore.
 - Keep the 27-domain catalog unchanged; no domains were added or restored.
 

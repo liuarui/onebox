@@ -108,7 +108,7 @@ KNS_STATE_DIR="$CONFIG_DIR/kns"
 KNS_INSTANCES_DIR="$KNS_STATE_DIR/instances"
 KNS_CERTS_DIR="$KNS_STATE_DIR/certs"
 KNS_REQUEST_DIR="/run/onebox/kns/requests"
-ONEBOX_SCRIPT_VERSION="1.0.7"
+ONEBOX_SCRIPT_VERSION="1.0.8"
 KNS_ADAPTER_VERSION="1.8.0"
 
 KERNEL_TMP_DIR=""
@@ -2176,9 +2176,15 @@ run_reality_sni_selection() {
                     tier=0; [ "$chain" -le 3 ] || tier=1
                     [ "$chain" != 0 ] || tier=2
                     region_priority=0
-                    if [ "$sni_region" != all ] && [ "${sni_host_regions[$host]:-}" != "$sni_region" ] &&
-                       [ "${sni_host_regions[$host]:-}" != global ]; then
-                        region_priority=2
+                    if [ "$sni_region" != all ]; then
+                        candidate_region="${sni_host_regions[$host]:-}"
+                        if [ "$candidate_region" != "$sni_region" ]; then
+                            if [ "$candidate_region" = global ]; then
+                                region_priority=1
+                            else
+                                region_priority=2
+                            fi
+                        fi
                     fi
                     matches+=("$tier"$'\t'"$region_priority"$'\t'"$score"$'\t'"$chain"$'\t'"$host")
                     result="$chain 层"; [ "$chain" != 0 ] || result=未知
@@ -2209,7 +2215,11 @@ run_reality_sni_selection() {
         case "$tier" in 1) answer='长链备选，需验证兼容性' ;; 2) answer='链长度未知，需验证兼容性'; chain='未知' ;; esac
         candidate_region=''
         if [ "$sni_region" != all ]; then
-            [ "$region_priority" = 0 ] && candidate_region='地区匹配' || candidate_region='全球备选'
+            case "$region_priority" in
+                0) candidate_region='地区匹配' ;;
+                1) candidate_region='全球备选' ;;
+                *) candidate_region='其他地区' ;;
+            esac
         fi
         printf ' %s) %s（%s，链 %s 层，%s%s）\n' "$index" "$host" "$result" "$chain" "$answer" "${candidate_region:+，$candidate_region}" >&2
     done <<< "$ranked"
