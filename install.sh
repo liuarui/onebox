@@ -108,7 +108,7 @@ KNS_STATE_DIR="$CONFIG_DIR/kns"
 KNS_INSTANCES_DIR="$KNS_STATE_DIR/instances"
 KNS_CERTS_DIR="$KNS_STATE_DIR/certs"
 KNS_REQUEST_DIR="/run/onebox/kns/requests"
-ONEBOX_SCRIPT_VERSION="1.0.5"
+ONEBOX_SCRIPT_VERSION="1.0.6"
 KNS_ADAPTER_VERSION="1.8.0"
 
 KERNEL_TMP_DIR=""
@@ -1523,106 +1523,45 @@ reality_sni_catalog() {
     # https://github.com/chnnic/Reality-SNI-Check
     # Upstream snapshot df1369dc080470d2; locally excluded candidates removed.
     # Columns: category, affiliation region (not IP geolocation), hostname.
-    # Korea additionally tags Samsung and LG; all other tags follow upstream.
+    # This is a reviewable seed pool, not a permanent ASN or reachability map.
+    # Every machine probes its own DNS path at runtime; exclude Cloudflare-
+    # hosted names here and diversify across networks where practical.
     cat <<'EOF'
-cdn global addons.mozilla.org
-cdn global www.python.org
-cloud global aws.amazon.com
-cloud global azure.microsoft.com
-cloud global www.digitalocean.com
-cloud global registry.npmjs.org
-cloud global www.jsdelivr.com
-cloud global www.netlify.com
-cloud global www.oracle.com
-cloud global www.ibm.com
-tech global www.amd.com
-tech global www.intel.com
-tech global www.nvidia.com
-tech global www.qualcomm.com
-tech global www.arm.com
-tech global www.tesla.com
-tech kr www.samsung.com
-tech global www.sony.com
-tech kr www.lg.com
-tech global www.dell.com
-tech global www.hp.com
-tech global www.lenovo.com
-tech global www.cisco.com
-tech global www.adobe.com
-fin global www.paypal.com
-fin global www.visa.com
-fin global www.mastercard.com
-fin global www.americanexpress.com
-fin global www.jpmorgan.com
-fin global www.goldmansachs.com
-fin global www.hsbc.com
-fin global www.citi.com
-fin global www.blackrock.com
-edu us www.mit.edu
-edu us www.stanford.edu
-edu us www.harvard.edu
-edu us www.berkeley.edu
-edu us www.cornell.edu
-edu us www.princeton.edu
-edu us www.yale.edu
-edu us www.columbia.edu
-edu eu www.ox.ac.uk
-edu eu www.cam.ac.uk
-edu eu www.imperial.ac.uk
-edu eu www.epfl.ch
-edu jp www.u-tokyo.ac.jp
-edu jp www.kyoto-u.ac.jp
+cdn global files.pythonhosted.org
+cdn global www.kernel.org
+cdn global www.apache.org
+cdn global www.php.net
+cdn global www.perl.org
+cloud global www.python.org
+cloud global www.postgresql.org
+cloud global deb.debian.org
+cloud global www.openssl.org
+cloud global www.isc.org
+cloud global www.cesnet.cz
+cloud eu www.surf.nl
+cloud eu www.nic.cz
+cloud us www.lacnic.net
+cloud global www.afrinic.net
+edu jp www.sinet.ad.jp
+edu jp www.osaka-u.ac.jp
+edu jp www.kyushu-u.ac.jp
 edu sg www.nus.edu.sg
-edu sg www.ntu.edu.sg
 edu hk www.hku.hk
 edu hk www.hkust.edu.hk
-edu au www.unimelb.edu.au
-edu us www.utoronto.ca
-media global www.imdb.com
-gaming global www.epicgames.com
-gaming global www.riotgames.com
-gaming global www.ea.com
-gaming global www.ubisoft.com
-gaming global www.playstation.com
-gaming global www.nintendo.com
-gaming global www.xbox.com
-gaming global www.blizzard.com
-ecom global www.ebay.com
-ecom global www.walmart.com
-ecom global www.target.com
-ecom global www.bestbuy.com
-ecom global www.shopify.com
-ecom cn www.alibaba.com
-ecom eu www.ikea.com
-ecom global www.nike.com
-ecom eu www.adidas.com
-ecom eu www.zara.com
-region jp www.lovelive-anime.jp
-region jp www.yahoo.co.jp
-region jp www.ana.co.jp
-region eu www.mercedes-benz.com
-region eu www.bmw.com
-region eu www.audi.com
-region eu www.lufthansa.com
-region sg www.singaporeair.com
-region hk www.cathaypacific.com
-region au www.qantas.com
-region global www.salesforce.com
+edu hk www.polyu.edu.hk
+edu us www.cmu.edu
+edu us www.waikato.ac.nz
+edu us www.ncku.edu.tw
+edu us www.ncu.edu.tw
+edu eu www.ethz.ch
 EOF
 }
 
 reality_sni_categories() {
     cat <<'EOF'
-cdn 全球CDN/anycast
-cloud 云/开发基础设施
-tech 科技/半导体大厂
-fin 金融/支付/银行
-edu 大学/教育机构
-media 流媒体/内容
-social 社交平台
-gaming 游戏平台
-ecom 电商/零售/品牌
-region 区域锚点
+cdn 开源/公共项目
+cloud 开发者/科研基础设施
+edu 大学/地区机构
 EOF
 }
 
@@ -1674,7 +1613,7 @@ valid_reality_sni_categories() {
     read -r -a keys <<< "$input"
     [ "${#keys[@]}" -gt 0 ] || return 1
     for key in "${keys[@]}"; do
-        case "$key" in all|cdn|cloud|tech|fin|edu|media|social|gaming|ecom|region) ;; *) return 1 ;; esac
+        case "$key" in all|cdn|cloud|edu) ;; *) return 1 ;; esac
     done
 }
 
@@ -1716,7 +1655,7 @@ reality_sni_candidates() {
 
 select_reality_sni_preset() {
     local preset_destination="$1" preset_choice preset_index
-    local -a preset_hosts=(www.intel.com www.nvidia.com www.ibm.com www.sony.com www.python.org)
+    local -a preset_hosts=(www.cesnet.cz www.apache.org www.surf.nl www.php.net www.nic.cz)
     if [ "$NON_INTERACTIVE" = 1 ]; then
         printf '[提示] 使用第一个预设 SNI：%s（未经本机测速，请验证实际连接）。\n' "${preset_hosts[0]}" >&2
         printf -v "$preset_destination" '%s' "${preset_hosts[0]}"
@@ -1756,11 +1695,11 @@ configure_reality_sni_scan() {
     local mode selection key label count item categories candidate_text
     local -a keys=() entries=()
     while true; do
-        printf '\nSNI 检测范围：\n 1) 快速检测（CDN、云、科技）\n 2) 全部候选\n 3) 按分类检测（可多选）\n 4) 按地区推荐\n 5) 自定义域名/网址列表\n 6) 检测设置（次数=%s，超时=%ss，并发=%s）\n 7) 自动识别当前出口 IP 地区（默认）\n 0) 取消\n' "$sni_samples" "$sni_timeout" "$sni_jobs" >&2
+        printf '\nSNI 检测范围：\n 1) 快速检测（开源项目、科研基础设施）\n 2) 全部候选\n 3) 按分类检测（可多选）\n 4) 按地区推荐\n 5) 自定义域名/网址列表\n 6) 检测设置（次数=%s，超时=%ss，并发=%s）\n 7) 自动识别当前出口 IP 地区（默认）\n 0) 取消\n' "$sni_samples" "$sni_timeout" "$sni_jobs" >&2
         ask '请选择 [0-7，默认: 7]: ' mode
         case "${mode:-7}" in
             0) return 130 ;;
-            1) sni_region=all; sni_categories=cdn,cloud,tech; sni_hosts=""; return 0 ;;
+            1) sni_region=all; sni_categories=cdn,cloud; sni_hosts=""; return 0 ;;
             2) sni_region=all; sni_categories=all; sni_hosts=""; return 0 ;;
             3)
                 keys=()
@@ -5170,7 +5109,7 @@ add 选项:
                                自签证书域名默认 bing.com
 Reality SNI 自动检测选项（仅 add --protocol reality）:
   --sni-region all|global|us|eu|jp|hk|sg|cn|au|kr（省略时自动识别出口 IP 地区）
-  --sni-category all|cdn,cloud,tech,fin,edu,media,social,gaming,ecom,region
+  --sni-category all|cdn,cloud,edu
                                默认 all；与地区筛选取交集，地区包含全球通用站
   --sni-hosts 'HOST URL ...'    自定义列表替代内置列表，空格/逗号分隔
                                不与地区/分类筛选混用；排除 Apple 旗下域名

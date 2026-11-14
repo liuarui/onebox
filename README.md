@@ -1,6 +1,40 @@
 # onebox
 
-## 免责声明
+**基于 sing-box 的 Linux 节点安装与管理脚本**，提供交互式和无交互部署、Reality SNI 自动筛选、证书与隧道管理，并可接入 Komari KNS。
+
+<div align="center">
+
+<a href="https://github.com/liuarui/onebox/releases"><img alt="最新 Release" src="https://img.shields.io/github/v/release/liuarui/onebox?display_name=tag&sort=semver&style=flat-square"></a>
+<a href="#notice"><img alt="Bash 4 及以上" src="https://img.shields.io/badge/Bash-4%2B-4EAA25?style=flat-square&logo=gnubash&logoColor=white"></a>
+<a href="#notice"><img alt="Linux，systemd 或 OpenRC" src="https://img.shields.io/badge/Linux-systemd%20%7C%20OpenRC-333?style=flat-square&logo=linux&logoColor=white"></a>
+<a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/License-MIT-0d9488?style=flat-square&logo=opensourceinitiative&logoColor=white"></a>
+<a href="#kns-adapter"><img alt="KNS Adapter 1.8.0" src="https://img.shields.io/badge/KNS%20Adapter-1.8.0-6f42c1?style=flat-square"></a>
+
+[🚀 安装](#quick-install) · [➕ 节点](#add-node) · [🧭 SNI](#reality-sni) · [🔐 证书](#certificates) · [☁️ Argo](#argo) · [🔌 KNS](#kns-adapter) · [🧰 管理](#management) · [🧹 卸载](#uninstall)
+
+</div>
+
+## ✨ 功能概览
+
+| 能力 | 说明 |
+| --- | --- |
+| 节点部署 | 交互式菜单或无交互命令安装 VLESS Reality、Hysteria2、TUIC、AnyTLS、Shadowsocks、Trojan、VMess 与 Argo 节点 |
+| Reality SNI | 按 VPS 出口地区、分类或自定义列表扫描；每台机器独立验证 TLS 1.3、X25519、证书与 HTTP/2 |
+| 证书与隧道 | 自签或 ACME 证书、Cloudflare DNS 验证、Argo 隧道及续期管理 |
+| 集中管理 | 查看、更新、诊断、备份与卸载；通过 schema 1 适配器接入 KNS |
+
+```mermaid
+flowchart LR
+  A[install.sh / onebox] --> B[Linux 与服务管理器]
+  B --> C[安装 sing-box 与依赖]
+  C --> D[生成节点配置]
+  D --> E[systemd / OpenRC]
+  E --> F[onebox 管理命令]
+  D -. 可选 .-> G[KNS schema 1]
+```
+
+<a id="notice"></a>
+## ⚖️ 免责声明与运行要求
 
 本项目仅供学习与技术研究，请在获得授权的服务器和网络环境中使用。使用者应遵守所在地适用的法律法规，不得用于违法或未经授权的活动，并自行评估和承担使用产生的风险。本项目按 [LICENSE](LICENSE) 原样提供，不提供任何明示或默示担保；作者及贡献者在适用法律允许的范围内不对使用本项目造成的损失承担责任。
 
@@ -8,7 +42,8 @@
 
 支持使用 apt、apk、dnf/yum、zypper、pacman 的 Debian/Ubuntu、Alpine、RHEL/Rocky/AlmaLinux/Fedora、openSUSE、Arch 等常见 Linux。需要**正在运行的 systemd 或 OpenRC**；无 init 的 Docker/WSL、其他 init、未知包管理器或架构会报错退出。支持 x86_64、ARM64、x86、ARMv6/v7、riscv64、s390x、ppc64le；具体版本必须提供对应官方发行包，Argo 仅支持前五类架构。Alpine 优先使用官方 musl 包。
 
-## 交互式一键安装（推荐）
+<a id="quick-install"></a>
+## 🚀 交互式一键安装（推荐）
 
 请用 root 登录。直接把 GitHub Raw 脚本交给 `sh` 执行：
 
@@ -28,14 +63,16 @@ curl -fsSL "https://raw.githubusercontent.com/liuarui/onebox/main/install.sh" | 
 
 脚本地址：[GitHub Raw install.sh](https://raw.githubusercontent.com/liuarui/onebox/main/install.sh)。
 
-## 已下载脚本的安装方式
+<a id="downloaded-install"></a>
+## 📦 已下载脚本的安装方式
 
 ```sh
 # 打开交互安装菜单
 sh install.sh menu
 ```
 
-## 无交互安装
+<a id="noninteractive-install"></a>
+## ⚙️ 无交互安装
 
 适合自动化部署。默认 VLESS + Reality、TCP 443，自动生成 UUID、Reality 密钥和分享链接；自动检测 SNI 时会按 OneBox 当前公网出口 IP 所在地区优先匹配候选，查询不可用时回退全部地区候选，失败时使用第一个预设：
 
@@ -70,35 +107,30 @@ sh install.sh install --version 1.14.3
 
 安装完成后使用 `onebox <命令>`。再次直接执行 `onebox` 可进入交互菜单，其中包含卸载选项。
 
-### Reality SNI 选择与自动检测
+<a id="reality-sni"></a>
+### 🧭 Reality SNI 选择与自动检测
 
 交互式添加或修改 `VLESS-REALITY` 的 SNI 时，先进入自动优选流程。只有资源不足、缺少检测能力、网络检测失败等情况，才显示以下 5 个预设供编号选择，无需手输域名；回车选第 1 项，`0` 取消。回退选择只使用 Bash 内建命令，不测速、不创建检测进程，适合低配置机器。
 
 | 编号 | 预设 SNI |
 | --- | --- |
-| 1 | `www.intel.com` |
-| 2 | `www.nvidia.com` |
-| 3 | `www.ibm.com` |
-| 4 | `www.sony.com` |
-| 5 | `www.python.org` |
+| 1 | `www.cesnet.cz` |
+| 2 | `www.apache.org` |
+| 3 | `www.surf.nl` |
+| 4 | `www.php.net` |
+| 5 | `www.nic.cz` |
 
 自动优选支持快速检测、全部候选、分类多选、地区推荐或自定义域名/网址列表，也可调整次数、超时和并发。交互菜单默认使用地区自动识别；非交互模式默认通过 HTTPS 向 `ipwho.is` 查询 OneBox 当前公网出口 IP 所属国家，并匹配地区候选；同证书链等级内地区匹配项优先，全球通用站作为备选。查询不可用时扫描全部地区候选，不阻断安装。该查询会把 OneBox 出口 IP 发送给 `ipwho.is`；手动指定 SNI 时不查询。检测范围或结果菜单的 0 取消本次操作，不会触发预设回退。预设不代表已通过本机测速或 Reality 连接验证，选择后仍需确认实际连接。
 
-内置 **83 个候选、9 类分类、9 个地区**。域名、分类和地区集中维护在 `install.sh` 的 `reality_sni_catalog()`，运行时无需下载或执行外部检测脚本。内置列表、自定义列表和显式指定的 Reality SNI 均排除 `apple.com`、`icloud.com`、`mzstatic.com` 及其子域名。
+内置 **27 个候选、3 类分类、7 个地区**。域名、分类和地区集中维护在 `install.sh` 的 `reality_sni_catalog()`，运行时无需下载或执行外部检测脚本。候选来自开源项目、科研教育网、RIR/NIR 和地区高校；已知由 Cloudflare 承载的站点不进入内置列表。DNS、CDN 和 ASN 归属会变化，列表只提供运行时探测的种子，不能保证某个域名永远属于同一网络。自定义列表和显式指定的 Reality SNI 仍排除 `apple.com`、`icloud.com`、`mzstatic.com` 及其子域名。
 
 | 分类键 | 分类 | 数量 |
 | --- | --- | --- |
-| `cdn` | 全球 CDN / anycast | 2 |
-| `cloud` | 云 / 开发基础设施 | 8 |
-| `tech` | 科技 / 半导体大厂 | 14 |
-| `fin` | 金融 / 支付 / 银行 | 9 |
-| `edu` | 大学 / 教育机构 | 20 |
-| `media` | 流媒体 / 内容 | 1 |
-| `gaming` | 游戏平台 | 8 |
-| `ecom` | 电商 / 零售 / 品牌 | 10 |
-| `region` | 区域锚点 | 11 |
+| `cdn` | 开源 / 公共项目 | 5 |
+| `cloud` | 开发者 / 科研基础设施 | 10 |
+| `edu` | 大学 / 地区机构 | 12 |
 
-快速检测取 `cdn,cloud,tech`，共 24 个站点。地区键为 `global`（全球通用）、`us`（美国/北美）、`eu`（欧洲）、`jp`（日本）、`hk`（香港）、`sg`（东南亚/新加坡）、`cn`（中国大陆）、`au`（澳洲）、`kr`（韩国）。选择某地区会检测该区站点加全球通用站；`global` 只测全球通用站，显式 `all` 不限制地区。地区标签按站点归属分类，韩国包括 Samsung、LG；自动识别根据 OneBox 出口 IP 国家映射候选地区，不会定位候选站点的 IP，也不保证候选站点实际落在该地区。
+快速检测取 `cdn,cloud`，共 15 个站点。地区键为 `global`（全球通用）、`us`（美国/北美）、`eu`（欧洲）、`jp`（日本）、`hk`（香港）、`sg`（东南亚/新加坡）、`cn`（中国大陆）、`au`（澳洲）、`kr`（韩国）。选择某地区会检测该区站点加全球通用站；`global` 只测全球通用站，显式 `all` 不限制地区。地区标签按机构归属分类；自动识别根据 OneBox 出口 IP 国家映射候选地区，不会定位候选站点的 IP，也不保证候选站点实际落在该地区。
 
 每站使用 curl 检查 TLS 1.3、X25519、证书主机名/信任及实际 HTTP/2（h2）响应，不再启动 `openssl s_client`。HTTP 状态码为 403 等不影响 TLS 筛选。需要 curl ≥ 7.73、OpenSSL ≥ 1.1.1 TLS 后端和 HTTP2 支持；缺失依赖会自动安装，现有 curl 功能不足则提示并回退到预设，也可通过系统软件源升级 curl 或显式指定 `--sni`。curl ≥ 7.88 时统计服务端提供的证书链长度；旧版标为链长度未知，排在已知链之后。
 
@@ -108,24 +140,25 @@ sh install.sh install --version 1.14.3
 
 通过检查的短链站点（不超过 3 层）优先；同证书链等级内地区匹配站点优先，再按握手耗时排序；长链站点标为备选。耗时使用 `curl time_appconnect`，包含 DNS、TCP 和 TLS，不是纯 TLS 用时。自动推荐要求目标能返回 HTTP/2 响应，只有 TLS 握手成功而 HTTP 请求异常的站点不会入选。自动检测是 TLS 条件筛选，不能替代真实客户端的 Reality 连接验证；结果只代表服务器当前网络。
 
-无交互模式省略 `SNI` 时自动检测与出口地区匹配的候选和全球通用站并选择排名第一的站点，不等待输入；`ipwho.is` 查询失败时检测全部地区候选。检测失败或资源不足时自动使用第一个预设 `www.intel.com`，并提示未经本机测速。显式指定 `SNI` 可跳过自动检测；显式指定 `--sni-region all` 可扫描全部地区。
+无交互模式省略 `SNI` 时自动检测与出口地区匹配的候选和全球通用站并选择排名第一的站点，不等待输入；`ipwho.is` 查询失败时检测全部地区候选。检测失败或资源不足时自动使用第一个预设 `www.cesnet.cz`，并提示未经本机测速。显式指定 `SNI` 可跳过自动检测；显式指定 `--sni-region all` 可扫描全部地区。
 
 ```sh
 # 日本地区站点＋全球通用站，自动选择第一名
 onebox add --protocol reality --port 443 --sni-region jp
 
-# 只测教育、科技分类；可与地区取交集
-onebox add --protocol reality --port 443 --sni-category edu,tech --sni-region sg
+# 只测开源项目和科研基础设施；可与地区取交集
+onebox add --protocol reality --port 443 --sni-category cdn,cloud --sni-region sg
 
 # 用自定义列表替代内置候选，自动规范化网址、去重
 onebox add --protocol reality --port 443 \
-  --sni-hosts 'https://www.intel.com/ www.nus.edu.sg,www.amd.com' \
+  --sni-hosts 'https://www.cesnet.cz/ www.sinet.ad.jp,www.ethz.ch' \
   --sni-jobs 4 --sni-samples 3 --sni-timeout 5
 ```
 
 自动检测参数只适用于 `add --protocol reality`。省略 `--sni-region` 时按 OneBox 出口 IP 自动识别；显式 `--sni-region all` 扫描全部地区，其他地区键会与全球通用候选一起筛选。`--sni-category` 默认 `all`，可与地区组合。`--sni-hosts` 支持 1–256 个域名或 HTTP(S) 网址，以空格或逗号分隔，替换内置列表，不与地区/分类筛选混用；仅探测 HTTPS 443。`--sni-jobs` 为并发上限，范围 `1–16`，`--sni-samples` 范围 `1–5`，`--sni-timeout` 范围 `1–15` 秒。显式传入 `--sni` 优先，跳过所有检测步骤。
 
-## 添加节点
+<a id="add-node"></a>
+## ➕ 添加节点
 
 以下命令一次添加一个节点，完成后退出。`add` 也会自动安装内核、依赖和固定入口。已有同名节点或端口冲突时返回失败。
 
@@ -159,7 +192,8 @@ Shadowsocks 支持 `aes-128-gcm`、`aes-256-gcm`、`chacha20-ietf-poly1305`、`2
 
 新增规则会在变更前登记，部分放行失败时仍保留清理记录。iptables/ufw 查询异常或无法确认受管规则已消失时，清理返回失败并保留记录，处理后可重试。
 
-## 证书
+<a id="certificates"></a>
+## 🔐 证书
 
 Cloudflare DNS 验证，API Token 需具备目标区域的 DNS 编辑权限及区域读取权限：
 
@@ -188,7 +222,8 @@ onebox cert --cert self --sni bing.com
 
 同类节点共用一份真实/自签证书。已有证书与 `add` 指定的域名不匹配时会报错；应先确认已有节点的影响，再用 `cert` 更新共享证书。真实证书申请或复用时会安装并检查专属 cron 续期任务；该任务与管理操作共用锁，避免同时修改证书。更换域名后，旧域名中仍指向共享证书文件的续期记录会停用，失败时恢复原记录。续期数据保存在 onebox 专属目录。
 
-## Argo
+<a id="argo"></a>
+## ☁️ Argo
 
 ```sh
 onebox add --protocol argo --tag argo-1 --port 18080 \
@@ -214,7 +249,8 @@ onebox add --protocol argo --tag argo-1 --port 18080 \
 
 删除 Argo 节点时会备份隧道服务、受管 Token 及启用/运行状态；删除失败或中断时随节点配置一起恢复，恢复失败则保留事务备份并报错。
 
-## Komari KNS 适配器
+<a id="kns-adapter"></a>
+## 🔌 Komari KNS 适配器
 
 `onebox kns` schema 1 适配器版本为 `1.8.0`，支持历史节点只读发现、只读凭据导入、显式接管，以及 KNS 节点安装/状态/启停/重装/重配置/卸载和 Runtime 维护。`discover` 只返回 tag、协议、监听和可导入性，不返回凭据；`import` 只读取支持的旧节点并交给 KNS 加密保存，不修改 OneBox 配置。`claim` 会把一个受支持的旧入站迁移到 KNS 专属 tag 并写入受限权限的实例清单，保留原协议、端口、凭据和 TLS 配置；配置校验、共享服务重载或一次性 HTTPS 回调失败时会尝试回滚。接管后可通过 KNS 重配置、启停、重装和卸载该实例。接管和卸载都会重载共享 sing-box 服务，可能短暂影响同机其他节点；卸载只删除该 KNS 实例，不会停止或移除共享服务。只读 `status` 返回资源归属、共享引用计数和卸载预览。当前支持单用户 VLESS Reality、Hysteria2、TUIC、AnyTLS 和 Shadowsocks；VLESS WS/Argo、多用户节点和不完整配置会显示为暂不支持。停用或卸载仅在共享配置不再引用对应端口/协议时清理防火墙规则。回调包含协议凭据和 TLS 参数（包括 ALPN）。
 
@@ -279,7 +315,8 @@ install -o root -g root -m 0600 /dev/null /run/onebox/kns/requests/job-001.json
 
 相同实例与配置的重复 `install` 幂等；`reinstall` 从已保存的实例配置恢复并保留凭据，不能借此修改实例参数。配置变化应使用 `reconfigure`；同协议重配置会尽量复用现有凭据。`enable` 和 `disable` 只修改指定 KNS inbound，保留登记文件与凭据；`uninstall` 可删除启用或已停用实例，且需要携带相同机器 UUID 并通过一次性回调确认实例已移除。`list` 和 `status` 不显示凭据；状态等级只反映本机服务和监听情况，不等同于真实代理握手验证。
 
-## 查看、管理与更新
+<a id="management"></a>
+## 🧰 查看、管理与更新
 
 ```sh
 onebox list
@@ -314,7 +351,8 @@ onebox --help
 
 `logs` 默认查看 systemd journal，`--lines` 范围为 `1–1000`。OpenRC 当前未配置服务运行日志落盘，查看运行日志会提示并返回 `3`；两种服务管理器都可用 `--source install` 查看最近安装步骤日志。成功步骤的日志会删除；安装进行时可能显示当前步骤，安装结束后保留的是失败步骤。日志可能包含网络地址等信息，分享前请检查内容。
 
-## 卸载与清理
+<a id="uninstall"></a>
+## 🧹 卸载与清理
 
 ```sh
 onebox uninstall --yes

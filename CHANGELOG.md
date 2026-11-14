@@ -2,6 +2,14 @@
 
 本文件记录 OneBox 的正式版本变更。
 
+## [1.0.6] - 2026-11-14
+
+- Replace high-profile corporate SNI defaults with open-source, research-network, RIR/NIR, and regional university endpoints.
+- Remove built-in candidates hosted by Cloudflare and prune finance, commerce, gaming, media, airline, automotive, and other high-association categories.
+- Diversify fallback presets across Fastly, Bunny, and research or numbering-authority networks; every VPS still verifies TLS 1.3, X25519, certificate trust, and HTTP/2 at runtime.
+- Document that DNS, CDN, and ASN observations are snapshots and are not permanent domain metadata.
+- Refresh the README with compact badges, navigation, a feature overview, and a deployment diagram.
+
 ## [1.0.5] - 2026-11-11
 
 - Remove fixed RAM/swap preflight thresholds from maintenance, node, and dependency operations; report failures from the actual command.
