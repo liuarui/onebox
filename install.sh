@@ -108,7 +108,7 @@ KNS_STATE_DIR="$CONFIG_DIR/kns"
 KNS_INSTANCES_DIR="$KNS_STATE_DIR/instances"
 KNS_CERTS_DIR="$KNS_STATE_DIR/certs"
 KNS_REQUEST_DIR="/run/onebox/kns/requests"
-ONEBOX_SCRIPT_VERSION="1.0.6"
+ONEBOX_SCRIPT_VERSION="1.0.7"
 KNS_ADAPTER_VERSION="1.8.0"
 
 KERNEL_TMP_DIR=""
@@ -1550,9 +1550,9 @@ edu hk www.hku.hk
 edu hk www.hkust.edu.hk
 edu hk www.polyu.edu.hk
 edu us www.cmu.edu
-edu us www.waikato.ac.nz
-edu us www.ncku.edu.tw
-edu us www.ncu.edu.tw
+edu au www.waikato.ac.nz
+edu tw www.ncku.edu.tw
+edu tw www.ncu.edu.tw
 edu eu www.ethz.ch
 EOF
 }
@@ -1573,6 +1573,7 @@ eu 欧洲
 jp 日本
 hk 香港
 sg 东南亚/新加坡
+tw 台湾
 cn 中国大陆
 au 澳洲
 kr 韩国
@@ -1580,7 +1581,7 @@ EOF
 }
 
 valid_reality_sni_region() {
-    case "$1" in all|global|us|eu|jp|hk|sg|cn|au|kr) return 0 ;; *) return 1 ;; esac
+    case "$1" in all|global|us|eu|jp|hk|sg|tw|cn|au|kr) return 0 ;; *) return 1 ;; esac
 }
 
 reality_sni_region_from_country() {
@@ -1588,6 +1589,7 @@ reality_sni_region_from_country() {
         HK) printf 'hk\n' ;;
         JP) printf 'jp\n' ;;
         SG|MY|TH|ID|PH|VN|KH|LA|MM|BN|TL) printf 'sg\n' ;;
+        TW) printf 'tw\n' ;;
         CN) printf 'cn\n' ;;
         AU|NZ) printf 'au\n' ;;
         KR) printf 'kr\n' ;;
@@ -1645,12 +1647,13 @@ normalize_reality_sni_hosts() {
 }
 
 reality_sni_candidates() {
-    local area="${1:-all}" categories="${2:-all}" custom="${3:-}"
+    local area="${1:-all}" categories="${2:-all}" custom="${3:-}" scope="${4:-both}"
     valid_reality_sni_region "$area" && valid_reality_sni_categories "$categories" || return 1
     if [ -n "$custom" ]; then normalize_reality_sni_hosts "$custom"; return $?; fi
-    reality_sni_catalog | awk -v area="$area" -v cats="${categories//,/ }" '
+    reality_sni_catalog | awk -v area="$area" -v cats="${categories//,/ }" -v scope="$scope" '
       BEGIN {n=split(cats, keys, /[[:space:]]+/); for(i=1;i<=n;i++) selected[keys[i]]=1}
-      (area=="all" || $2=="global" || $2==area) && (selected["all"] || selected[$1]) && !seen[$3]++ {print $3}'
+      (area=="all" || (scope!="regional" && $2=="global") || (scope!="global" && $2==area)) &&
+      (selected["all"] || selected[$1]) && !seen[$3]++ {print $3}'
 }
 
 select_reality_sni_preset() {
@@ -2173,7 +2176,10 @@ run_reality_sni_selection() {
                     tier=0; [ "$chain" -le 3 ] || tier=1
                     [ "$chain" != 0 ] || tier=2
                     region_priority=0
-                    if [ "$sni_region" != all ] && [ "${sni_host_regions[$host]:-}" != "$sni_region" ]; then region_priority=1; fi
+                    if [ "$sni_region" != all ] && [ "${sni_host_regions[$host]:-}" != "$sni_region" ] &&
+                       [ "${sni_host_regions[$host]:-}" != global ]; then
+                        region_priority=2
+                    fi
                     matches+=("$tier"$'\t'"$region_priority"$'\t'"$score"$'\t'"$chain"$'\t'"$host")
                     result="$chain 层"; [ "$chain" != 0 ] || result=未知
                     printf ' [%s/%s] %s：通过（证书链 %s）\n' "$completed" "${#candidates[@]}" "$host" "$result" >&2
@@ -2195,7 +2201,7 @@ run_reality_sni_selection() {
         return 1
     fi
     ranked=$(printf '%s\n' "${matches[@]}" | LC_ALL=C sort -k1,1n -k2,2n -k3,3n -k5,5) || return 1
-    printf '\n候选 SNI（短证书链优先；同链等级优先同地区候选，再按耗时排序；通过 %s/%s）：\n' "${#matches[@]}" "${#candidates[@]}" >&2
+    printf '\n候选 SNI（短证书链优先；同链等级优先地区机构，再按耗时排序；通过 %s/%s）：\n' "${#matches[@]}" "${#candidates[@]}" >&2
     while IFS=$'\t' read -r tier region_priority score chain host; do
         hosts+=("$host"); index=$((index+1))
         result="约 $score ms"; [ "$score" != 2147483647 ] || result='耗时未测得'
@@ -2203,7 +2209,7 @@ run_reality_sni_selection() {
         case "$tier" in 1) answer='长链备选，需验证兼容性' ;; 2) answer='链长度未知，需验证兼容性'; chain='未知' ;; esac
         candidate_region=''
         if [ "$sni_region" != all ]; then
-            [ "$region_priority" = 0 ] && candidate_region='地区匹配' || candidate_region='全球/其他备选'
+            [ "$region_priority" = 0 ] && candidate_region='地区匹配' || candidate_region='全球备选'
         fi
         printf ' %s) %s（%s，链 %s 层，%s%s）\n' "$index" "$host" "$result" "$chain" "$answer" "${candidate_region:+，$candidate_region}" >&2
     done <<< "$ranked"
@@ -5108,7 +5114,7 @@ add 选项:
                                无交互省略则自动优选，失败使用第一个预设
                                自签证书域名默认 bing.com
 Reality SNI 自动检测选项（仅 add --protocol reality）:
-  --sni-region all|global|us|eu|jp|hk|sg|cn|au|kr（省略时自动识别出口 IP 地区）
+  --sni-region all|global|us|eu|jp|hk|sg|tw|cn|au|kr（省略时自动识别出口 IP 地区）
   --sni-category all|cdn,cloud,edu
                                默认 all；与地区筛选取交集，地区包含全球通用站
   --sni-hosts 'HOST URL ...'    自定义列表替代内置列表，空格/逗号分隔
@@ -5116,6 +5122,7 @@ Reality SNI 自动检测选项（仅 add --protocol reality）:
   --sni-jobs 1..16             并发上限，默认 8；按剩余 PID/内存额度自动下调
   --sni-samples 1..5           每站测速次数，默认 3，取最小值
   --sni-timeout 1..15          每次请求超时秒数，默认 5
+                               具体地区先测本地机构，再测该地区全球通用站
                                短证书链优先、同组按耗时排名；--sni 跳过检测
 其他 add 选项:
   --cert self|real             默认 self
@@ -5236,7 +5243,7 @@ parse_cli() {
     local host
     for host in "$CLI_SNI" "$CLI_DOMAIN"; do [ -z "$host" ] || valid_host "$host" || die "域名格式错误：$host" 2; done
     for host in "$CLI_ADDRESS" "$CLI_EDGE"; do [ -z "$host" ] || valid_host "$host" true || die "地址格式错误：$host" 2; done
-    valid_reality_sni_region "$CLI_SNI_REGION" || die '--sni-region 必须是 all/global/us/eu/jp/hk/sg/cn/au/kr。' 2
+    valid_reality_sni_region "$CLI_SNI_REGION" || die '--sni-region 必须是 all/global/us/eu/jp/hk/sg/tw/cn/au/kr。' 2
     valid_reality_sni_categories "$CLI_SNI_CATEGORIES" || die '--sni-category 含未知分类，请查看 --help。' 2
     [[ "$CLI_SNI_JOBS" =~ ^[1-9][0-9]?$ ]] && [ "$CLI_SNI_JOBS" -le 16 ] || die '--sni-jobs 必须为 1–16 的整数。' 2
     [[ "$CLI_SNI_SAMPLES" =~ ^[1-5]$ ]] || die '--sni-samples 必须为 1–5 的整数。' 2
