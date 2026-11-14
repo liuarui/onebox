@@ -8,6 +8,7 @@
 - Remove built-in candidates hosted by Cloudflare and prune finance, commerce, gaming, media, airline, automotive, and other high-association categories.
 - Diversify fallback presets across Fastly, Bunny, and research or numbering-authority networks; every VPS still verifies TLS 1.3, X25519, certificate trust, and HTTP/2 at runtime.
 - Document that DNS, CDN, and ASN observations are snapshots and are not permanent domain metadata.
+- Clarify that less-associated domains reduce visible network overlap but cannot guarantee resistance to blocking or active probing; VPS IP reputation and traffic behavior still matter.
 - Refresh the README with compact badges, navigation, a feature overview, and a deployment diagram.
 
 ## [1.0.5] - 2026-11-11
