@@ -108,7 +108,7 @@ KNS_STATE_DIR="$CONFIG_DIR/kns"
 KNS_INSTANCES_DIR="$KNS_STATE_DIR/instances"
 KNS_CERTS_DIR="$KNS_STATE_DIR/certs"
 KNS_REQUEST_DIR="/run/onebox/kns/requests"
-ONEBOX_SCRIPT_VERSION="1.0.8"
+ONEBOX_SCRIPT_VERSION="1.0.9"
 KNS_ADAPTER_VERSION="1.8.0"
 
 KERNEL_TMP_DIR=""
@@ -1526,6 +1526,8 @@ reality_sni_catalog() {
     # This is a reviewable seed pool, not a permanent ASN or reachability map.
     # Every machine probes its own DNS path at runtime; exclude Cloudflare-
     # hosted names here and diversify across networks where practical.
+    # Additions reviewed 2026-11-14: Netnod (TU-stiftelsen-owned) and NLnet
+    # Labs (nonprofit open-source foundation); both use the existing eu group.
     cat <<'EOF'
 cdn global files.pythonhosted.org
 cdn global www.kernel.org
@@ -1540,6 +1542,8 @@ cloud global www.isc.org
 cloud global www.cesnet.cz
 cloud eu www.surf.nl
 cloud eu www.nic.cz
+cloud eu www.netnod.se
+cloud eu www.nlnetlabs.nl
 cloud us www.lacnic.net
 cloud global www.afrinic.net
 edu jp www.sinet.ad.jp

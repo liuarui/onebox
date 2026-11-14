@@ -2,6 +2,13 @@
 
 本文件记录 OneBox 的正式版本变更。
 
+## [1.0.9] - 2026-11-14
+
+- Add Netnod and NLnet Labs as European infrastructure candidates, expanding the default SNI catalog from 27 to 29 hosts.
+- Restrict this addition to independent civilian organizations; leave government, state research, public-university, and registry candidates out of the new batch.
+- Reuse the existing European region filter and ranking; keep adapter schema 1 and version `1.8.0`.
+- Review organization identity and DNS/IPv4 ASN snapshots only; leave TLS, HTTP/2, and Reality suitability to each VPS.
+
 ## [1.0.8] - 2026-11-14
 
 - Rank selected-region candidates ahead of global fallback endpoints within the same certificate-chain tier.
