@@ -108,8 +108,9 @@ KNS_STATE_DIR="$CONFIG_DIR/kns"
 KNS_INSTANCES_DIR="$KNS_STATE_DIR/instances"
 KNS_CERTS_DIR="$KNS_STATE_DIR/certs"
 KNS_REQUEST_DIR="/run/onebox/kns/requests"
-ONEBOX_SCRIPT_VERSION="1.0.9"
+ONEBOX_SCRIPT_VERSION="1.0.10"
 KNS_ADAPTER_VERSION="1.8.0"
+DEFAULT_SELF_SNI="www.python.org"
 
 KERNEL_TMP_DIR=""
 declare -a SB_OWNED_TEMP_FILES=()
@@ -2565,10 +2566,28 @@ deploy_real_cert() {
     )
 }
 
+certificate_common_name() {
+    local cert="$1" subject
+    CERT_COMMON_NAME=''
+    command -v openssl >/dev/null 2>&1 || return 1
+    subject=$(openssl x509 -in "$cert" -noout -subject -nameopt RFC2253 2>/dev/null) || return 1
+    [[ "$subject" == *CN=* ]] || return 1
+    subject="${subject#*CN=}"
+    subject="${subject%%,*}"
+    [ -n "$subject" ] || return 1
+    CERT_COMMON_NAME="$subject"
+}
+
 generate_self_cert() {
     ensure_deps openssl || return 1
-    local NEW_DOMAIN
-    NEW_DOMAIN=$(get_domain "请输入伪装域名" "bing.com") || return 1
+    load_secrets || { echo -e "${RED}[错误] 无法读取 OneBox 本地密钥文件。${PLAIN}" >&2; return 1; }
+    local NEW_DOMAIN default_domain="${SELF_DOMAIN:-}"
+    if [ -z "$default_domain" ] && [ -s "$CERT_DIR/self.cer" ] &&
+       certificate_common_name "$CERT_DIR/self.cer"; then
+        default_domain="$CERT_COMMON_NAME"
+    fi
+    [ -n "$default_domain" ] || default_domain="$DEFAULT_SELF_SNI"
+    NEW_DOMAIN=$(get_domain "请输入伪装域名" "$default_domain") || return 1
     echo -e "${CYAN}[信息] 正在生成自签证书...${PLAIN}"
     (
         umask 077
@@ -2852,7 +2871,13 @@ resolve_conn() {
         CONN_INSECURE=0
         CONN_SNI=$REAL_DOMAIN
     elif [[ "$cert_path" == *"/self.cer" ]]; then
-        CONN_SNI=${SELF_DOMAIN:-bing.com}
+        CONN_SNI=${SELF_DOMAIN:-}
+        if [ -z "$CONN_SNI" ] && [ -s "$cert_path" ] &&
+           certificate_common_name "$cert_path"; then
+            CONN_SNI="$CERT_COMMON_NAME"
+            save_secret "SELF_DOMAIN" "$CONN_SNI" || :
+        fi
+        [ -n "$CONN_SNI" ] || CONN_SNI="$DEFAULT_SELF_SNI"
     fi
 }
 
@@ -5124,9 +5149,9 @@ add 选项:
   --protocol reality|hysteria2|tuic|anytls|argo|shadowsocks
   --tag NAME --port 1..65535 --uuid UUID --password VALUE
   --password-file PATH（或环境变量 SB_PASSWORD）
-  --sni DOMAIN                 指定 Reality 伪装域名并跳过检测
-                               无交互省略则自动优选，失败使用第一个预设
-                               自签证书域名默认 bing.com
+  --sni DOMAIN                 指定 Reality 伪装域名或自签证书 SNI
+                               Reality 无交互省略时自动优选，失败使用第一个预设
+                               自签证书未指定时默认 www.python.org
 Reality SNI 自动检测选项（仅 add --protocol reality）:
   --sni-region all|global|us|eu|jp|hk|sg|tw|cn|au|kr（省略时自动识别出口 IP 地区）
   --sni-category all|cdn,cloud,edu
@@ -5491,19 +5516,12 @@ kns_list() {
 }
 
 onebox_certificate_domain() {
-    local cert="$1" subject
     KNS_CERT_COMMON_NAME=''
-    command -v openssl >/dev/null 2>&1 || return 1
-    subject=$(openssl x509 -in "$cert" -noout -subject -nameopt RFC2253 2>/dev/null) || return 1
-    [[ "$subject" == *CN=* ]] || return 1
-    subject="${subject#*CN=}"
-    subject="${subject%%,*}"
-    [ -n "$subject" ] || return 1
-    KNS_CERT_COMMON_NAME="$subject"
+    certificate_common_name "$1" && KNS_CERT_COMMON_NAME="$CERT_COMMON_NAME"
 }
 
 kns_discover() {
-    local file registered='[]' real_domain self_domain='bing.com' public_key_ports='' port pub_var pub separator=''
+    local file registered='[]' real_domain self_domain='' public_key_ports='' port pub_var pub separator=''
     local -a manifests=() reality_ports=()
     require_config readonly || return 1
     if [ -d "$KNS_INSTANCES_DIR" ] && [ ! -L "$KNS_INSTANCES_DIR" ]; then
@@ -5517,7 +5535,12 @@ kns_discover() {
     fi
     load_secrets || return 1
     real_domain=${REAL_DOMAIN:-}
-    self_domain=${SELF_DOMAIN:-bing.com}
+    self_domain=${SELF_DOMAIN:-}
+    if [ -z "$self_domain" ] && [ -s "$CERT_DIR/self.cer" ] &&
+       certificate_common_name "$CERT_DIR/self.cer"; then
+        self_domain="$CERT_COMMON_NAME"
+    fi
+    [ -n "$self_domain" ] || self_domain="$DEFAULT_SELF_SNI"
     # Prefer OneBox metadata. A single openssl process is a legacy fallback;
     # avoid the former openssl|sed|tr pipeline in constrained containers.
     if [ -z "$real_domain" ] && [ -s "$CERT_DIR/real.cer" ]; then
@@ -6072,7 +6095,14 @@ kns_import_legacy() {
             if [ -z "$sni" ] && [ -s "$cert_path" ]; then
                 onebox_certificate_domain "$cert_path" && sni="$KNS_CERT_COMMON_NAME"
             fi ;;
-          */self.cer) sni=${SELF_DOMAIN:-bing.com}; allow_insecure=true ;;
+          */self.cer)
+            sni=${SELF_DOMAIN:-}
+            if [ -z "$sni" ] && [ -s "$cert_path" ] &&
+               certificate_common_name "$cert_path"; then
+                sni="$CERT_COMMON_NAME"
+            fi
+            [ -n "$sni" ] || sni="$DEFAULT_SELF_SNI"
+            allow_insecure=true ;;
         esac
     fi
     case "$cert_path" in */self.cer) allow_insecure=true ;; esac

@@ -183,7 +183,7 @@ onebox add --protocol shadowsocks --tag ss-1 --port 11443 --method aes-128-gcm
 | `--uuid UUID` | Reality、TUIC、Argo 的 UUID；省略则随机生成 |
 | `--password-file PATH` | 从单行文件读取密码；也支持 `SB_PASSWORD` 环境变量和 `--password VALUE` |
 | `--cert self\|real` | Hysteria2/TUIC/AnyTLS 使用的证书；默认 `self` |
-| `--sni DOMAIN` | 指定 Reality 伪装域名并跳过自动检测；无交互省略时检测选第一名，失败使用第一个预设；新自签证书域名默认 `bing.com` |
+| `--sni DOMAIN` | 指定 Reality 伪装域名或自签证书 SNI；Reality 无交互省略时检测选第一名，失败使用第一个预设；新自签证书域名默认 `www.python.org`（非微软） |
 | `--address HOST_OR_IP` | 分享链接中的服务器地址；省略则查询公网 IP，IPv6 不加方括号 |
 | `--firewall auto\|skip` | 默认 `auto`，使用已有 ufw/firewalld/iptables 放行；`skip` 跳过 |
 | `--version VERSION` | 内核未安装时选择的版本；已有内核用 `update` 更新 |
@@ -221,8 +221,10 @@ onebox cert --cert real --domain node.example.com --validation http --http01-rea
 自签证书单独生成：
 
 ```sh
-onebox cert --cert self --sni bing.com
+onebox cert --cert self --sni www.python.org
 ```
+
+自签证书域名默认使用 `www.python.org`，不再使用微软的 `bing.com`。该域名只作为证书 CN 和客户端 SNI 伪装，客户端仍需允许不验证证书；Hysteria2、TUIC、AnyTLS 共用同一份自签证书，因此修改默认值会同时影响这些协议，KNS 发现和导入旧自签节点时也会优先读取证书 CN 而不是猜测域名。需要更换时可改用 `www.kernel.org`、`www.cesnet.cz`、`www.apache.org`、`www.surf.nl` 等已支持 TLS 1.3 和 HTTP/2 的非微软站点；已有自签证书会沿用当前域名，除非重新生成。
 
 同类节点共用一份真实/自签证书。已有证书与 `add` 指定的域名不匹配时会报错；应先确认已有节点的影响，再用 `cert` 更新共享证书。真实证书申请或复用时会安装并检查专属 cron 续期任务；该任务与管理操作共用锁，避免同时修改证书。更换域名后，旧域名中仍指向共享证书文件的续期记录会停用，失败时恢复原记录。续期数据保存在 onebox 专属目录。
 

@@ -2,6 +2,13 @@
 
 本文件记录 OneBox 的正式版本变更。
 
+## [1.0.10] - 2026-11-18
+
+- Replace the Microsoft `bing.com` default for self-signed TLS certificates with `www.python.org`, a non-Microsoft open-source endpoint that supports TLS 1.3, HTTP/2, and QUIC.
+- Apply the shared self-signed SNI consistently to Hysteria2, TUIC, AnyTLS, share links, and KNS legacy discovery/import.
+- Read the certificate CN when `SELF_DOMAIN` is missing instead of falling back to a guessed domain.
+- Keep the Reality SNI catalog and KNS adapter schema unchanged.
+
 ## [1.0.9] - 2026-11-14
 
 - Add Netnod and NLnet Labs as European infrastructure candidates, expanding the default SNI catalog from 27 to 29 hosts.
