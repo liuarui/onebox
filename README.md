@@ -19,6 +19,7 @@
 | 能力 | 说明 |
 | --- | --- |
 | 节点部署 | 交互式菜单或无交互命令安装 VLESS Reality、Hysteria2、TUIC、AnyTLS、Shadowsocks、Trojan、VMess 与 Argo 节点 |
+| HY2 端口跳跃 | 为新旧 Hysteria2 节点管理 UDP 转发范围，导出多端口链接、Mihomo 和 sing-box 配置 |
 | Reality SNI | 按 VPS 出口地区、分类或自定义列表扫描；每台机器独立验证 TLS 1.3、X25519、证书与 HTTP/2 |
 | 证书与隧道 | 自签或 ACME 证书、Cloudflare DNS 验证、Argo 隧道及续期管理 |
 | 集中管理 | 查看、更新、诊断、备份与卸载；通过 schema 1 适配器接入 KNS |
@@ -187,6 +188,8 @@ onebox add --protocol shadowsocks --tag ss-1 --port 11443 --method aes-128-gcm
 | `--address HOST_OR_IP` | 分享链接中的服务器地址；省略则查询公网 IP，IPv6 不加方括号 |
 | `--firewall auto\|skip` | 默认 `auto`，使用已有 ufw/firewalld/iptables 放行；`skip` 跳过 |
 | `--version VERSION` | 内核未安装时选择的版本；已有内核用 `update` 更新 |
+| `--hop-ports START-END` | 仅 Hysteria2，启用连续 UDP 跳跃范围；省略则保持单端口 |
+| `--hop-interval SECONDS` | 客户端跳跃间隔，默认 `30` 秒，范围 `5–3600`；配合 `--hop-ports` |
 
 未指定密码时随机生成。密码文件建议 `chmod 600`；文件内容和环境变量不会作为 shell 代码执行。创建成功会输出节点凭据及链接，请妥善保存输出。自签证书需要客户端允许不验证证书。
 
@@ -195,6 +198,34 @@ Shadowsocks 支持 `aes-128-gcm`、`aes-256-gcm`、`chacha20-ietf-poly1305`、`2
 自动放行仅处理本机已识别的防火墙，云安全组需要自行配置；裸 iptables 未配置持久化时，新增规则仅在当前运行期生效。firewalld 新规则会分别写入并核验永久与运行时状态，不会全局 reload；已有永久规则会补齐当前放行，已有临时规则则复用并提示自行持久化，卸载时保留这些已有规则。
 
 新增规则会在变更前登记，部分放行失败时仍保留清理记录。iptables/ufw 查询异常或无法确认受管规则已消失时，清理返回失败并保留记录，处理后可重试。
+
+### 🔀 Hysteria2 端口跳跃
+
+从 `v1.0.12` 起，添加 Hysteria2 时可以填写连续 UDP 跳跃范围。已有节点先执行 `onebox update-script`，再进入 `onebox` →「更改节点」→ 选择 Hysteria2 →「设置 / 关闭端口跳跃」。填写 `20000-50000` 启用，填写 `off` 关闭。菜单使用 30 秒客户端跳跃间隔；命令行可以调整。
+
+```sh
+# 添加带跳跃的新节点，主监听端口须在跳跃范围之外
+onebox add --protocol hysteria2 --tag hy2-1 --port 443 --cert self \
+  --hop-ports 20000-50000 --hop-interval 30
+
+# 为已有节点启用或修改跳跃范围，无需重建密码或证书
+onebox hopping --tag hy2-1 --hop-ports 20000-50000 --hop-interval 30
+
+# 导出客户端配置片段；可用 --address 指定公网连接地址
+onebox links --tag hy2-1 --format mihomo
+onebox links --tag hy2-1 --format sing-box
+
+# 恢复单端口连接，保留原节点
+onebox hopping --tag hy2-1 --hop-ports off
+```
+
+sing-box 服务端仍监听原来的单个 UDP 端口；OneBox 使用专属 `inet onebox_hopping` nftables 表，将跳跃范围内发往本机的 UDP 包转到该端口。需要支持 **inet NAT 的 Linux 内核（5.2+）**、`nft` 和管理防火墙的权限；启用时会安装缺失的 nftables 工具。受限 LXC 若没有这些权限会报错并恢复原配置。范围不能包含主监听端口、其他 UDP 监听端口或其他节点的跳跃范围；启用后请将该范围留给此节点使用。支持通配监听 `::`、`0.0.0.0`，仅 IPv4 的监听不会创建 IPv6 转发。
+
+本机防火墙仍需允许**主监听端口**；**云安全组和上游防火墙需允许主端口及整个跳跃范围的 UDP 入站**。NAT 规则不会绕过其他防火墙链，也不会接管经过本机转发的远程流量。复杂的自定义 NAT 或上游端口映射可能需要额外配置。systemd / OpenRC 启动服务时恢复规则，停止服务时清理规则；更改监听端口、重命名、删除节点和卸载会同步处理。手动全局重载 nftables 并清空规则后，执行 `onebox restart` 恢复；请保留现有的其他防火墙配置。
+
+默认 `onebox links` 为跳跃节点生成[官方多端口 URI](https://v2.hysteria.network/docs/developers/URI-Scheme/)，端口部分例如 `443,20000-50000`。部分客户端的 URI 导入不支持多端口时，请使用 `--format mihomo` 或 `--format sing-box` 的配置片段。Mihomo 输出 `ports`、`hop-interval`；sing-box **1.11.0+** 输出 `server_ports`、`hop_interval`，其中范围使用冒号。输出为 JSON（亦是有效 YAML），将 `proxies` / `outbounds` 中的节点合并进客户端现有配置。官方 URI 不携带跳跃间隔，导入后请在客户端设置；默认 30 秒。关闭跳跃后需重新获取并更新客户端配置。导出内容包含节点凭据，请妥善保管。
+
+当前 KNS 的订阅和节点接口只支持单端口 HY2。开启跳跃的节点在发现结果中标为 `port_hopping_requires_onebox`，不能导入或接管；KNS 已管理的节点也不能通过此入口开启跳跃。需要交给 KNS 时，先在 OneBox 关闭跳跃，再扫描导入。
 
 <a id="certificates"></a>
 ## 🔐 证书
