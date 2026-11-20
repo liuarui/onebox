@@ -2,6 +2,13 @@
 
 本文件记录 OneBox 的正式版本变更。
 
+## [1.0.12] - 2026-11-20
+
+- Add Hysteria2 UDP port hopping for new and existing standalone nodes through the menu and `onebox hopping` command (Issue #2).
+- Own a dedicated nftables redirect table, reserve configured UDP ranges, and restore or clear rules with systemd/OpenRC service lifecycle. Preserve hopping settings through configuration rollback, port changes, renames, deletion, and uninstall.
+- Export official multi-port share URIs and Mihomo/sing-box client configuration fragments with hopping intervals; retain existing single-port behavior when hopping is disabled.
+- Explicitly reject KNS import/takeover of hopping nodes until its client and subscription schema can represent their ranges.
+
 ## [1.0.11] - 2026-11-20
 
 - Open the interactive menu without taking the operation lock, so an idle menu cannot block KNS or ACME renewal.

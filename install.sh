@@ -57,7 +57,7 @@ if [ "$bootstrap_needs_bash" = 1 ]; then
             if [ "$bootstrap_skip_value" = 1 ]; then bootstrap_skip_value=0; continue; fi
             case "$bootstrap_arg" in
                 doctor|status|logs) echo '[错误] 只读查看需要 Bash 4 或更高版本，请先自行安装 Bash。' >&2; exit 3 ;;
-                --protocol|--tag|--port|--uuid|--password|--password-file|--tunnel-token-file|--cf-token-file|--cert|--method|--sni|--sni-region|--sni-category|--sni-hosts|--sni-jobs|--sni-samples|--sni-timeout|--domain|--version|--validation|--address|--edge|--strategy|--firewall|--lines|--source) bootstrap_skip_value=1 ;;
+                --protocol|--tag|--port|--uuid|--password|--password-file|--tunnel-token-file|--cf-token-file|--cert|--method|--sni|--sni-region|--sni-category|--sni-hosts|--sni-jobs|--sni-samples|--sni-timeout|--domain|--version|--validation|--address|--edge|--strategy|--firewall|--lines|--source|--hop-ports|--hop-interval|--format) bootstrap_skip_value=1 ;;
                 -*) ;;
                 *) break ;;
             esac
@@ -103,12 +103,14 @@ CONFIG_FILE="$CONFIG_DIR/config.json"
 CERT_DIR="$CONFIG_DIR/cert"
 SECRETS_FILE="$CONFIG_DIR/.secrets"
 FW_PORTS_FILE="$CONFIG_DIR/.fw_ports"
+HOPPING_FILE="$CONFIG_DIR/port_hopping.json"
+HOPPING_HELPER="/usr/local/lib/onebox/port-hopping"
 ACME_HOME="/var/lib/onebox/acme"
 KNS_STATE_DIR="$CONFIG_DIR/kns"
 KNS_INSTANCES_DIR="$KNS_STATE_DIR/instances"
 KNS_CERTS_DIR="$KNS_STATE_DIR/certs"
 KNS_REQUEST_DIR="/run/onebox/kns/requests"
-ONEBOX_SCRIPT_VERSION="1.0.11"
+ONEBOX_SCRIPT_VERSION="1.0.12"
 KNS_ADAPTER_VERSION="1.8.0"
 DEFAULT_SELF_SNI="www.python.org"
 MENU_RECOVERY_FAILED=76
@@ -439,6 +441,7 @@ check_port_in_config() {
     local port="$1"
     local proto="${2:-both}"
     local exclude_tag="${3:-}"
+    if [ "$proto" != tcp ] && hopping_port_reserved "$port"; then return 0; fi
     [ -f "$CONFIG_FILE" ] || return 1
     local existing
     existing=$(jq -r --argjson p "$port" --arg ex "$exclude_tag" '
@@ -715,6 +718,222 @@ cleanup_node_secrets() {
         remove_secret "REALITY_PUB_${port}" || return 1
     fi
     return 0
+}
+
+hopping_load() {
+    HOPPING_STATE='{}'
+    [ -e "$HOPPING_FILE" ] || [ -L "$HOPPING_FILE" ] || return 0
+    [ -f "$HOPPING_FILE" ] && [ ! -L "$HOPPING_FILE" ] || return 1
+    HOPPING_STATE=$(jq -ce '
+      def integer: type == "number" and floor == .;
+      select(type == "object") | select(all(to_entries[];
+        (.key | test("^[A-Za-z0-9_-]+$")) and
+        (.value | type == "object" and
+          (.start | integer and . >= 1 and . <= 65535) and
+          (.end | integer and . >= 1 and . <= 65535) and .start < .end and
+          (.interval | integer and . >= 5 and . <= 3600))))
+    ' "$HOPPING_FILE") || { printf '[错误] 端口跳跃记录无法读取，已取消操作。\n' >&2; return 1; }
+}
+
+hopping_write() {
+    local tmp
+    tmp=$(mktemp "$CONFIG_DIR/.hopping.XXXXXX") || return 1
+    SB_OWNED_TEMP_FILES+=("$tmp")
+    if ! printf '%s\n' "$HOPPING_STATE" > "$tmp" || ! chmod 600 "$tmp" || ! mv -f "$tmp" "$HOPPING_FILE"; then
+        rm -f "$tmp"; return 1
+    fi
+}
+
+hopping_port_reserved() {
+    [ -e "$HOPPING_FILE" ] || [ -L "$HOPPING_FILE" ] || return 1
+    hopping_load || return 0
+    jq -e --argjson p "$1" 'any(.[]; .start <= $p and $p <= .end)' <<< "$HOPPING_STATE" >/dev/null
+}
+
+valid_hopping_range() {
+    [[ "$1" =~ ^([1-9][0-9]{0,4})-([1-9][0-9]{0,4})$ ]] &&
+        [ "${BASH_REMATCH[1]}" -lt "${BASH_REMATCH[2]}" ] && [ "${BASH_REMATCH[2]}" -le 65535 ]
+}
+
+# Also emitted into the boot helper. It must not depend on the operation lock:
+# systemd/OpenRC invokes it while the parent OneBox transaction holds that lock.
+hopping_rules() (
+    local mode="${1:-apply}" tables owned=0 rules rows tag start end port address interval state
+    [ "$EUID" = 0 ] || return 1
+    case "$mode" in apply|clear|check) ;; *) return 2 ;; esac
+    command -v nft >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 || return 1
+    mkdir -p /run/lock || return 1
+    exec 9>/run/lock/onebox-hopping.lock || return 1
+    flock -w 15 -x 9 || return 1
+    tables=$(nft -j list tables) || return 1
+    if jq -e 'any(.nftables[]; .table.family? == "inet" and .table.name? == "onebox_hopping")' <<< "$tables" >/dev/null; then
+        tables=$(nft -j list table inet onebox_hopping) || return 1
+        jq -e 'any(.nftables[]; .chain.name? == "onebox_owned_v1")' <<< "$tables" >/dev/null || {
+            printf '[错误] 同名 nftables 表不属于 OneBox，拒绝覆盖。\n' >&2; return 1;
+        }
+        owned=1
+    fi
+    if [ "$mode" = clear ]; then
+        [ "$owned" = 0 ] || nft delete table inet onebox_hopping || return 1
+        return 0
+    fi
+    if [ "$mode" = check ]; then state="$2"
+    else hopping_load || return 1; state="$HOPPING_STATE"; fi
+    rows=''
+    if [ "$state" != '{}' ]; then
+        # Validate the complete desired state before changing any live rules.
+        rows=$(jq -er --argjson hops "$state" '
+          def udp: .type as $t | if $t == "hysteria2" or $t == "tuic" then true
+            elif .network == "tcp" then false
+            elif (["vless","anytls","trojan","vmess"] | index($t)) != null then false else true end;
+          .inbounds as $ins |
+          [$hops | to_entries[] | .key as $tag | .value as $h |
+            [$ins[] | select(.tag == $tag)] as $nodes |
+            if ($nodes | length) != 1 then error("hopping node missing or duplicated") else $nodes[0] end |
+            . as $node |
+            if .type != "hysteria2" or (["::","0.0.0.0"] | index($node.listen // "::")) == null
+              then error("unsupported hopping listener") else . end |
+            {tag:$tag,start:$h.start,end:$h.end,interval:$h.interval,port:.listen_port,address:(.listen // "::")}] as $rules |
+          if any($rules[]; . as $a | any($rules[]; .tag != $a.tag and .start <= $a.end and .end >= $a.start))
+            then error("overlapping hopping ranges")
+          elif any($rules[]; . as $r | any($ins[]; udp and .listen_port >= $r.start and .listen_port <= $r.end))
+            then error("hopping range overlaps a UDP listener")
+          else $rules[] | [.tag,.start,.end,.port,.address,.interval] | @tsv end
+        ' "$CONFIG_FILE") || return 1
+    fi
+    rules=$(mktemp /run/onebox-hopping.XXXXXX) || return 1
+    trap 'rm -f "$rules"' EXIT
+    if [ "$owned" = 1 ]; then printf 'delete table inet onebox_hopping\n' > "$rules" || return 1; fi
+    if [ -n "$rows" ]; then
+        printf '%s\n' 'table inet onebox_hopping {' '  chain onebox_owned_v1 {}' \
+            '  chain prerouting {' '    type nat hook prerouting priority dstnat; policy accept;' >> "$rules" || return 1
+        while IFS=$'\t' read -r tag start end port address interval; do
+            # Never redirect traffic being routed through this host. NAT then
+            # reaches INPUT on the original listener, using its existing permit.
+            if [ "$address" = 0.0.0.0 ]; then printf '    meta nfproto ipv4 ' >> "$rules" || return 1
+            else printf '    ' >> "$rules" || return 1; fi
+            printf 'fib daddr type local udp dport %s-%s counter redirect to :%s\n' "$start" "$end" "$port" >> "$rules" || return 1
+        done <<< "$rows"
+        printf '  }\n}\n' >> "$rules" || return 1
+    fi
+    [ -s "$rules" ] || return 0
+    nft --check --file "$rules" || return 1
+    [ "$mode" = check ] || nft --file "$rules"
+)
+
+hopping_setup() {
+    local tmp unit=/etc/systemd/system/onebox.service.d/30-onebox-hopping.conf
+    ensure_deps nft jq flock || return 1
+    if { [ -e "$HOPPING_HELPER" ] || [ -L "$HOPPING_HELPER" ]; } &&
+       { [ -L "$HOPPING_HELPER" ] || ! grep -q '^# Managed by OneBox port hopping v1$' "$HOPPING_HELPER"; }; then
+        printf '[错误] 端口跳跃辅助程序路径已被其他文件占用。\n' >&2; return 1
+    fi
+    mkdir -p /usr/local/lib/onebox || return 1
+    tmp=$(mktemp /usr/local/lib/onebox/.hopping.XXXXXX) || return 1
+    SB_OWNED_TEMP_FILES+=("$tmp")
+    {
+        printf '#!/usr/bin/env bash\n# Managed by OneBox port hopping v1\numask 077\n'
+        printf 'CONFIG_DIR=%q\nCONFIG_FILE=%q\nHOPPING_FILE=%q\n' "$CONFIG_DIR" "$CONFIG_FILE" "$HOPPING_FILE"
+        declare -f hopping_load hopping_rules
+        printf 'hopping_rules "$@"\n'
+    } > "$tmp" || return 1
+    chmod 755 "$tmp" && mv -f "$tmp" "$HOPPING_HELPER" || return 1
+    if [ "$SERVICE_MANAGER" = openrc ]; then
+        # Existing custom hooks need explicit integration; do not overwrite them.
+        [ -f /etc/init.d/onebox ] || return 0
+        if grep -q '^# Managed by OneBox port hopping v1$' /etc/init.d/onebox; then return 0; fi
+        if ! grep -q '^command="/usr/local/lib/onebox/sing-box"$' /etc/init.d/onebox ||
+           ! grep -q '^depend() { need net; }$' /etc/init.d/onebox ||
+           grep -qE '^[[:space:]]*(start_pre|stop_post)[[:space:]]*\(' /etc/init.d/onebox; then
+            printf '[错误] OpenRC 启动脚本含自定义设置，无法自动加入端口跳跃钩子。\n' >&2; return 1
+        fi
+        tmp=$(mktemp /etc/init.d/.onebox-hopping.XXXXXX) || return 1
+        SB_OWNED_TEMP_FILES+=("$tmp")
+        sed 's/^depend() { need net; }$/depend() { need net; after nftables iptables ip6tables firewalld ufw; }/' /etc/init.d/onebox > "$tmp" || return 1
+        cat >> "$tmp" <<'EOF'
+
+# Managed by OneBox port hopping v1
+start_pre() { /usr/local/lib/onebox/port-hopping apply; }
+stop_post() { /usr/local/lib/onebox/port-hopping clear; }
+EOF
+        chmod 755 "$tmp" && mv -f "$tmp" /etc/init.d/onebox || return 1
+    else
+        if { [ -e "$unit" ] || [ -L "$unit" ]; } &&
+           { [ -L "$unit" ] || ! grep -q '^# Managed by OneBox port hopping v1$' "$unit"; }; then
+            printf '[错误] 端口跳跃服务钩子路径已被其他文件占用。\n' >&2; return 1
+        fi
+        mkdir -p "${unit%/*}" || return 1
+        tmp=$(mktemp "${unit}.XXXXXX") || return 1
+        SB_OWNED_TEMP_FILES+=("$tmp")
+        cat > "$tmp" <<'EOF'
+# Managed by OneBox port hopping v1
+[Unit]
+After=nftables.service firewalld.service ufw.service
+[Service]
+ExecStartPre=/usr/local/lib/onebox/port-hopping apply
+ExecStopPost=/usr/local/lib/onebox/port-hopping clear
+EOF
+        chmod 644 "$tmp" && mv -f "$tmp" "$unit" && systemctl daemon-reload || return 1
+    fi
+}
+
+hopping_check_available() {
+    local tag="$1" range="$2" start="${2%-*}" end="${2#*-}" sockets endpoint p _state _recv _send _rest
+    valid_hopping_range "$range" || { printf '[错误] 跳跃范围须为 START-END（1–65535，起点小于终点）。\n' >&2; return 1; }
+    hopping_load || return 1
+    if jq -e --arg tag "$tag" --argjson a "$start" --argjson b "$end" \
+        'any(to_entries[]; .key != $tag and .value.start <= $b and .value.end >= $a)' <<< "$HOPPING_STATE" >/dev/null; then
+        printf '[错误] 跳跃范围与另一个节点重叠。\n' >&2; return 1
+    fi
+    sockets=$(ss -H -lun) || return 1
+    while read -r _state _recv _send endpoint _rest; do
+        p="${endpoint##*:}"
+        if [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -ge "$start" ] && [ "$p" -le "$end" ]; then
+            printf '[错误] 跳跃范围包含已占用的 UDP 端口 %s。\n' "$p" >&2; return 1
+        fi
+    done <<< "$sockets"
+}
+
+hopping_set() {
+    local tag="$1" range="$2" interval="${3:-30}" file
+    hopping_load || return 1
+    if [ "$range" = off ]; then
+        jq -e --arg tag "$tag" 'has($tag)' <<< "$HOPPING_STATE" >/dev/null || return 0
+        HOPPING_STATE=$(jq -c --arg tag "$tag" 'del(.[$tag])' <<< "$HOPPING_STATE") || return 1
+    else
+        jq -e --arg tag "$tag" '.inbounds[] | select(.tag == $tag and .type == "hysteria2")' "$CONFIG_FILE" >/dev/null || {
+            printf '[错误] 端口跳跃仅支持 Hysteria2 节点。\n' >&2; return 1;
+        }
+        for file in "$KNS_INSTANCES_DIR"/*.json; do
+            [ -f "$file" ] || continue
+            if jq -e --arg tag "$tag" '.tag == $tag' "$file" >/dev/null; then
+                printf '[错误] KNS 尚不支持端口跳跃；请使用独立 OneBox 节点。\n' >&2; return 1
+            fi
+        done
+        hopping_check_available "$tag" "$range" || return 1
+        HOPPING_STATE=$(jq -c --arg tag "$tag" --argjson a "${range%-*}" --argjson b "${range#*-}" --argjson i "$interval" \
+            '.[$tag]={start:$a,end:$b,interval:$i}' <<< "$HOPPING_STATE") || return 1
+        ensure_deps nft jq flock || return 1
+        # Check kernel capability and the exact desired batch before installing
+        # any permanent service hooks or interrupting the original listener.
+        hopping_rules check "$HOPPING_STATE" || return 1
+        hopping_setup || return 1
+    fi
+    hopping_write
+}
+
+hopping_configure() {
+    local tag="$1" range="$2" interval="${3:-30}"
+    jq -e --arg tag "$tag" '.inbounds[] | select(.tag == $tag and .type == "hysteria2")' "$CONFIG_FILE" >/dev/null || {
+        printf '[错误] 找不到指定的 Hysteria2 节点。\n' >&2; return 1;
+    }
+    backup_config || return 1
+    if ! hopping_set "$tag" "$range" "$interval" || ! restart_service; then
+        restore_config_and_service || return 1
+        printf '[错误] 端口跳跃设置失败，已恢复原配置。\n' >&2; return 1
+    fi
+    commit_config || return 1
+    printf '[完成] 端口跳跃设置已保存。云安全组需放行所选 UDP 范围；客户端间隔为 %s 秒。\n' "$interval"
 }
 
 record_fw_port() {
@@ -1037,13 +1256,19 @@ fetch_url() {
     return 1
 }
 
+clear_hopping_if_present() {
+    [ -x "$HOPPING_HELPER" ] || return 0
+    [ ! -L "$HOPPING_HELPER" ] && grep -q '^# Managed by OneBox port hopping v1$' "$HOPPING_HELPER" || return 1
+    "$HOPPING_HELPER" clear
+}
+
 stop_sing_box_if_present() {
     local state rc
     if [ "$SERVICE_MANAGER" = openrc ]; then
-        if [ ! -e /etc/init.d/onebox ] && [ ! -L /etc/init.d/onebox ]; then return 0; fi
+        if [ ! -e /etc/init.d/onebox ] && [ ! -L /etc/init.d/onebox ]; then clear_hopping_if_present; return $?; fi
         rc-service onebox status >/dev/null 2>&1
         rc=$?
-        [ "$rc" = 3 ] && return 0
+        if [ "$rc" = 3 ]; then clear_hopping_if_present; return $?; fi
         if [ "$rc" != 0 ]; then
             printf '无法确认 sing-box 状态，退出码：%s\n' "$rc" >&2
             return 1
@@ -1055,7 +1280,7 @@ stop_sing_box_if_present() {
     else
         state=$(systemctl show onebox -p LoadState --value) || return 1
         case "$state" in
-            not-found) return 0 ;;
+            not-found) clear_hopping_if_present; return $? ;;
             loaded|masked) ;;
             *) printf '无法确认 sing-box 服务：%s\n' "$state" >&2; return 1 ;;
         esac
@@ -1063,7 +1288,7 @@ stop_sing_box_if_present() {
         state=$(systemctl show onebox -p ActiveState --value) || return 1
         case "$state" in inactive|failed) ;; *) printf 'sing-box 未停止：%s\n' "$state" >&2; return 1 ;; esac
     fi
-    return 0
+    clear_hopping_if_present
 }
 
 download_kernel_archive() {
@@ -1229,6 +1454,7 @@ ensure_deps() {
             sha256sum|base64|timeout|date|mv) pkg=coreutils ;;
             sysctl|ps) case "$PACKAGE_MANAGER" in apk|pacman) pkg=procps-ng ;; apt-get) pkg=procps ;; *) pkg=procps-ng ;; esac ;;
             modprobe) pkg=kmod ;;
+            nft) pkg=nftables ;;
             awk) pkg=gawk ;;
             grep) pkg="grep" ;;
             sed) pkg="sed" ;;
@@ -1420,6 +1646,7 @@ restart_service() {
     fi
     if [ "$INBOUND_COUNT" -eq 0 ]; then
         stop_sing_box_if_present || return 1
+        [ ! -x "$HOPPING_HELPER" ] || "$HOPPING_HELPER" clear || return 1
         printf '[提示] 暂无节点，无需启动服务。\n'
         return 0
     fi
@@ -1448,6 +1675,7 @@ EOF
             fi
         fi
         rc-update add onebox default || return 1
+        if [ -e "$HOPPING_FILE" ]; then hopping_setup || return 1; fi
         rc-service onebox restart || return 1
     else
         if [ ! -e "/etc/systemd/system/onebox.service" ] && [ ! -L "/etc/systemd/system/onebox.service" ]; then
@@ -2868,14 +3096,14 @@ read_all_tags() {
 resolve_conn() {
     local cert_path=$1
     local ip=$2
-    CONN_ADDR=$ip
+    CONN_ADDR=${CLI_ADDRESS:-$ip}
     CONN_INSECURE=1
     CONN_SNI=""
     if [[ "$cert_path" == *"/real.cer" ]]; then
         if [ -z "$REAL_DOMAIN" ] && [ -s "$cert_path" ] && command -v openssl >/dev/null 2>&1; then
             REAL_DOMAIN=$(openssl x509 -in "$cert_path" -noout -subject 2>/dev/null | sed -n 's/.*CN *= *\([^,]*\).*/\1/p' | tr -d ' ')
         fi
-        CONN_ADDR=$REAL_DOMAIN
+        CONN_ADDR=${CLI_ADDRESS:-$REAL_DOMAIN}
         CONN_INSECURE=0
         CONN_SNI=$REAL_DOMAIN
     elif [[ "$cert_path" == *"/self.cer" ]]; then
@@ -2886,6 +3114,45 @@ resolve_conn() {
         fi
         [ -n "$CONN_SNI" ] || CONN_SNI="$DEFAULT_SELF_SNI"
     fi
+}
+
+hopping_node_settings() {
+    local fields start end
+    HOPPING_PORTS='' HOPPING_INTERVAL=30
+    hopping_load || return 1
+    fields=$(jq -r --arg tag "$1" '.[$tag] // empty | [.start,.end,.interval] | @tsv' <<< "$HOPPING_STATE") || return 1
+    if [ -n "$fields" ]; then
+        IFS=$'\t' read -r start end HOPPING_INTERVAL <<< "$fields"
+        HOPPING_PORTS="$start-$end"
+    fi
+}
+
+build_hy2_client_config() {
+    local TAG="$1" IP="$2" format="$3" ports='' interval=30 inbound
+    local -a M=()
+    load_secrets || return 1
+    read_node_fields "$TAG" || return 1
+    [ "${M[0]}" = hysteria2 ] || { printf '[错误] 配置片段导出目前仅支持 Hysteria2。\n' >&2; return 1; }
+    resolve_conn "${M[2]}" "$IP"
+    [ -z "${M[5]}" ] || CONN_SNI="${M[5]}"
+    [ -n "$CONN_ADDR" ] || return 1
+    inbound=$(jq -ce --arg tag "$TAG" '.inbounds[] | select(.tag == $tag)' "$CONFIG_FILE") || return 1
+    hopping_node_settings "$TAG" || return 1
+    if [ -n "$HOPPING_PORTS" ]; then ports="${M[1]},$HOPPING_PORTS"; interval="$HOPPING_INTERVAL"; fi
+    jq -n --arg format "$format" --arg tag "$TAG" --arg host "$CONN_ADDR" --argjson port "${M[1]}" \
+        --arg auth "${M[4]}" --arg sni "$CONN_SNI" --argjson insecure "$CONN_INSECURE" --arg ports "$ports" --argjson interval "$interval" --argjson inbound "$inbound" '
+      if $format == "mihomo" then
+        {proxies:[{name:$tag,type:"hysteria2",server:$host,port:$port,password:$auth,sni:$sni,
+          "skip-cert-verify":($insecure == 1),alpn:($inbound.tls.alpn // ["h3"])} +
+          (if $inbound.obfs == null then {} else {obfs:$inbound.obfs.type,"obfs-password":$inbound.obfs.password} end) +
+          (if $ports == "" then {} else {ports:$ports,"hop-interval":($interval|tostring)} end)]}
+      else
+        {outbounds:[{type:"hysteria2",tag:$tag,server:$host,password:$auth,
+          tls:{enabled:true,server_name:$sni,insecure:($insecure == 1),alpn:($inbound.tls.alpn // ["h3"])}} +
+          (if $inbound.obfs == null then {} else {obfs:$inbound.obfs} end) +
+          (if $ports == "" then {server_port:$port}
+           else {server_ports:($ports | split(",") | map(if contains("-") then gsub("-";":") else .+":"+. end)),hop_interval:(($interval|tostring)+"s")} end)]}
+      end'
 }
 
 build_share_url() {
@@ -2928,9 +3195,17 @@ build_share_url() {
             ;;
         hysteria2)
             if [ -z "$CONN_ADDR" ]; then echo -e "${RED}[错误] [获取连接地址失败，无法生成 Hysteria2 链接]${PLAIN}" >&2; return 1; fi
-            local AUTH_ENC
+            local AUTH_ENC HY2_PORTS="$PORT" HY2_OPTIONS
+            hopping_node_settings "$TAG" || return 1
+            [ -z "$HOPPING_PORTS" ] || HY2_PORTS="$PORT,$HOPPING_PORTS"
             AUTH_ENC=$(url_encode "$N_PASS")
-            printf '%s\n' "hysteria2://${AUTH_ENC}@${CONN_ADDR_URI}:${PORT}?security=tls&alpn=h3&insecure=${CONN_INSECURE}&allowInsecure=${CONN_INSECURE}${SNI_URL}#${TAG}"
+            HY2_OPTIONS=$(jq -r --arg tag "$TAG" --arg sni "$CONN_SNI" '
+              .inbounds[] | select(.tag == $tag) |
+              "&alpn=" + ((.tls.alpn // ["h3"] | join(",")) | @uri) +
+              ((.tls.server_name // $sni) as $s | if $s == "" then "" else "&sni=" + ($s|@uri) end) +
+              (if .obfs == null then "" else "&obfs=" + (.obfs.type|@uri) + "&obfs-password=" + (.obfs.password|@uri) end)
+            ' "$CONFIG_FILE") || return 1
+            printf '%s\n' "hysteria2://${AUTH_ENC}@${CONN_ADDR_URI}:${HY2_PORTS}?security=tls&insecure=${CONN_INSECURE}&allowInsecure=${CONN_INSECURE}${HY2_OPTIONS}#${TAG}"
             ;;
         tuic)
             if [ -z "$CONN_ADDR" ]; then echo -e "${RED}[错误] [获取连接地址失败，无法生成 TUIC 链接]${PLAIN}" >&2; return 1; fi
@@ -3018,6 +3293,11 @@ print_config_detail() {
             [[ "$CONN_ADDR_DISP" == *:* ]] && CONN_ADDR_DISP="[$CONN_ADDR_DISP]"
             echo -e "地址 (address)\t\t\t= ${CONN_ADDR_DISP:-[获取目标地址失败]}"
             echo -e "端口 (port)\t\t\t= $PORT"
+            hopping_node_settings "$TAG" || return 1
+            if [ -n "$HOPPING_PORTS" ]; then
+                printf 'UDP 跳跃范围\t\t\t= %s（客户端间隔 %s 秒）\n' "$HOPPING_PORTS" "$HOPPING_INTERVAL"
+                printf '客户端配置片段：onebox links --tag %s --format mihomo（或 sing-box）\n' "$TAG"
+            fi
             printf '密码 (password)\t\t\t= %s\n' "$N_PASS"
             echo -e "传输层安全 (TLS)\t\t= tls"
             echo -e "应用层协议协商 (Alpn)\t\t= h3"
@@ -3230,6 +3510,11 @@ add_config() {
         case "$proto_idx" in
             2|3|4) prompt_cert_type || return 1 ;;
         esac
+        local hop_range="${CLI_HOP_PORTS:-}" hop_interval="${CLI_HOP_INTERVAL:-30}"
+        if [ "$proto_idx" = 2 ] && [ "$NON_INTERACTIVE" = 0 ]; then
+            ask 'UDP 跳跃范围（例如 20000-50000，回车不启用）: ' hop_range
+            if [ -n "$hop_range" ]; then hopping_check_available "$TAG" "$hop_range" || return 1; fi
+        fi
         backup_config || return 1
         local IS_ARGO=0
         local jq_ok=1
@@ -3392,6 +3677,13 @@ add_config() {
             return 1
         fi
 
+        if [ "$proto_idx" = 2 ] && [ -n "$hop_range" ] && [ "$hop_range" != off ]; then
+            if ! hopping_set "$TAG" "$hop_range" "$hop_interval"; then
+                restore_config_and_service || return 1
+                return 1
+            fi
+        fi
+
         if ! restart_service; then
             echo '节点启动失败，正在清理本次隧道并恢复配置。' >&2
             if [ "$IS_ARGO" -eq 1 ]; then
@@ -3457,6 +3749,7 @@ menu_edit_node() {
                 echo -e " 2) 更改端口"
                 echo -e " 3) 更改节点名称"
                 if [ "$TYPE" != "shadowsocks" ]; then echo -e " 4) 更改证书类型 (域名/自签)"; fi
+                if [ "$TYPE" = hysteria2 ]; then echo ' 5) 设置 / 关闭端口跳跃'; fi
             else
                 echo -e "${RED}[错误] 不支持修改的协议类型${PLAIN}"
                 pause
@@ -3477,6 +3770,7 @@ menu_edit_node() {
                             vless:false:true) action=argo_ip ;;
                             hysteria2:*|anytls:*|tuic:*) action=cert ;;
                         esac ;;
+                    5) [ "$TYPE" != hysteria2 ] || action=hopping ;;
                     0) break ;;
                 esac
                 [ -n "$action" ] || echo -e "${RED}[错误] 输入错误，请重新选择！${PLAIN}"
@@ -3496,6 +3790,13 @@ modify_config() {
             TYPE=$(jq -er '.type' <<< "$node") || return 1
             OLD_PORT=$(jq -er '.listen_port' <<< "$node") || return 1
             load_secrets || return 1
+            if [ "$action" = hopping ]; then
+                local hop_range
+                ask 'UDP 跳跃范围（例如 20000-50000，off 关闭，回车取消）: ' hop_range
+                [ -n "$hop_range" ] || return 0
+                hopping_configure "$TAG" "$hop_range" 30
+                return $?
+            fi
             if [ "$action" == "argo_ip" ]; then
                 local NEW_ARGO_IP argo_domain_key="ARGO_DOMAIN_${OLD_PORT}"
                 NEW_ARGO_IP=$(get_domain "请输入新的 Argo 优选域名/IP" "${!argo_domain_key}" "true") || exit 1
@@ -3683,6 +3984,11 @@ modify_config() {
                     restore_config_and_service
                     return 1
                 fi
+                if [ -e "$HOPPING_FILE" ]; then
+                    hopping_load || return 1
+                    HOPPING_STATE=$(jq -c --arg old "$TAG" --arg new "$NEW_TAG" 'if has($old) then .[$new]=.[$old] | del(.[$old]) else . end' <<< "$HOPPING_STATE") || return 1
+                    hopping_write || return 1
+                fi
 
                 if ! restart_service; then
                     restore_config_and_service || return 1
@@ -3755,6 +4061,11 @@ del_config() {
         if ! apply_jq_config 'del(.inbounds[] | select(.tag == $tag))' --arg tag "$TAG"; then
             restore_config_and_service
             return 1
+        fi
+        if [ -e "$HOPPING_FILE" ]; then
+            hopping_load || return 1
+            HOPPING_STATE=$(jq -c --arg tag "$TAG" 'del(.[$tag])' <<< "$HOPPING_STATE") || return 1
+            hopping_write || return 1
         fi
 
         if ! cleanup_node_secrets "$PORT" "$TYPE" "$IS_ARGO"; then
@@ -4453,6 +4764,13 @@ uninstall_all() {
             echo '卸载暂停：防火墙清理失败，未删除程序和配置；服务已停止。' >&2
             return 1
         }
+        if [ -x "$HOPPING_HELPER" ]; then "$HOPPING_HELPER" clear || return 1; fi
+        local hopping_unit=/etc/systemd/system/onebox.service.d/30-onebox-hopping.conf
+        if [ -e "$hopping_unit" ] || [ -L "$hopping_unit" ]; then
+            [ ! -L "$hopping_unit" ] && grep -q '^# Managed by OneBox port hopping v1$' "$hopping_unit" || return 1
+            rm -f "$hopping_unit" || return 1
+            rmdir "${hopping_unit%/*}" 2>/dev/null || :
+        fi
         for svc in "${services[@]}"; do
             if [ "$SERVICE_MANAGER" = openrc ]; then
                 rm -f -- "/etc/init.d/$svc" || return 1
@@ -4853,6 +5171,48 @@ cleanup_created_argo_service_impl() {
     return 0
 }
 
+backup_hopping_files() {
+    local d="$1" role file
+    for role in helper systemd openrc; do
+        case "$role" in
+            helper) file="$HOPPING_HELPER" ;;
+            systemd) file=/etc/systemd/system/onebox.service.d/30-onebox-hopping.conf ;;
+            openrc) file=/etc/init.d/onebox ;;
+        esac
+        [ ! -L "$file" ] || return 1
+        if [ -e "$file" ]; then cp -p "$file" "$d/hopping.$role" || return 1
+        else touch "$d/hopping.$role.absent" || return 1; fi
+    done
+}
+
+restore_hopping_files() {
+    local d="$1" role file tmp reload=0
+    # A first failed OpenRC install may already have started its daemon. Stop it
+    # before removing a service script which did not exist at transaction start.
+    if [ "$SERVICE_MANAGER" = openrc ] && [ -f "$d/hopping.openrc.absent" ] && service_is_active; then
+        stop_sing_box_if_present || return 1
+    fi
+    for role in helper systemd openrc; do
+        case "$role" in
+            helper) file="$HOPPING_HELPER" ;;
+            systemd) file=/etc/systemd/system/onebox.service.d/30-onebox-hopping.conf ;;
+            openrc) file=/etc/init.d/onebox ;;
+        esac
+        if [ -f "$d/hopping.$role.absent" ]; then
+            if [ -e "$file" ]; then rm -f "$file" || return 1; [ "$role" != systemd ] || reload=1; fi
+        elif [ -f "$d/hopping.$role" ]; then
+            if ! cmp -s "$d/hopping.$role" "$file"; then
+                tmp=$(mktemp "${file}.restore.XXXXXX") || return 1
+                SB_OWNED_TEMP_FILES+=("$tmp")
+                cp -p "$d/hopping.$role" "$tmp" && mv -f "$tmp" "$file" || return 1
+                [ "$role" != systemd ] || reload=1
+            fi
+        else return 1; fi
+    done
+    if [ "$SERVICE_MANAGER" != openrc ] && [ "$reload" = 1 ]; then systemctl daemon-reload || return 1; fi
+    return 0
+}
+
 backup_config() {
     if [ -n "${CONFIG_TX_DIR:-}" ]; then
         printf '%s\n' '上一次配置事务尚未结束，拒绝覆盖备份。' >&2
@@ -4866,6 +5226,12 @@ backup_config() {
     else
         touch "$d/secrets.absent" || { rm -rf "$d"; return 1; }
     fi
+    if [ -e "$HOPPING_FILE" ]; then
+        hopping_load && cp -p "$HOPPING_FILE" "$d/hopping.json" || { rm -rf "$d"; return 1; }
+    else
+        touch "$d/hopping.absent" || { rm -rf "$d"; return 1; }
+    fi
+    backup_hopping_files "$d" || { rm -rf "$d"; return 1; }
     if [ -d "$KNS_STATE_DIR" ]; then
         if ! mkdir -p "$d/kns" || ! cp -a "$KNS_STATE_DIR/." "$d/kns/"; then rm -rf "$d"; return 1; fi
     else
@@ -4880,7 +5246,7 @@ restore_config_and_service() {
         echo '事务已阻塞，跳过自动恢复，保留配置、密钥和备份供人工处理。' >&2
         return 1
     fi
-    local d="${CONFIG_TX_DIR:-}" active enabled
+    local d="${CONFIG_TX_DIR:-}" active enabled hopping_recovery_failed=0
     if [ -z "$d" ] || [ ! -f "$d/config.json" ]; then
         printf '%s\n' '缺少完整事务备份，拒绝不完整恢复。' >&2
         return 1
@@ -4935,6 +5301,17 @@ restore_config_and_service() {
         printf 'KNS 实例备份缺失；事务备份保留在 %s\n' "$d" >&2
         return 1
     fi
+    if [ -f "$d/hopping.absent" ]; then
+        rm -f "$HOPPING_FILE" || return 1
+    elif [ -f "$d/hopping.json" ]; then
+        restore_tmp=$(mktemp "$CONFIG_DIR/.hopping.restore.XXXXXX") || return 1
+        SB_OWNED_TEMP_FILES+=("$restore_tmp")
+        cp -p "$d/hopping.json" "$restore_tmp" && mv -f "$restore_tmp" "$HOPPING_FILE" || return 1
+    else
+        printf '端口跳跃备份缺失；事务备份保留在 %s\n' "$d" >&2; return 1
+    fi
+    clear_hopping_if_present || hopping_recovery_failed=1
+    restore_hopping_files "$d" || hopping_recovery_failed=1
     load_secrets || return 1
     if ! restore_service_state "$d"; then
         printf '配置与 secrets 已恢复，但服务恢复失败；备份保留在 %s\n' "$d" >&2
@@ -4942,6 +5319,10 @@ restore_config_and_service() {
     fi
     if ! restore_deleted_argo_service_state "$d"; then
         printf '隧道运行状态恢复失败；备份保留在 %s\n' "$d" >&2
+        return 1
+    fi
+    if [ "$hopping_recovery_failed" = 1 ]; then
+        printf '服务已尝试恢复，端口跳跃文件或规则仍需核查；备份保留在 %s\n' "$d" >&2
         return 1
     fi
     commit_config
@@ -5077,6 +5458,7 @@ onebox -n 使用上述默认安装。
   add              添加一个节点（自动安装缺少的依赖及内核）
   delete           删除节点，需要 --tag NAME --yes
   list | links     节点列表 / 分享链接（--tag 可筛选）
+  hopping          设置已有 HY2 的端口跳跃：--tag NAME --hop-ports START-END|off
   kns              KNS 节点接口：discover/import/install/reconfigure/reinstall/status/uninstall/list/schema
   status | check   服务状态 / 配置检查
   doctor           只读体检：程序、配置 JSON、服务、隧道和证书
@@ -5111,6 +5493,13 @@ Reality SNI 自动检测选项（仅 add --protocol reality）:
   --method METHOD              SS 默认 aes-128-gcm
   --firewall auto|skip         默认 auto
   --address IP_OR_HOST         分享链接地址（省略则自动获取公网 IP）
+HY2 端口跳跃（add --protocol hysteria2 或 hopping）:
+  --hop-ports START-END        连续 UDP 范围；hopping 使用 off 关闭
+  --hop-interval 5..3600       客户端跳跃间隔秒数，默认 30
+                               需要 nftables / 内核 inet NAT 权限；云安全组另行放行
+链接导出:
+  links --tag NAME --format uri|mihomo|sing-box
+                               后两项导出 HY2 客户端配置片段（JSON）
 argo 选项:
   --domain DOMAIN --tunnel-token-file PATH（完整连接器 Token，不是隧道 ID）
   --edge HOST 可选，默认连接自己的隧道域名；也可通过 SB_TUNNEL_TOKEN 提供 Token
@@ -5134,6 +5523,7 @@ parse_cli() {
     CLI_VERSION=latest CLI_VALIDATION=dns CLI_HTTP01_READY=0 CLI_ADDRESS=""
     CLI_FIREWALL=y CLI_EDGE="" CLI_STRATEGY="" CLI_RESTORE_BBR=1
     CLI_LINES=80 CLI_LOG_SOURCE=service
+    CLI_HOP_PORTS="" CLI_HOP_INTERVAL=30 CLI_LINK_FORMAT=uri
     local option value
     local -a used_options=()
     while [ "$#" -gt 0 ]; do
@@ -5144,7 +5534,7 @@ parse_cli() {
             -y|--yes) ASSUME_YES=1 ;;
             --http01-ready) CLI_HTTP01_READY=1; used_options+=("$option") ;;
             --keep-bbr) CLI_RESTORE_BBR=0; used_options+=("$option") ;;
-            --protocol|--tag|--port|--uuid|--password|--password-file|--tunnel-token-file|--cf-token-file|--cert|--method|--sni|--sni-region|--sni-category|--sni-hosts|--sni-jobs|--sni-samples|--sni-timeout|--domain|--version|--validation|--address|--edge|--strategy|--firewall|--lines|--source)
+            --protocol|--tag|--port|--uuid|--password|--password-file|--tunnel-token-file|--cf-token-file|--cert|--method|--sni|--sni-region|--sni-category|--sni-hosts|--sni-jobs|--sni-samples|--sni-timeout|--domain|--version|--validation|--address|--edge|--strategy|--firewall|--lines|--source|--hop-ports|--hop-interval|--format)
                 [ "$#" -gt 0 ] && [[ "$1" != --* ]] || die "选项 $option 缺少值。" 2
                 value="$1"; shift
                 [ -n "$value" ] || die "选项 $option 不能为空。" 2
@@ -5175,6 +5565,9 @@ parse_cli() {
                     --strategy) CLI_STRATEGY="$value" ;;
                     --lines) CLI_LINES="$value" ;;
                     --source) CLI_LOG_SOURCE="$value" ;;
+                    --hop-ports) CLI_HOP_PORTS="$value" ;;
+                    --hop-interval) CLI_HOP_INTERVAL="$value" ;;
+                    --format) CLI_LINK_FORMAT="$value" ;;
                     --firewall) case "$value" in auto) CLI_FIREWALL=y ;; skip) CLI_FIREWALL=n ;; *) die '--firewall 只能是 auto 或 skip。' 2 ;; esac ;;
                 esac ;;
             -*) die "未知选项：$option" 2 ;;
@@ -5199,12 +5592,13 @@ parse_cli() {
         [ -t 0 ] || die '交互菜单需要终端；无交互默认安装请使用 onebox -n。' 2
     fi
     [ "$CLI_COMMAND" = menu ] || NON_INTERACTIVE=1
-    case "$CLI_COMMAND" in install|add|delete|list|links|status|check|doctor|logs|start|stop|restart|update|update-script|cert|outbound|bbr|uninstall|menu) ;; *) die "未知命令：$CLI_COMMAND（使用 --help 查看用法）。" 2 ;; esac
+    case "$CLI_COMMAND" in install|add|hopping|delete|list|links|status|check|doctor|logs|start|stop|restart|update|update-script|cert|outbound|bbr|uninstall|menu) ;; *) die "未知命令：$CLI_COMMAND（使用 --help 查看用法）。" 2 ;; esac
     # Reject irrelevant options rather than silently ignoring a typo in automation.
     for option in "${used_options[@]}"; do
         case "$CLI_COMMAND:$option" in
             add:--protocol|add:--tag|add:--port|add:--uuid|add:--password|add:--password-file|add:--tunnel-token-file|add:--cf-token-file|add:--cert|add:--method|add:--sni|add:--domain|add:--version|add:--validation|add:--address|add:--edge|add:--http01-ready|add:--firewall|install:--version|update:--version|delete:--tag|list:--tag|links:--tag|links:--address|cert:--cert|cert:--sni|cert:--domain|cert:--validation|cert:--cf-token-file|cert:--http01-ready|outbound:--strategy|uninstall:--keep-bbr) ;;
             logs:--lines|logs:--source|logs:--tag) ;;
+            add:--hop-ports|add:--hop-interval|hopping:--tag|hopping:--hop-ports|hopping:--hop-interval|links:--format) ;;
             add:--sni-region|add:--sni-category|add:--sni-hosts|add:--sni-jobs|add:--sni-samples|add:--sni-timeout) ;;
             *) die "命令 $CLI_COMMAND 不接受选项 $option。" 2 ;;
         esac
@@ -5214,6 +5608,20 @@ parse_cli() {
     case "$CLI_LOG_SOURCE" in service|install) ;; *) die '--source 只能为 service 或 install。' 2 ;; esac
     [ "$CLI_LOG_SOURCE" != install ] || [ -z "$CLI_TAG" ] || die '--source install 不支持 --tag。' 2
     [ -z "$CLI_PORT" ] || { [[ "$CLI_PORT" =~ ^[1-9][0-9]{0,4}$ ]] && [ "$CLI_PORT" -le 65535 ]; } || die '端口必须为 1–65535 的整数。' 2
+    [[ "$CLI_HOP_INTERVAL" =~ ^[1-9][0-9]{0,3}$ ]] && [ "$CLI_HOP_INTERVAL" -ge 5 ] && [ "$CLI_HOP_INTERVAL" -le 3600 ] || die '--hop-interval 必须为 5–3600 秒。' 2
+    case "$CLI_LINK_FORMAT" in uri|mihomo|sing-box) ;; *) die '--format 只能为 uri、mihomo 或 sing-box。' 2 ;; esac
+    if [ "$CLI_LINK_FORMAT" != uri ]; then [ -n "$CLI_TAG" ] || die '配置片段导出需要 --tag。' 2; fi
+    if [ -n "$CLI_HOP_PORTS" ] && [ "$CLI_HOP_PORTS" != off ]; then
+        valid_hopping_range "$CLI_HOP_PORTS" || die '--hop-ports 必须为 START-END（1–65535，起点小于终点）。' 2
+    fi
+    if [ "$CLI_COMMAND" = hopping ]; then
+        [ -n "$CLI_TAG" ] && [ -n "$CLI_HOP_PORTS" ] || die 'hopping 需要 --tag 和 --hop-ports START-END|off。' 2
+    fi
+    for option in "${used_options[@]}"; do
+        if [ "$option" = --hop-interval ] && { [ -z "$CLI_HOP_PORTS" ] || [ "$CLI_HOP_PORTS" = off ]; }; then
+            die '--hop-interval 需要启用 --hop-ports START-END。' 2
+        fi
+    done
     [ -z "$CLI_UUID" ] || [[ "$CLI_UUID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || die 'UUID 格式错误。' 2
     [[ "$CLI_PASSWORD" != *$'\n'* && "$CLI_PASSWORD" != *$'\r'* ]] || die '密码不能包含换行。' 2
     [ -z "$CLI_PASSWORD" ] || [[ "$CLI_PASSWORD" =~ [^[:space:]] ]] || die '密码不能全为空白。' 2
@@ -5255,6 +5663,7 @@ parse_cli() {
         esac
         for option in "${used_options[@]}"; do
             case "$option" in --sni-*) [ "$CLI_PROTOCOL_INDEX" = 1 ] || die "$option 仅适用于 Reality。" 2 ;; esac
+            case "$option" in --hop-*) [ "$CLI_PROTOCOL_INDEX" = 2 ] || die "$option 仅适用于 Hysteria2。" 2 ;; esac
         done
         if [ "$CLI_PROTOCOL_INDEX" = 1 ] && [ -n "$CLI_SNI" ]; then
             reality_sni_allowed_host "$CLI_SNI" || die 'Reality SNI 已排除 Apple 旗下域名，请使用其他域名。' 2
@@ -5467,6 +5876,7 @@ kns_discover() {
     local file registered='[]' real_domain self_domain='' public_key_ports='' port pub_var pub separator=''
     local -a manifests=() reality_ports=()
     require_config readonly || return 1
+    hopping_load || return 1
     if [ -d "$KNS_INSTANCES_DIR" ] && [ ! -L "$KNS_INSTANCES_DIR" ]; then
         for file in "$KNS_INSTANCES_DIR"/*.json; do
             [ -f "$file" ] && [ ! -L "$file" ] || continue
@@ -5500,7 +5910,7 @@ kns_discover() {
         separator=,
     done
     public_key_ports="[${public_key_ports}]"
-    jq -c --arg version "$KNS_ADAPTER_VERSION" --argjson registered "$registered" --arg real "$real_domain" --arg self "$self_domain" --argjson publicKeyPorts "$public_key_ports" '
+    jq -c --arg version "$KNS_ADAPTER_VERSION" --argjson hops "$HOPPING_STATE" --argjson registered "$registered" --arg real "$real_domain" --arg self "$self_domain" --argjson publicKeyPorts "$public_key_ports" '
       [.inbounds[]? | select((.tag? | type) == "string" and .tag != "" and .tag != "dns-in") | . as $inbound |
        ($inbound.type // "unknown") as $type |
        ($inbound.listen_port // 0) as $port |
@@ -5517,6 +5927,7 @@ kns_discover() {
           (if (($inbound.tls.certificate_path // "") | endswith("/self.cer")) then $self else null end) ]
         | map(select(type == "string" and length > 0)) | .[0] // "") as $sni |
        (($registered | index($inbound.tag)) != null) as $managed |
+       ($hops | has($inbound.tag)) as $hopping |
        (if $type == "vless" then ($security == "reality" and ($users|length) == 1 and (($users[0].uuid // "")|test("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")) and (($inbound.tls.reality.short_id[0] // "")|length) > 0 and (($inbound.listen_port // 0) > 0) and (($publicKeyPorts | index($port)) != null))
         elif $type == "shadowsocks" then ((["aes-128-gcm","aes-256-gcm","chacha20-ietf-poly1305","2022-blake3-aes-128-gcm","2022-blake3-aes-256-gcm","2022-blake3-chacha20-poly1305"] | index($inbound.method // "")) != null and (($inbound.password // "")|length) > 0 and $transport == "tcp+udp" and ($port > 0))
         elif $type == "hysteria2" or $type == "anytls" then (($users|length) == 1 and (($users[0].password // "")|length) > 0 and ($port > 0))
@@ -5524,9 +5935,9 @@ kns_discover() {
         else false end) as $credentialShape |
        (($inbound.listen // "::") as $listenAddr |
         {tag:$inbound.tag,protocol:$type,listen:{port:(if ($port|type)=="number" then $port else 0 end),address:$listenAddr,transport:$transport},managed:$managed,
-         importable:($credentialShape and ($managed|not) and ($inbound.tag|test("^[A-Za-z0-9._:-]{1,128}$")) and ((["::","0.0.0.0"] | index($listenAddr)) != null) and ($type == "shadowsocks" or $sni != "")),
+         importable:($credentialShape and ($managed|not) and ($hopping|not) and ($inbound.tag|test("^[A-Za-z0-9._:-]{1,128}$")) and ((["::","0.0.0.0"] | index($listenAddr)) != null) and ($type == "shadowsocks" or $sni != "")),
          options:{security:$optionSecurity,sni:$sni,method:($inbound.method // "")},
-         reason:(if $managed then "already_managed" elif (["::","0.0.0.0"] | index($listenAddr)) == null then "unsupported_listen_address" elif (($inbound.tag|test("^[A-Za-z0-9._:-]{1,128}$"))|not) then "invalid_tag" elif (["vless","hysteria2","tuic","anytls","shadowsocks"] | index($type)) == null then "unsupported_protocol" elif ($users|length) > 1 then "multiple_users" elif $type != "shadowsocks" and $sni == "" then "missing_sni" elif $credentialShape then "" else "unsupported_or_incomplete_config" end)})]
+         reason:(if $managed then "already_managed" elif $hopping then "port_hopping_requires_onebox" elif (["::","0.0.0.0"] | index($listenAddr)) == null then "unsupported_listen_address" elif (($inbound.tag|test("^[A-Za-z0-9._:-]{1,128}$"))|not) then "invalid_tag" elif (["vless","hysteria2","tuic","anytls","shadowsocks"] | index($type)) == null then "unsupported_protocol" elif ($users|length) > 1 then "multiple_users" elif $type != "shadowsocks" and $sni == "" then "missing_sni" elif $credentialShape then "" else "unsupported_or_incomplete_config" end)})]
       | {schema:1,adapterVersion:$version,runtime:{engine:"sing-box",id:"onebox-main"},instances:.}' "$CONFIG_FILE"
 }
 
@@ -5947,9 +6358,21 @@ kns_callback() {
     return 0
 }
 
+kns_require_no_hopping() {
+    local tag
+    hopping_load || { kns_emit_error invalid_state '无法读取端口跳跃记录。'; return 1; }
+    for tag in "$@"; do
+        if jq -e --arg tag "$tag" 'has($tag)' <<< "$HOPPING_STATE" >/dev/null; then
+            kns_emit_error unsupported_port_hopping '此节点启用了端口跳跃，当前仅支持由 OneBox 管理；请先在 OneBox 关闭跳跃再导入或接管。'
+            return 1
+        fi
+    done
+}
+
 kns_claim_legacy_from_manifest() {
     local tag legacy inbound matches_request port transport
     tag=$(jq -er '.tag | strings' "$KNS_INSTANCE_FILE") || { kns_emit_error invalid_state '接管实例登记文件无效。'; return 1; }
+    kns_require_no_hopping "$tag" "$KNS_LEGACY_TAG" || return 1
     legacy=$(jq -er '.client.legacyTag | strings' "$KNS_INSTANCE_FILE") || { kns_emit_error invalid_state '接管实例缺少原始节点标识。'; return 1; }
     [ "$tag" = "kns-${KNS_INSTANCE_ID}" ] && [ "$legacy" = "$KNS_LEGACY_TAG" ] && [ "$(jq -r '.machineUuid' "$KNS_INSTANCE_FILE")" = "$KNS_MACHINE_UUID" ] || { kns_emit_error instance_conflict '该 KNS 实例与接管请求不匹配。'; return 1; }
     matches_request=$(jq -e --arg id "$KNS_INSTANCE_ID" --arg protocol "$KNS_PROTOCOL" --argjson port "$KNS_LISTEN_PORT" --arg address "$KNS_LISTEN_ADDR" --arg transport "$KNS_NETWORK" --arg security "$KNS_SECURITY" --arg sni "$KNS_SNI" --arg method "$KNS_METHOD" '
@@ -6006,6 +6429,7 @@ kns_import_legacy() {
     local matches inbound type port transport security sni cert_path method uuid password flow short_id public_key allow_insecure=false
     local pub_var user_count
     [ -n "$KNS_LEGACY_TAG" ] || { kns_emit_error invalid_request '旧节点操作必须指定 tag。'; return 1; }
+    kns_require_no_hopping "$KNS_LEGACY_TAG" "kns-${KNS_INSTANCE_ID}" || return 1
     if [ "$KNS_COMMAND" = claim ] && [ -f "$KNS_INSTANCE_FILE" ] && [ ! -L "$KNS_INSTANCE_FILE" ]; then
         kns_claim_legacy_from_manifest; return $?
     fi
@@ -6104,6 +6528,7 @@ kns_close_instance_firewall() {
 
 kns_enable_conflicts() {
     local tag="$1" port="$2" address="$3" network="$4" conflict=false
+    if [ "$network" != tcp ] && hopping_port_reserved "$port"; then return 0; fi
     case "$network" in
       tcp) conflict=$(jq -r --arg tag "$tag" --arg addr "$address" --argjson port "$port" '[.inbounds[]? | select(.tag != $tag and .listen_port == $port and (.type != "hysteria2" and .type != "tuic") and (((.listen // "") as $a | $a == "" or $a == "::" or $a == "0.0.0.0" or $addr == "::" or $addr == "0.0.0.0" or $a == $addr)))] | length > 0' "$CONFIG_FILE") || return 2 ;;
       udp) conflict=$(jq -r --arg tag "$tag" --arg addr "$address" --argjson port "$port" '[.inbounds[]? | select(.tag != $tag and .listen_port == $port and (.type == "hysteria2" or .type == "tuic" or .type == "shadowsocks") and (((.listen // "") as $a | $a == "" or $a == "::" or $a == "0.0.0.0" or $addr == "::" or $addr == "0.0.0.0" or $a == $addr)))] | length > 0' "$CONFIG_FILE") || return 2 ;;
@@ -6125,6 +6550,10 @@ kns_commit_after_callback() {
 kns_apply() {
     local request_hash old_hash old_tag old_action old_port old_network tmp manifest listen_json inbound_json conflict installed=false changed=true reuse_existing=0
     KNS_TAG="kns-${KNS_INSTANCE_ID}"; KNS_INSTANCE_FILE=$(kns_instance_file "$KNS_INSTANCE_ID")
+    kns_require_no_hopping "$KNS_TAG" || return 1
+    if [ "$KNS_NETWORK" != tcp ] && hopping_port_reserved "$KNS_LISTEN_PORT"; then
+        kns_emit_error port_in_use '监听端口位于 OneBox 已保留的 UDP 跳跃范围内。'; return 1
+    fi
     request_hash=$(jq -cS '{machineUuid,runtime,instance}' "$KNS_REQUEST_FILE" | sha256sum | awk '{print $1}') || { kns_emit_error invalid_request '无法计算请求摘要。'; return 1; }
     if [ -f "$KNS_INSTANCE_FILE" ]; then
         old_tag=$(jq -er '.tag' "$KNS_INSTANCE_FILE") || { kns_emit_error invalid_state '实例登记文件无效。'; return 1; }
@@ -6211,6 +6640,7 @@ kns_uninstall() {
     fi
     tag=$(jq -er '.tag' "$file") || { kns_emit_error invalid_state '实例登记文件无效。'; return 1; }
     [ "$tag" = "kns-${KNS_INSTANCE_ID}" ] || { kns_emit_error instance_conflict '拒绝删除 tag 与 instance_id 不匹配的实例。'; return 1; }
+    kns_require_no_hopping "$tag" || return 1
     [ "$(jq -r '.machineUuid' "$file")" = "$KNS_MACHINE_UUID" ] || { kns_emit_error instance_conflict 'instance id 已绑定到另一台机器。'; return 1; }
     port=$(jq -r '.listen.port' "$file")
     network=$(jq -r '.listen.transport' "$file")
@@ -6244,6 +6674,7 @@ kns_toggle() {
     [ -f "$file" ] && [ ! -L "$file" ] || { kns_emit_error not_found '实例登记文件不存在。'; return 1; }
     tag=$(jq -er '.tag | strings' "$file") || { kns_emit_error invalid_state '实例登记文件无效。'; return 1; }
     [ "$tag" = "kns-${KNS_INSTANCE_ID}" ] || { kns_emit_error instance_conflict '拒绝修改 tag 与 instance_id 不匹配的实例。'; return 1; }
+    kns_require_no_hopping "$tag" || return 1
     [ "$(jq -r '.machineUuid' "$file")" = "$KNS_MACHINE_UUID" ] || { kns_emit_error instance_conflict 'instance id 已绑定到另一台机器。'; return 1; }
     inbound=$(jq -c '.inbound' "$file") || return 1
     [ "$inbound" != null ] || { kns_emit_error invalid_state '实例登记文件缺少配置片段。'; return 1; }
@@ -6604,10 +7035,14 @@ cli_dispatch() {
                     fi
                     tags=$(jq -r --arg tag "$CLI_TAG" '.inbounds[] | select($tag == "" or .tag == $tag) | .tag' "$CONFIG_FILE") || return 1
                     if [ -n "$tags" ]; then
-                        while IFS= read -r tag; do build_share_url "$tag" "$ip" || rc=1; done <<< "$tags"
+                        while IFS= read -r tag; do
+                            if [ "$CLI_LINK_FORMAT" = uri ]; then build_share_url "$tag" "$ip" || rc=1
+                            else build_hy2_client_config "$tag" "$ip" "$CLI_LINK_FORMAT" || rc=1; fi
+                        done <<< "$tags"
                     fi
                     return "$rc" ;;
                 delete) del_config ;;
+                hopping) ensure_deps ss || return 1; hopping_configure "$CLI_TAG" "$CLI_HOP_PORTS" "$CLI_HOP_INTERVAL" ;;
                 check) check_kernel_config "$CONFIG_FILE" ;;
                 start|restart) restart_service ;;
                 stop) stop_sing_box_if_present ;;
@@ -6637,7 +7072,7 @@ main() {
         status|doctor|logs) cli_dispatch; return $? ;;
     esac
     case "$CLI_COMMAND" in
-        install|add|delete|update|uninstall|cert|outbound|bbr|start|stop|restart|update-script)
+        install|add|hopping|delete|update|uninstall|cert|outbound|bbr|start|stop|restart|update-script)
             onebox_require_pid_headroom 8 "OneBox $CLI_COMMAND" || return 1 ;;
     esac
     trap cleanup_on_exit EXIT
