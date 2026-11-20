@@ -108,9 +108,10 @@ KNS_STATE_DIR="$CONFIG_DIR/kns"
 KNS_INSTANCES_DIR="$KNS_STATE_DIR/instances"
 KNS_CERTS_DIR="$KNS_STATE_DIR/certs"
 KNS_REQUEST_DIR="/run/onebox/kns/requests"
-ONEBOX_SCRIPT_VERSION="1.0.10"
+ONEBOX_SCRIPT_VERSION="1.0.11"
 KNS_ADAPTER_VERSION="1.8.0"
 DEFAULT_SELF_SNI="www.python.org"
+MENU_RECOVERY_FAILED=76
 
 KERNEL_TMP_DIR=""
 declare -a SB_OWNED_TEMP_FILES=()
@@ -323,7 +324,7 @@ get_ip() {
             fi
         fi
 
-        if [ -n "$GLOBAL_IP" ]; then
+        if [ -n "$GLOBAL_IP" ] && [ "${ONEBOX_LOCKED:-0}" = 1 ]; then
             # CONFIG_DIR normally exists already; create it only on a
             # successful lookup, and rely on the script's umask 077.
             [ -d "$CONFIG_DIR" ] || mkdir -p "$CONFIG_DIR" 2>/dev/null || :
@@ -935,7 +936,8 @@ migrate_certs() {
         d=$(mktemp -d "$CONFIG_DIR/.cert-migrate.XXXXXX") || exit 1
         migration_finish() {
             local rc=$? failed=0 tmp
-            trap - EXIT INT TERM
+            trap - EXIT
+            trap '' HUP INT TERM
             if [ "$changed" = 1 ] && [ "$complete" = 0 ]; then
                 tmp=$(mktemp "${CONFIG_FILE}.restore.XXXXXX") || failed=1
                 if [ "$failed" = 0 ]; then
@@ -960,6 +962,7 @@ migrate_certs() {
             exit "$rc"
         }
         trap migration_finish EXIT
+        trap 'exit 129' HUP
         trap 'exit 130' INT
         trap 'exit 143' TERM
         cp -p "$CONFIG_FILE" "$d/config" || exit 1
@@ -1108,7 +1111,8 @@ install_kernel() {
             local rc=$? failed=0
             # An inherited EXIT trap must never roll back another shell's transaction.
             [ "$BASHPID" = "$kernel_tx_owner" ] || return 0
-            trap - EXIT INT TERM
+            trap - EXIT
+            trap '' HUP INT TERM
             if [ "$touched" = 1 ] && [ "$done_ok" = 0 ]; then
                 stop_sing_box_if_present || failed=1
                 if [ -n "$config_backup" ] && [ -f "$config_backup" ]; then
@@ -1139,6 +1143,7 @@ install_kernel() {
             exit "$rc"
         }
         trap kernel_tx_finish EXIT
+        trap 'exit 129' HUP
         trap 'exit 130' INT
         trap 'exit 143' TERM
         service_before=$(managed_service_state onebox 2>/dev/null) || service_before=unknown
@@ -2508,7 +2513,8 @@ deploy_real_cert() {
         }
         real_finish() {
             local rc=$? failed=0 j
-            trap - EXIT INT TERM
+            trap - EXIT
+            trap '' HUP INT TERM
             if [ "$changed" = 1 ] && [ "$completed" = 0 ]; then
                 for j in "${!targets[@]}"; do real_restore_one "$j" "${targets[$j]}" || failed=1; done
                 if [ "$failed" = 0 ]; then
@@ -2528,6 +2534,7 @@ deploy_real_cert() {
             exit "$rc"
         }
         trap real_finish EXIT
+        trap 'exit 129' HUP
         trap 'exit 130' INT
         trap 'exit 143' TERM
         for i in "${!targets[@]}"; do
@@ -2605,7 +2612,8 @@ generate_self_cert() {
         }
         cert_finish() {
             local rc=$? restore_failed=0
-            trap - EXIT INT TERM
+            trap - EXIT
+            trap '' HUP INT TERM
             if [ "$changed" = 1 ] && [ "$completed" = 0 ]; then
                 cert_restore_one old.cer "$CERT_DIR/self.cer" || restore_failed=1
                 cert_restore_one old.key "$CERT_DIR/self.key" || restore_failed=1
@@ -2619,6 +2627,7 @@ generate_self_cert() {
             exit "$rc"
         }
         trap cert_finish EXIT
+        trap 'exit 129' HUP
         trap 'exit 130' INT
         trap 'exit 143' TERM
         cert_backup_one() {
@@ -2663,8 +2672,8 @@ cert_manage() {
         local cert_idx
         ask "请选择 [0-3]: " cert_idx
         case "$cert_idx" in
-            1) apply_real_cert; pause ;;
-            2) generate_self_cert; pause ;;
+            1) menu_action cert real; pause ;;
+            2) menu_action cert self; pause ;;
             3)
                 echo -e "\n------------- 域名证书 -------------"
                 if [ -s "$CERT_DIR/real.cer" ]; then
@@ -2865,7 +2874,6 @@ resolve_conn() {
     if [[ "$cert_path" == *"/real.cer" ]]; then
         if [ -z "$REAL_DOMAIN" ] && [ -s "$cert_path" ] && command -v openssl >/dev/null 2>&1; then
             REAL_DOMAIN=$(openssl x509 -in "$cert_path" -noout -subject 2>/dev/null | sed -n 's/.*CN *= *\([^,]*\).*/\1/p' | tr -d ' ')
-            [ -n "$REAL_DOMAIN" ] && save_secret "REAL_DOMAIN" "$REAL_DOMAIN"
         fi
         CONN_ADDR=$REAL_DOMAIN
         CONN_INSECURE=0
@@ -2875,7 +2883,6 @@ resolve_conn() {
         if [ -z "$CONN_SNI" ] && [ -s "$cert_path" ] &&
            certificate_common_name "$cert_path"; then
             CONN_SNI="$CERT_COMMON_NAME"
-            save_secret "SELF_DOMAIN" "$CONN_SNI" || :
         fi
         [ -n "$CONN_SNI" ] || CONN_SNI="$DEFAULT_SELF_SNI"
     fi
@@ -3128,9 +3135,9 @@ warn_port_shared() {
     return $found
 }
 
-add_config() {
+menu_add_node() {
+    local proto_idx
     while true; do
-        if [ "$NON_INTERACTIVE" = 0 ]; then
         ui_clear
         echo -e "请选择协议:\n"
         echo -e " 1) VLESS-REALITY"
@@ -3140,16 +3147,17 @@ add_config() {
         echo -e " 5) VLESS-Argo"
         echo -e " 6) Shadowsocks"
         echo -e " 0) 返回\n"
-        fi
+        ask "请选择 [0-6]: " proto_idx
+        case "$proto_idx" in
+            0) return 0 ;;
+            [1-6]) menu_action add "$proto_idx"; pause ;;
+            *) echo -e "${RED}[错误] 输入错误，请重新选择！${PLAIN}"; sleep 1 ;;
+        esac
+    done
+}
 
-        local proto_idx
-        while true; do
-            ask "请选择 [0-6]: " proto_idx
-            if [[ "$proto_idx" =~ ^[0-6]$ ]]; then break; fi
-            echo -e "${RED}[错误] 输入错误，请重新选择！${PLAIN}"
-        done
-        [ "$proto_idx" == "0" ] && return
-
+add_config() {
+        local proto_idx="${1:-$CLI_PROTOCOL_INDEX}"
         load_secrets
         local DEF_PORT
         if [ -n "${CLI_PORT:-}" ] && [ "$NON_INTERACTIVE" = 1 ]; then DEF_PORT="$CLI_PORT"
@@ -3215,12 +3223,12 @@ add_config() {
             if [ -e "/etc/init.d/cloudflared-$TAG" ] || [ -L "/etc/init.d/cloudflared-$TAG" ] ||
                [ -e "/etc/systemd/system/cloudflared-$TAG.service" ] || [ -L "/etc/systemd/system/cloudflared-$TAG.service" ]; then
                 echo '同名隧道服务已存在，请选择其他节点名称。' >&2
-                if [ "$NON_INTERACTIVE" = 1 ]; then return 1; fi; continue
+                return 1
             fi
         fi
 
         case "$proto_idx" in
-            2|3|4) if ! prompt_cert_type; then [ "$NON_INTERACTIVE" = 0 ] || return 1; continue; fi ;;
+            2|3|4) prompt_cert_type || return 1 ;;
         esac
         backup_config || return 1
         local IS_ARGO=0
@@ -3358,8 +3366,7 @@ add_config() {
                         fi
                         restore_config_and_service || return 1
                         echo '隧道创建失败，节点配置已恢复。' >&2
-                        pause
-                        if [ "$NON_INTERACTIVE" = 1 ]; then return 1; fi; continue
+                        return 1
                     fi
                 fi
                 ;;
@@ -3382,8 +3389,7 @@ add_config() {
 
         if [ "$jq_ok" -eq 0 ]; then
             restore_config_and_service || return 1
-            pause
-            if [ "$NON_INTERACTIVE" = 1 ]; then return 1; fi; continue
+            return 1
         fi
 
         if ! restart_service; then
@@ -3395,8 +3401,7 @@ add_config() {
                 }
             fi
             restore_config_and_service || return 1
-            pause
-            if [ "$NON_INTERACTIVE" = 1 ]; then return 1; fi; continue
+            return 1
         fi
 
         commit_config || return 1
@@ -3413,108 +3418,94 @@ add_config() {
         if [ "$IS_ARGO" = 1 ]; then
             printf '[提示] 连接器已连上 Cloudflare；请确认 %s 的云端映射为 http://127.0.0.1:%s。\n' "$ARGO_DOMAIN" "$PORT"
         fi
-        if [ "$NON_INTERACTIVE" = 1 ]; then return 0; fi
-        pause
-    done
+        return 0
 }
 
-modify_config() {
+menu_node_snapshot() {
+    jq -ceS --arg tag "$1" '[.inbounds[] | select(.tag == $tag)] | select(length == 1) | .[0]' "$CONFIG_FILE"
+}
+
+menu_check_node_snapshot() {
+    local node
+    if node=$(menu_node_snapshot "$1") && [ "$node" = "$2" ]; then return 0; fi
+    printf '[错误] 节点 %s 已被其他操作修改或移除，请重新选择。\n' "$1" >&2
+    return 1
+}
+
+menu_edit_node() {
+    local TAG node info TYPE IS_REALITY IS_ARGO action mod_idx
     while true; do
         ui_clear
         echo -e "选择: 更改节点\n"
-        select_inbound || return
+        require_config readonly || { pause; return 1; }
+        select_inbound || return 0
 
         while true; do
+            node=$(menu_node_snapshot "$TAG") || break
+            info=$(jq -r '[.type, (.tls.reality.enabled == true), (.transport.type == "ws")] | @tsv' <<< "$node") || break
+            IFS=$'\t' read -r TYPE IS_REALITY IS_ARGO <<< "$info"
             ui_clear
-            local TYPE
-            TYPE=$(jq -r --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .type' "$CONFIG_FILE")
-            local OLD_PORT
-            OLD_PORT=$(jq -r --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .listen_port' "$CONFIG_FILE")
-
-            if [ -z "$TYPE" ] || [ "$TYPE" == "null" ]; then
-                break
-            fi
-
             echo -e "\n当前选中: ${YELLOW}$TAG${PLAIN}"
-
-            local action=""
             if [ "$TYPE" == "vless" ]; then
-                local IS_REALITY
-                IS_REALITY=$(jq -r --arg tag "$TAG" '[.inbounds[] | select(.tag==$tag) | .tls.reality.enabled] | .[0] // false' "$CONFIG_FILE" 2>/dev/null)
-                [ "$IS_REALITY" == "true" ] && IS_REALITY=1 || IS_REALITY=0
-                local IS_ARGO
-                IS_ARGO=$(jq -r --arg tag "$TAG" '[.inbounds[] | select(.tag==$tag) | .transport.type] | .[0] // ""' "$CONFIG_FILE" 2>/dev/null)
-                [ "$IS_ARGO" == "ws" ] && IS_ARGO=1 || IS_ARGO=0
-
                 echo -e " 1) 更改 UUID"
                 echo -e " 2) 更改端口"
                 echo -e " 3) 更改节点名称"
-                [ "$IS_REALITY" -eq 1 ] && echo -e " 4) 更改伪装域名"
-                [ "$IS_ARGO" -eq 1 ] && echo -e " 4) 更改优选域名/IP"
-                echo -e " 0) 返回\n"
-
-                while true; do
-                    local mod_idx
-                    if [ "$IS_REALITY" -eq 1 ] || [ "$IS_ARGO" -eq 1 ]; then
-                        ask "请选择 [0-4]: " mod_idx
-                        case "$mod_idx" in
-                            1) action="uuid"; break ;;
-                            2) action="port"; break ;;
-                            3) action="tag"; break ;;
-                            4) [ "$IS_REALITY" -eq 1 ] && action="sni" || action="argo_ip"; break ;;
-                            0) break ;;
-                            *) echo -e "${RED}[错误] 错误!${PLAIN}" ;;
-                        esac
-                    else
-                        ask "请选择 [0-3]: " mod_idx
-                        case "$mod_idx" in
-                            1) action="uuid"; break ;;
-                            2) action="port"; break ;;
-                            3) action="tag"; break ;;
-                            0) break ;;
-                            *) echo -e "${RED}[错误] 错误!${PLAIN}" ;;
-                        esac
-                    fi
-                done
+                if [ "$IS_REALITY" = true ]; then echo -e " 4) 更改伪装域名"
+                elif [ "$IS_ARGO" = true ]; then echo -e " 4) 更改优选域名/IP"; fi
             elif [[ "$TYPE" == "hysteria2" || "$TYPE" == "anytls" || "$TYPE" == "tuic" || "$TYPE" == "shadowsocks" ]]; then
                 echo -e " 1) 更改主密钥/密码"
                 echo -e " 2) 更改端口"
                 echo -e " 3) 更改节点名称"
                 if [ "$TYPE" != "shadowsocks" ]; then echo -e " 4) 更改证书类型 (域名/自签)"; fi
-                echo -e " 0) 返回\n"
-                while true; do
-                    if [ "$TYPE" == "shadowsocks" ]; then ask "请选择 [0-3]: " mod_idx; else ask "请选择 [0-4]: " mod_idx; fi
-                    case "$mod_idx" in
-                        1) action="pass"; break ;;
-                        2) action="port"; break ;;
-                        3) action="tag"; break ;;
-                        4) if [ "$TYPE" != "shadowsocks" ]; then action="cert"; break; else echo -e "${RED}[错误] 错误!${PLAIN}"; fi ;;
-                        0) break ;;
-                        *) echo -e "${RED}[错误] 错误!${PLAIN}" ;;
-                    esac
-                done
             else
                 echo -e "${RED}[错误] 不支持修改的协议类型${PLAIN}"
                 pause
                 break
             fi
 
-            [ "$mod_idx" == "0" ] && break
+            echo -e " 0) 返回\n"
+            action=''
+            while [ -z "$action" ]; do
+                ask '请选择: ' mod_idx
+                case "$mod_idx" in
+                    1) if [ "$TYPE" = vless ]; then action=uuid; else action=pass; fi ;;
+                    2) action=port ;;
+                    3) action=tag ;;
+                    4)
+                        case "$TYPE:$IS_REALITY:$IS_ARGO" in
+                            vless:true:*) action=sni ;;
+                            vless:false:true) action=argo_ip ;;
+                            hysteria2:*|anytls:*|tuic:*) action=cert ;;
+                        esac ;;
+                    0) break ;;
+                esac
+                [ -n "$action" ] || echo -e "${RED}[错误] 输入错误，请重新选择！${PLAIN}"
+            done
+            [ -n "$action" ] || break
+            if menu_action edit "$TAG" "$node" "$action" && [ "$action" = tag ]; then
+                pause
+                break
+            fi
+            pause
+        done
+    done
+}
 
+modify_config() {
+            local TAG="$1" node="$2" action="$3" TYPE OLD_PORT
+            TYPE=$(jq -er '.type' <<< "$node") || return 1
+            OLD_PORT=$(jq -er '.listen_port' <<< "$node") || return 1
+            load_secrets || return 1
             if [ "$action" == "argo_ip" ]; then
                 local NEW_ARGO_IP argo_domain_key="ARGO_DOMAIN_${OLD_PORT}"
                 NEW_ARGO_IP=$(get_domain "请输入新的 Argo 优选域名/IP" "${!argo_domain_key}" "true") || exit 1
                 save_secret "ARGO_IP_${OLD_PORT}" "$NEW_ARGO_IP" || return 1
                 echo -e "${GREEN}[完成] 优选域名/IP 已成功更改为: $NEW_ARGO_IP${PLAIN}"
-                pause
-                continue
+                return 0
             fi
 
             if [ "$action" = cert ]; then
-                if ! prompt_cert_type; then
-                    pause
-                    continue
-                fi
+                prompt_cert_type || return 1
             fi
             backup_config || return 1
 
@@ -3538,45 +3529,45 @@ modify_config() {
 
                 if [ "$action" == "uuid" ]; then
                     if ! apply_jq_config '(.inbounds[] | select(.tag==$tag) | .users[0].uuid) = $auth' --arg tag "$TAG" --arg auth "$NEW_AUTH"; then
-                        restore_config_and_service || return 1
-                        pause
-                        continue
+                        restore_config_and_service
+                        return 1
                     fi
                 else
                     local PASS_FILTER='(.inbounds[] | select(.tag==$tag) | .users[0].password) = $auth'
                     if [ "$TYPE" == "shadowsocks" ]; then PASS_FILTER='(.inbounds[] | select(.tag==$tag) | .password) = $auth'; fi
                     if ! apply_jq_config "$PASS_FILTER" --arg tag "$TAG" --arg auth "$NEW_AUTH"; then
-                        restore_config_and_service || return 1
-                        pause
-                        continue
+                        restore_config_and_service
+                        return 1
                     fi
                 fi
 
                 if ! restart_service; then
-                    echo -e "${RED}[错误] 操作失败，已还原配置！${PLAIN}"; restore_config_and_service || return 1
+                    restore_config_and_service || return 1
+                    echo -e "${RED}[错误] 操作失败，已还原配置！${PLAIN}"
+                    return 1
                 else
                     echo -e "${GREEN}[完成] 节点秘钥已更新！${PLAIN}"; commit_config || return 1
                 fi
-                pause
 
             elif [ "$action" == "cert" ]; then
                 if [ -s "$SEL_CERT" ] && [ -s "$SEL_KEY" ]; then
                     if ! apply_jq_config '(.inbounds[] | select(.tag==$tag) | .tls.certificate_path) = $cert | (.inbounds[] | select(.tag==$tag) | .tls.key_path) = $key' \
                     --arg tag "$TAG" --arg cert "$SEL_CERT" --arg key "$SEL_KEY"; then
-                        restore_config_and_service || return 1
-                        pause
-                        continue
+                        restore_config_and_service
+                        return 1
                     fi
 
                     if ! restart_service; then
-                        echo -e "${RED}[错误] 操作失败，已还原配置！${PLAIN}"; restore_config_and_service || return 1
+                        restore_config_and_service || return 1
+                        echo -e "${RED}[错误] 操作失败，已还原配置！${PLAIN}"
+                        return 1
                     else
                         echo -e "${GREEN}[完成] 节点 $TAG 的证书已更新！${PLAIN}"; commit_config || return 1
                     fi
                 else
-                    restore_config_and_service || return 1
+                    restore_config_and_service
+                    return 1
                 fi
-                pause
 
             elif [ "$action" == "port" ]; then
                 local f_proto=""
@@ -3598,8 +3589,7 @@ modify_config() {
                     if [[ "${argo_go:-n}" != "y" && "${argo_go:-n}" != "Y" ]]; then
                         commit_config || return 1
                         echo -e "${CYAN}[信息] 已取消。${PLAIN}"
-                        pause
-                        continue
+                        return 0
                     fi
                 fi
 
@@ -3614,9 +3604,8 @@ modify_config() {
                 warn_port_shared "$NEW_PORT" "$check_proto" "$TAG"
 
                 if ! apply_jq_config '(.inbounds[] | select(.tag==$tag) | .listen_port) = $p' --arg tag "$TAG" --argjson p "$NEW_PORT"; then
-                    restore_config_and_service || return 1
-                    pause
-                    continue
+                    restore_config_and_service
+                    return 1
                 fi
 
                 load_secrets
@@ -3652,8 +3641,9 @@ modify_config() {
                     cleanup_node_secrets "$OLD_PORT" "$SEC_TYPE" "$IS_ARGO" || { restore_config_and_service || return 1; return 1; }
                 fi
                 if ! restart_service; then
-                    echo -e "${RED}[错误] 操作失败，已还原配置！${PLAIN}"
                     restore_config_and_service || return 1
+                    echo -e "${RED}[错误] 操作失败，已还原配置！${PLAIN}"
+                    return 1
                 else
                     commit_config || return 1
 
@@ -3673,7 +3663,6 @@ modify_config() {
                         echo -e "\n${YELLOW}【重要警告】: 您修改了 Argo 节点的本地端口！\n请务必前往 Cloudflare Zero Trust 后台，将对应 Tunnel 的 Public Hostname (Ingress) 映射目标同步更改为 http://127.0.0.1:${NEW_PORT}，否则节点将无法连接！${PLAIN}\n"
                     fi
                 fi
-                pause
 
             elif [ "$action" == "tag" ]; then
                 local NEW_TAG=""
@@ -3691,14 +3680,14 @@ modify_config() {
                 [ "$IS_ARGO" == "ws" ] && IS_ARGO=1 || IS_ARGO=0
 
                 if ! apply_jq_config '(.inbounds[] | select(.tag==$tag) | .tag) = $newtag' --arg tag "$TAG" --arg newtag "$NEW_TAG"; then
-                    restore_config_and_service || return 1
-                    pause
-                    continue
+                    restore_config_and_service
+                    return 1
                 fi
 
                 if ! restart_service; then
-                    echo -e "${RED}[错误] 操作失败，已还原配置！${PLAIN}"
                     restore_config_and_service || return 1
+                    echo -e "${RED}[错误] 操作失败，已还原配置！${PLAIN}"
+                    return 1
                 else
                     if [ "$IS_ARGO" -eq 1 ]; then
                         if ! rename_argo_service "$TAG" "$NEW_TAG"; then
@@ -3709,9 +3698,7 @@ modify_config() {
                     fi
                     echo -e "${GREEN}[完成] 节点名称已成功更改为: $NEW_TAG${PLAIN}"
                     commit_config || return 1
-                    TAG="$NEW_TAG"
                 fi
-                pause
 
             elif [ "$action" == "sni" ]; then
                 local NEW_SNI
@@ -3719,32 +3706,38 @@ modify_config() {
 
                 if ! apply_jq_config '(.inbounds[] | select(.tag==$tag) | .tls.server_name) = $sni | (.inbounds[] | select(.tag==$tag) | .tls.reality.handshake.server) = $sni' \
                 --arg tag "$TAG" --arg sni "$NEW_SNI"; then
-                    restore_config_and_service || return 1
-                    pause
-                    continue
+                    restore_config_and_service
+                    return 1
                 fi
 
                 if ! restart_service; then
-                    echo -e "${RED}[错误] 操作失败，已还原配置！${PLAIN}"
                     restore_config_and_service || return 1
+                    echo -e "${RED}[错误] 操作失败，已还原配置！${PLAIN}"
+                    return 1
                 else
                     echo -e "${GREEN}[完成] 伪装域名已成功更改为: $NEW_SNI${PLAIN}"
                     commit_config || return 1
                 fi
-                pause
             fi
-        done
+}
+
+menu_delete_node() {
+    local TAG node confirmed
+    while true; do
+        ui_clear
+        echo -e "选择: 删除节点\n"
+        require_config readonly || { pause; return 1; }
+        select_inbound || return 0
+        node=$(menu_node_snapshot "$TAG") || { printf '[错误] 无法确认节点 %s，请重新选择。\n' "$TAG" >&2; pause; continue; }
+        ask "确认删除节点 $TAG？(y/n) [默认: n]: " confirmed
+        case "$confirmed" in y|Y) menu_action delete "$TAG" "$node"; pause ;; esac
     done
 }
 
 del_config() {
-    while true; do
-        ui_clear
-        echo -e "选择: 删除节点\n"
-        select_inbound || return 1
-
+        local TAG="${1:-$CLI_TAG}"
         local TYPE
-        TYPE=$(jq -r --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .type' "$CONFIG_FILE")
+        TYPE=$(jq -er --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .type' "$CONFIG_FILE") || return 1
         local PORT
         PORT=$(jq -r --arg tag "$TAG" '.inbounds[] | select(.tag==$tag) | .listen_port' "$CONFIG_FILE")
         local IS_ARGO
@@ -3760,10 +3753,8 @@ del_config() {
         fi
 
         if ! apply_jq_config 'del(.inbounds[] | select(.tag == $tag))' --arg tag "$TAG"; then
-            restore_config_and_service || return 1
-            pause
-            [ "$NON_INTERACTIVE" = 0 ] || return 1
-            continue
+            restore_config_and_service
+            return 1
         fi
 
         if ! cleanup_node_secrets "$PORT" "$TYPE" "$IS_ARGO"; then
@@ -3771,11 +3762,9 @@ del_config() {
             return 1
         fi
         if ! restart_service; then
-            echo -e "${RED}[错误] 删除失败：配置还原，内核未能正常重启！${PLAIN}"
             restore_config_and_service || return 1
-            pause
-            [ "$NON_INTERACTIVE" = 0 ] || return 1
-            continue
+            echo -e "${RED}[错误] 删除失败：配置已还原，内核未能正常重启！${PLAIN}"
+            return 1
         fi
 
         if [ "$IS_ARGO" = 1 ]; then
@@ -3813,9 +3802,7 @@ del_config() {
         else
             echo -e "${GREEN}[完成] 配置 $TAG 已删除！${PLAIN}"
         fi
-        [ "$NON_INTERACTIVE" = 0 ] || return 0
-        pause
-    done
+        return 0
 }
 
 view_single_config() {
@@ -3895,29 +3882,9 @@ run_manage() {
         while true; do
             ask "请选择 [0-5]: " run_idx
             case "$run_idx" in
-                1|3)
-                   if [ "$run_idx" = 1 ] && service_is_active; then
-                       echo -e "${GREEN}[完成] 服务已运行，无需重复启动。${PLAIN}"
-                       pause; break
-                   fi
-                   local INBOUND_COUNT
-                   INBOUND_COUNT=$(jq '.inbounds | length' "$CONFIG_FILE" 2>/dev/null)
-                   if [ -z "$INBOUND_COUNT" ] || [ "$INBOUND_COUNT" -eq 0 ]; then echo -e "${RED}[错误] 未添加节点配置！${PLAIN}"; pause; break; fi
-                   if ! restart_service; then
-                       echo -e "${RED}[错误] 操作失败！内核启动失败，请检查配置。${PLAIN}"
-                   else
-                       echo -e "${GREEN}[完成] 已启动${PLAIN}"
-                   fi
-                   pause; break ;;
-                2)
-                   local stop_rc=0
-                   if [ "$SERVICE_MANAGER" == openrc ]; then rc-service onebox stop || stop_rc=$?; else systemctl stop onebox || stop_rc=$?; fi
-                   if [ "$stop_rc" = 0 ]; then
-                       echo -e "${GREEN}[完成] 已停止${PLAIN}"
-                   else
-                       printf '%s\n' '停止服务失败，请检查服务状态。' >&2
-                   fi
-                   pause; break ;;
+                1) menu_action service start; pause; break ;;
+                2) menu_action service stop; pause; break ;;
+                3) menu_action service restart; pause; break ;;
                 4) cli_doctor; pause; break ;;
                 5) CLI_LOG_SOURCE=service CLI_LINES=80 CLI_TAG="" cli_logs; pause; break ;;
                 0) return ;;
@@ -3927,74 +3894,85 @@ run_manage() {
     done
 }
 
+menu_service_control() {
+    case "$1" in
+        stop)
+            stop_sing_box_if_present || return 1
+            echo -e "${GREEN}[完成] 已停止${PLAIN}"
+            return 0 ;;
+        start)
+            if service_is_active; then
+                echo -e "${GREEN}[完成] 服务已运行，无需重复启动。${PLAIN}"
+                return 0
+            fi ;;
+        restart) ;;
+        *) return 2 ;;
+    esac
+    require_config || return 1
+    jq -e '.inbounds | length > 0' "$CONFIG_FILE" >/dev/null || {
+        echo -e "${RED}[错误] 未添加节点配置！${PLAIN}" >&2
+        return 1
+    }
+    if restart_service; then
+        echo -e "${GREEN}[完成] 已启动${PLAIN}"
+    else
+        echo -e "${RED}[错误] 内核启动失败，请检查配置。${PLAIN}" >&2
+        return 1
+    fi
+}
+
 update_manage() {
     while true; do
         ui_clear
-        echo -e "${CYAN}[信息] 正在检查更新，请稍候...${PLAIN}"
-        local CUR_VER="未安装"
-        if kernel_ok; then
-            local extracted_ver
-            extracted_ver=$( ( /usr/local/lib/onebox/sing-box version ) 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
-            [ -n "$extracted_ver" ] && CUR_VER="$extracted_ver"
-        fi
-        local NEW_VER
-        NEW_VER=$(get_latest_version)
-        local SB_UPDATE_TEXT="更新 sing-box 内核"
-        if kernel_ok && [ -n "$NEW_VER" ]; then
-            if [ "$CUR_VER" != "$NEW_VER" ]; then SB_UPDATE_TEXT="更新 sing-box 内核 ${GREEN}[发现新版: v${NEW_VER}]${PLAIN}"
-            else SB_UPDATE_TEXT="更新 sing-box 内核 ${YELLOW}[已是最新: v${CUR_VER}]${PLAIN}"
-            fi
-        fi
-
-        ui_clear
         echo -e "选择: 更新\n"
-        echo -e " 1) ${SB_UPDATE_TEXT}"
+        echo -e " 1) 更新 sing-box 内核"
         echo -e " 2) 更新脚本"
         echo -e " 3) 强制覆盖重装内核"
         echo -e " 0) 返回\n"
         local up_idx
-        while true; do
-            ask "请选择 [0-3]: " up_idx
-            case "$up_idx" in
-                1)
-                    if [ -z "$NEW_VER" ]; then echo -e "${RED}[错误] 获取最新版本失败！API 受限或网络超时。${PLAIN}"; pause; break; fi
-                    if kernel_ok && [ "$CUR_VER" == "$NEW_VER" ]; then echo -e "\n${GREEN}当前已是最新，无需更新！${PLAIN}"; pause; break; fi
-
-                    echo -e "\n${YELLOW}即将更新内核至 v${NEW_VER}...${PLAIN}"
-                    install_kernel "$NEW_VER" restart
-                    pause; break ;;
-                2)
-                    echo -e "\n${CYAN}正在拉取最新脚本代码...${PLAIN}"
-                    if fetch_script; then
-                        echo -e "${GREEN}[完成] 脚本代码更新成功！请重新运行 onebox 命令。${PLAIN}"
-                        exit 0
-                    else
-                        echo -e "${RED}[错误] 下载脚本失败或内容校验不通过！更新中止。${PLAIN}"
-                        pause; break
-                    fi
-                    ;;
-                3)
-                    if [ -z "$NEW_VER" ]; then
-                        ask "获取最新版本失败，请手动输入要安装的版本号 (如 1.10.1): " NEW_VER
-                        [ -z "$NEW_VER" ] && { echo -e "${RED}[错误] 未输入版本号，已取消。${PLAIN}"; pause; break; }
-                    fi
-                    if ! [[ "$NEW_VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-                        echo -e "${RED}[错误] 版本号格式错误(应为 x.y.z)，已取消。${PLAIN}"
-                        pause; break
-                    fi
-                    echo -e "\n${YELLOW}将强制覆盖安装 v${NEW_VER}（无论当前版本是否相同）。${PLAIN}"
-                    ask "确认继续？(y/n) [默认: y]: " fc
-                    if [[ "${fc:-y}" == "y" || "${fc:-y}" == "Y" ]]; then
-                        install_kernel "$NEW_VER" restart
-                    else
-                        echo -e "${YELLOW}[提示] 已取消。${PLAIN}"
-                    fi
-                    pause; break ;;
-                0) return ;;
-                *) echo -e "${RED}[错误] 输入错误!${PLAIN}" ;;
-            esac
-        done
+        ask "请选择 [0-3]: " up_idx
+        case "$up_idx" in
+            1) menu_action update-kernel latest; pause ;;
+            2) if menu_action update-script; then exit 0; fi; pause ;;
+            3) menu_action update-kernel force; pause ;;
+            0) return ;;
+            *) echo -e "${RED}[错误] 输入错误!${PLAIN}"; sleep 1 ;;
+        esac
     done
+}
+
+menu_update_kernel() {
+    local mode="$1" current version confirmation
+    if [ -f "$CONFIG_FILE" ]; then require_config readonly || return 1; fi
+    ensure_deps jq curl wget tar gzip sha256sum ss || return 1
+    echo -e "${CYAN}[信息] 正在检查更新，请稍候...${PLAIN}"
+    version=$(get_latest_version)
+    if [ "$mode" = force ]; then
+        if [ -z "$version" ]; then
+            ask '获取最新版本失败，请手动输入要安装的版本号 (如 1.10.1): ' version
+            [ -n "$version" ] || { printf '[提示] 未输入版本号，已取消。\n'; return 0; }
+        fi
+    elif [ -z "$version" ]; then
+        printf '[错误] 获取最新版本失败，请检查网络后重试。\n' >&2
+        return 1
+    fi
+    [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]] || {
+        printf '[错误] 版本号格式错误，已取消。\n' >&2
+        return 1
+    }
+    if [ "$mode" = force ]; then
+        printf '将强制覆盖安装 v%s。\n' "$version"
+        ask '确认继续？(y/n) [默认: y]: ' confirmation
+        case "${confirmation:-y}" in y|Y) ;; *) printf '[提示] 已取消。\n'; return 0 ;; esac
+    else
+        current=$(kns_current_kernel_version) || current=''
+        if [ "$current" = "$version" ]; then
+            printf '[完成] 当前内核已是最新版本 v%s。\n' "$version"
+            return 0
+        fi
+        printf '即将更新内核至 v%s。\n' "$version"
+    fi
+    install_kernel "$version" restart
 }
 
 BBR_STATE_DIR="/var/lib/onebox/bbr"
@@ -4113,48 +4091,41 @@ enable_bbr() {
     cc=$(sysctl -n net.ipv4.tcp_congestion_control) || return 1
     qdisc=$(sysctl -n net.core.default_qdisc) || return 1
     printf '[信息] 当前算法：%s；默认队列：%s。\n' "$cc" "$qdisc"
-    bbr_check_conflicts || { pause; return 1; }
+    bbr_check_conflicts || return 1
     if [ -e "$BBR_STATE_DIR" ] || [ -L "$BBR_STATE_DIR" ]; then
         if ! bbr_state_valid || [ -L "$BBR_SYSCTL_FILE" ]; then
             printf '[提示] BBR+FQ 恢复记录无效，请先检查；未覆盖。\n'
-            pause
             return 1
         fi
         if [ -e "$BBR_SYSCTL_FILE" ] &&
            ! cmp -s "$BBR_STATE_DIR/managed.conf" "$BBR_SYSCTL_FILE"; then
             printf '[提示] BBR+FQ 配置已被外部修改，请先检查；未覆盖。\n'
-            pause
             return 1
         fi
         if [ ! -e "$BBR_SYSCTL_FILE" ]; then
             local rebuild
             ask "BBR+FQ 配置缺失，是否按有效记录重建？[y/N]: " rebuild
-            case "$rebuild" in y|Y) ;; *) pause; return 0 ;; esac
+            case "$rebuild" in y|Y) ;; *) return 0 ;; esac
             if ! (set -C; cat "$BBR_STATE_DIR/managed.conf" > "$BBR_SYSCTL_FILE") || ! chmod 644 "$BBR_SYSCTL_FILE"; then
                 printf '[错误] 无法重建 BBR+FQ 持久化配置。\n' >&2
-                pause
                 return 1
             fi
         fi
         if [ "$cc" = bbr ] && [ "$qdisc" = fq ]; then
             printf '[完成] BBR+FQ 已生效，本脚本的持久化配置存在。\n'
-            pause
             return 0
         fi
         if run_step "重新应用 BBR+FQ" sysctl -p "$BBR_SYSCTL_FILE" &&
            [ "$(sysctl -n net.ipv4.tcp_congestion_control)" = bbr ] &&
            [ "$(sysctl -n net.core.default_qdisc)" = fq ]; then
             printf '[完成] BBR+FQ 已重新应用，原始备份保持不变。\n'
-            pause
             return 0
         fi
         printf '[错误] BBR+FQ 未完全生效，配置及恢复记录已保留。\n' >&2
-        pause
         return 1
     fi
     if [ -e "$BBR_SYSCTL_FILE" ] || [ -L "$BBR_SYSCTL_FILE" ]; then
         printf '[提示] 存在非本脚本登记的 BBR 配置，未覆盖。\n'
-        pause
         return 1
     fi
     [[ "$cc" =~ ^[a-zA-Z0-9_-]+$ && "$qdisc" =~ ^[a-zA-Z0-9_-]+$ ]] || return 1
@@ -4185,16 +4156,15 @@ enable_bbr() {
         else
             printf '[错误] 开启或恢复失败，保留记录：%s\n' "$BBR_STATE_DIR" >&2
         fi
-        pause
         return 1
     fi
-    pause
 }
 
 config_outbound() {
     local out_idx=""
     while true; do
         ui_clear
+        require_config readonly || { pause; return 1; }
         local current_strategy
         current_strategy=$(jq -r '.outbounds[] | select(.tag=="direct") | ((if (.domain_resolver | type) == "object" then .domain_resolver.strategy else null end) // .domain_strategy // "auto")' "$CONFIG_FILE" 2>/dev/null)
         echo -e "选择: 配置出站 IPv4/IPv6 策略"
@@ -4205,11 +4175,6 @@ config_outbound() {
         echo -e " 0) 返回\n"
         ask "请选择 [0-3]: " out_idx
 
-        local USE_NEW_FORMAT=0
-        if ! kernel_ok || sb_ge_112; then
-            USE_NEW_FORMAT=1
-        fi
-
         local strategy=""
         case "$out_idx" in
             1) strategy="ipv4_only" ;;
@@ -4219,31 +4184,8 @@ config_outbound() {
             *) echo -e "${RED}[错误] 输入错误!${PLAIN}"; sleep 1; continue ;;
         esac
 
-        local jq_success=0
-        backup_config || return 1
-        if [ "$strategy" == "auto" ]; then
-            apply_jq_config '(.outbounds[] | select(.tag=="direct")) |= del(.domain_strategy, .domain_resolver)' && jq_success=1
-        elif [ "$USE_NEW_FORMAT" -eq 1 ]; then
-            apply_jq_config "
-              $JQ_DNS_LOCAL |
-              (.outbounds[] | select(.tag==\"direct\")) |= (del(.domain_strategy) | .domain_resolver = {\"server\": \"dns-local\", \"strategy\": \$s})
-            " --arg s "$strategy" && jq_success=1
-        else
-            apply_jq_config '(.outbounds[] | select(.tag=="direct")).domain_strategy = $s' --arg s "$strategy" && jq_success=1
-        fi
-
-        if [ "$jq_success" -eq 0 ]; then
-            restore_config_and_service || return 1
-            pause
-            continue
-        fi
-
-        if ! restart_service; then
-            echo -e "${RED}[错误] 操作失败(校验报错)，配置已还原！${PLAIN}"
-            restore_config_and_service || return 1
-        else
+        if menu_action outbound "$strategy"; then
             echo -e "${GREEN}[完成] 出站策略已更新！${PLAIN}"
-            commit_config || return 1
         fi
         pause
     done
@@ -4259,7 +4201,7 @@ other_manage() {
         echo -e " 0) 返回\n"
         ask "请选择 [0-2]: " om_idx
         case "$om_idx" in
-            1) enable_bbr ;;
+            1) menu_action bbr; pause ;;
             2) config_outbound ;;
             0) return ;;
             *) echo -e "${RED}[错误] 输入错误!${PLAIN}"; sleep 1 ;;
@@ -4480,11 +4422,15 @@ cleanup_acme_cron() {
     update_acme_cron remove
 }
 
-uninstall_all() {
+confirm_uninstall() {
     local un
     ask "确认卸载脚本、sing-box和所有节点配置吗？(y/n): " un
     [[ "$un" == "y" || "$un" == "Y" ]] || return 2
-    if [[ "$un" == "y" || "$un" == "Y" ]]; then
+}
+
+uninstall_all() {
+        [ "${1:-}" = confirmed ] || confirm_uninstall || return $?
+        ensure_deps jq sha256sum || return 1
         load_secrets || return 1
         local svc
         local -a services=(onebox) registered=()
@@ -4538,15 +4484,13 @@ uninstall_all() {
         rm -rf /usr/local/lib/onebox /usr/local/bin/onebox /etc/onebox /var/log/onebox || return 1
         if [ ! -d "$BBR_STATE_DIR" ]; then rm -rf /var/lib/onebox || return 1
         else printf '[提示] 按要求保留 BBR 及其恢复记录：%s\n' "$BBR_STATE_DIR"; fi
-        rm -f /run/lock/onebox.lock || return 1
+        # Keep the lock inode shared by concurrent callers through uninstall.
 
         echo -e "${GREEN}[完成] 已卸载 sing-box、管理脚本和节点配置。${PLAIN}"
-    fi
 }
 
 menu() {
-    local choice=""
-    ensure_deps jq || return 1
+    local choice="" un_rc
 
     while true; do
         ui_clear
@@ -4562,7 +4506,7 @@ menu() {
 
         echo -e "------------- onebox 管理脚本 -------------"
         printf '%s\n' '仅供学习与技术研究，请遵守适用法律法规，在获得授权的环境中使用。'
-        printf '系统: Linux %s | 包管理: %s | 服务管理: %s\n' "$ARCH" "$PACKAGE_MANAGER" "$SERVICE_MANAGER"
+        printf 'OneBox %s | Linux %s | 包管理: %s | 服务管理: %s\n' "$ONEBOX_SCRIPT_VERSION" "$ARCH" "$PACKAGE_MANAGER" "$SERVICE_MANAGER"
         echo -e "sing-box ${VER_SHOW}: ${ST_COLOR}${SB_STATUS}${PLAIN}\n"
         echo -e " 1) 添加节点"
         echo -e " 2) 更改节点"
@@ -4577,28 +4521,26 @@ menu() {
         ask "请选择 [0-9]: " choice
 
         case "$choice" in
-            1) init_base && add_config ;;
-            2) require_config && modify_config ;;
-            3) require_config && del_config ;;
+            1) menu_add_node ;;
+            2) menu_edit_node ;;
+            3) menu_delete_node ;;
             4) view_config ;;
-            5) mkdir -p "$CONFIG_DIR" "$CERT_DIR" && chmod 700 "$CONFIG_DIR" "$CERT_DIR" && cert_manage ;;
+            5) cert_manage ;;
             6) run_manage ;;
-            7) init_base && update_manage ;;
-            8) require_config && other_manage ;;
+            7) update_manage ;;
+            8) other_manage ;;
             9)
-                if uninstall_all; then exit 0
-                else
-                    local un_rc=$?
-                    [ "$un_rc" -eq 2 ] || exit "$un_rc"
-                fi
-                ;;
+                confirm_uninstall || continue
+                un_rc=0
+                menu_action uninstall || un_rc=$?
+                case "$un_rc" in
+                    0) exit 0 ;;
+                    75) pause ;;
+                    *) exit "$un_rc" ;;
+                esac ;;
             0) exit 0 ;;
             *) echo "  [提示] 选项无效，请重新输入。"; sleep 1 ;;
         esac
-        if [ "${CONFIG_TX_BLOCKED:-0}" = 1 ]; then
-            echo '存在未完成恢复的事务，退出管理面板；请保留备份并人工检查。' >&2
-            exit 1
-        fi
     done
 }
 
@@ -5127,7 +5069,8 @@ cli_help() {
 onebox 仅供学习与技术研究，请遵守适用法律法规，在获得授权的环境中使用。
 用法: sh install.sh <命令> [选项]  或  onebox <命令> [选项]
 直接运行 install.sh 默认无交互安装 VLESS + Reality，端口 443。
-安装后的 onebox 不带参数进入菜单；onebox -n 使用上述默认安装。
+安装后的 onebox 不带参数进入菜单；菜单浏览不占用操作锁。
+onebox -n 使用上述默认安装。
 显式使用 menu 进入交互菜单；指定其他命令即为无交互模式。
 命令:
   install          安装到 /usr/local/bin/onebox（可指定 --version）
@@ -5348,7 +5291,7 @@ cli_outbound() {
     backup_config || return 1
     if [ "$CLI_STRATEGY" = auto ]; then
         apply_jq_config '(.outbounds[] | select(.tag=="direct")) |= del(.domain_strategy, .domain_resolver)' || return 1
-    elif sb_ge_112; then
+    elif sb_ge_112 || { [ "$NON_INTERACTIVE" = 0 ] && ! kernel_ok; }; then
         apply_jq_config "$JQ_DNS_LOCAL | (.outbounds[] | select(.tag==\"direct\")) |= (del(.domain_strategy) | .domain_resolver = {\"server\": \"dns-local\", \"strategy\": \$s})" --arg s "$CLI_STRATEGY" || return 1
     else
         apply_jq_config '(.outbounds[] | select(.tag=="direct")).domain_strategy = $s' --arg s "$CLI_STRATEGY" || return 1
@@ -6484,15 +6427,141 @@ kns_main() {
     kns_dispatch
 }
 
+prepare_operation_lock() {
+    if ! command -v flock >/dev/null 2>&1; then
+        onebox_require_pid_headroom 8 'flock 依赖安装' || return 1
+    fi
+    ensure_deps flock || return 1
+    if ! flock --help 2>&1 | grep -q -- '--close'; then
+        onebox_require_pid_headroom 8 'flock 依赖更新' || return 1
+        if [ "$PACKAGE_MANAGER" = apk ]; then install_packages flock || return 1
+        else install_packages util-linux || return 1; fi
+        hash -r
+    fi
+    mkdir -p /run/lock
+}
+
+MENU_ACTION_SUPERVISOR_PID=""
+MENU_ACTION_PENDING_SIGNAL=""
+
+menu_action_forward_signal() {
+    local signal="$1" status=1
+    case "$signal" in HUP) status=129 ;; INT) status=130 ;; TERM) status=143 ;; esac
+    if [[ ! "${MENU_ACTION_SUPERVISOR_PID:-}" =~ ^[0-9]+$ ]]; then
+        MENU_ACTION_PENDING_SIGNAL="$signal"
+        return 0
+    fi
+    trap '' HUP INT TERM
+    kill -s "$signal" "$MENU_ACTION_SUPERVISOR_PID" 2>/dev/null || :
+    wait "$MENU_ACTION_SUPERVISOR_PID" 2>/dev/null || :
+    exit "$status"
+}
+
+menu_action_supervisor_signal() {
+    local signal="$1" status=1
+    case "$signal" in HUP) status=129 ;; INT) status=130 ;; TERM) status=143 ;; esac
+    trap '' HUP INT TERM
+    if [[ "${MENU_ACTION_WORKER_PID:-}" =~ ^[0-9]+$ ]]; then
+        kill -s "$signal" "$MENU_ACTION_WORKER_PID" 2>/dev/null || :
+        wait "$MENU_ACTION_WORKER_PID" 2>/dev/null || :
+    fi
+    exit "$status"
+}
+
+menu_action() {
+    local rc=0
+    onebox_require_pid_headroom 8 "OneBox 菜单操作 $1" || return 1
+    prepare_operation_lock || return 1
+    # A supervisor owns the lock while the interactive worker rolls back.
+    # The parent can forward signals even if the worker is waiting for input.
+    MENU_ACTION_SUPERVISOR_PID=""
+    MENU_ACTION_PENDING_SIGNAL=""
+    trap 'menu_action_forward_signal HUP' HUP
+    trap 'menu_action_forward_signal INT' INT
+    trap 'menu_action_forward_signal TERM' TERM
+    (
+        trap 'menu_action_supervisor_signal HUP' HUP
+        trap 'menu_action_supervisor_signal INT' INT
+        trap 'menu_action_supervisor_signal TERM' TERM
+        flock -n -E 75 9 || exit "$?"
+        (
+            ONEBOX_LOCKED=1
+            SB_OWNED_TEMP_FILES=() SB_OWNED_TEMP_DIRS=()
+            trap menu_action_cleanup EXIT
+            trap 'exit 129' HUP
+            trap 'exit 130' INT
+            trap 'exit 143' TERM
+            menu_action_dispatch "$@"
+        ) </dev/tty 9>&- &
+        MENU_ACTION_WORKER_PID=$!
+        wait "$MENU_ACTION_WORKER_PID"
+    ) 9>> /run/lock/onebox.lock &
+    MENU_ACTION_SUPERVISOR_PID=$!
+    if [ -n "$MENU_ACTION_PENDING_SIGNAL" ]; then
+        menu_action_forward_signal "$MENU_ACTION_PENDING_SIGNAL"
+    fi
+    wait "$MENU_ACTION_SUPERVISOR_PID" || rc=$?
+    MENU_ACTION_SUPERVISOR_PID=""
+    trap 'exit 129' HUP
+    trap cleanup_on_interrupt INT
+    trap 'exit 143' TERM
+    case "$rc" in
+        75) printf '[提示] 另一个 OneBox 操作正在运行，请稍后重试。\n' >&2 ;;
+        "$MENU_RECOVERY_FAILED")
+            printf '[错误] 配置事务未能恢复，退出管理面板。请保留备份并人工检查。\n' >&2
+            exit 1 ;;
+        129|130|143) exit "$rc" ;;
+    esac
+    return "$rc"
+}
+
+menu_action_cleanup() {
+    local rc=$?
+    trap '' HUP INT TERM
+    cleanup_on_exit
+    if [ "${CONFIG_TX_BLOCKED:-0}" = 1 ] || [ -n "${CONFIG_TX_DIR:-}" ]; then
+        exit "$MENU_RECOVERY_FAILED"
+    fi
+    exit "$rc"
+}
+
+menu_action_dispatch() {
+    case "$1" in
+        add)
+            if [ "$2" = 5 ] && [ -z "$CF_ARCH" ]; then echo '[错误] 此架构暂不支持 cloudflared。' >&2; return 3; fi
+            init_base || return 1
+            if [ ! -x /usr/local/bin/onebox ]; then
+                prepare_script_path "${BASH_SOURCE[0]}" && fetch_script "$ONEBOX_SELF" || return 1
+            fi
+            add_config "$2" ;;
+        edit) require_config && menu_check_node_snapshot "$2" "$3" && modify_config "$2" "$3" "$4" ;;
+        delete) require_config && menu_check_node_snapshot "$2" "$3" && del_config "$2" ;;
+        cert)
+            mkdir -p "$CONFIG_DIR" "$CERT_DIR" && chmod 700 "$CONFIG_DIR" "$CERT_DIR" || return 1
+            if [ "$2" = self ]; then generate_self_cert; else apply_real_cert; fi ;;
+        service) menu_service_control "$2" ;;
+        update-kernel) menu_update_kernel "$2" ;;
+        update-script)
+            printf '[信息] 正在下载最新管理脚本…\n'
+            if fetch_script; then
+                printf '[完成] 管理脚本已更新，请重新运行 onebox。\n'
+            else
+                printf '[错误] 下载或校验管理脚本失败。\n' >&2
+                return 1
+            fi ;;
+        bbr) ensure_deps sysctl modprobe && enable_bbr ;;
+        outbound)
+            CLI_STRATEGY="$2"
+            require_config && cli_outbound ;;
+        uninstall) uninstall_all confirmed ;;
+        *) return 2 ;;
+    esac
+}
+
 cli_dispatch() {
     local version tag ip tags rc=0
     case "$CLI_COMMAND" in
-        menu)
-            if [ "$ONEBOX_SELF" != /usr/local/bin/onebox ]; then
-                ensure_deps jq || return 1
-                fetch_script "$ONEBOX_SELF" || return 1
-            fi
-            menu ;;
+        menu) menu ;;
         install)
             printf '%s\n' '免责声明：仅供学习与技术研究，请遵守适用法律法规，在获得授权的环境中使用；使用风险由使用者承担。'
             init_base || return 1
@@ -6507,7 +6576,7 @@ cli_dispatch() {
         status) cli_status ;;
         doctor) cli_doctor ;;
         logs) cli_logs ;;
-        uninstall) ensure_deps jq sha256sum || return 1; uninstall_all ;;
+        uninstall) uninstall_all ;;
         update-script) fetch_script && printf '[完成] 管理脚本已更新。\n' ;;
         bbr) ensure_deps sysctl modprobe || return 1; enable_bbr ;;
         cert)
@@ -6574,20 +6643,15 @@ main() {
     trap cleanup_on_exit EXIT
     trap cleanup_on_interrupt INT
     trap 'exit 143' TERM
+    if [ "$CLI_COMMAND" = menu ]; then
+        trap 'exit 129' HUP
+        cli_dispatch
+        return $?
+    fi
     prepare_script_path "${BASH_SOURCE[0]}" || return 1
     # util-linux flock closes its lock fd before exec so daemons cannot inherit it.
     if [ "${ONEBOX_LOCKED:-0}" != 1 ]; then
-        if ! command -v flock >/dev/null 2>&1; then
-            onebox_require_pid_headroom 8 'flock 依赖安装' || return 1
-        fi
-        ensure_deps flock || return 1
-        if ! flock --help 2>&1 | grep -q -- '--close'; then
-            onebox_require_pid_headroom 8 'flock 依赖更新' || return 1
-            if [ "$PACKAGE_MANAGER" = apk ]; then install_packages flock || return 1
-            else install_packages util-linux || return 1; fi
-            hash -r
-        fi
-        mkdir -p /run/lock || return 1
+        prepare_operation_lock || return 1
         env ONEBOX_LOCKED=1 flock -n -E 75 -o /run/lock/onebox.lock bash "$ONEBOX_SELF" "$@"
         local rc=$?
         [ "$rc" != 75 ] || printf '[错误] 另一个 onebox 操作正在运行。\n' >&2

@@ -57,7 +57,7 @@ wget -qO- "https://raw.githubusercontent.com/liuarui/onebox/main/install.sh" | s
 curl -fsSL "https://raw.githubusercontent.com/liuarui/onebox/main/install.sh" | sh -s -- menu
 ```
 
-管道启动时，脚本会先通过同一个下载器获取一份可重启的临时副本，再自动安装缺失的 Bash；进入交互菜单时会从终端读取输入。执行安装操作时，其他缺失依赖也会自动安装。安装完成后直接执行 `onebox` 可再次打开管理菜单；无交互卸载使用 `onebox uninstall --yes`。
+管道启动时，脚本会获取一份可执行的临时副本，再自动安装缺失的 Bash；交互菜单从终端读取输入。选择添加节点时才初始化程序和配置，并安装缺失的依赖和 `onebox` 管理命令。安装完成后直接执行 `onebox` 可再次打开菜单；无交互卸载使用 `onebox uninstall --yes`。
 
 远程命令开始前必须已有能通过 HTTPS 证书校验访问 GitHub Raw 的 `wget` 或 `curl`；脚本尚未下载时无法替自己安装下载器。进入脚本后，缺少 Bash 和其他依赖会自动安装。
 
@@ -353,9 +353,17 @@ onebox --help
 
 `doctor` 汇总程序是否可运行、配置 JSON、主服务和登记隧道的状态，以及配置中引用的 onebox 证书有效期；7 天内到期会提醒。发现异常或缺少检查工具时返回 `1`，不会联网修复或安装依赖。内核完整配置校验仍使用 `onebox check`。`status` 会区分 `not-installed`、`inactive`/`stopped`、`failed`、`active` 等状态。
 
-菜单打开时不联网检查新版本；安装或更新内核时才查询版本。“查看节点”子菜单直接打开，不会先安装依赖。生成需要公网 IP 的链接时，会显示查询提示并限制单次请求时间；查询失败仍可查看节点参数，也可执行 `onebox links --address 你的公网IP`。Argo 和使用真实证书域名的节点无需查询公网 IP。
+从 `v1.0.11` 起，打开和浏览菜单无需操作锁，也不会安装依赖或检查更新。查看节点、证书状态、体检和日志在其他任务运行时仍可打开。修改节点、证书、服务或更新程序时才与 KNS 和 ACME 续期共用锁；遇到占用会提示稍后重试。开始修改后，请完成该操作或按 `Ctrl+C` 退出当前终端里的操作。
+
+生成需要公网 IP 的链接时，会显示查询提示并限制单次请求时间；查询失败仍可查看节点参数，也可执行 `onebox links --address 你的公网IP`。Argo 和使用真实证书域名的节点无需查询公网 IP。
 
 `logs` 默认查看 systemd journal，`--lines` 范围为 `1–1000`。OpenRC 当前未配置服务运行日志落盘，查看运行日志会提示并返回 `3`；两种服务管理器都可用 `--source install` 查看最近安装步骤日志。成功步骤的日志会删除；安装进行时可能显示当前步骤，安装结束后保留的是失败步骤。日志可能包含网络地址等信息，分享前请检查内容。
+
+### 旧版菜单提示「另一个 onebox 操作正在运行」
+
+先执行 `onebox status` 查看服务状态。系统有 `lslocks` 时，可用 `lslocks -o PID,COMMAND,PATH | grep -F /run/lock/onebox.lock` 找到持锁进程，再用 `ps` 确认它在做什么。若确认是空闲的旧菜单，在原终端按 `0` 退出；若正在执行 KNS 任务、证书续期或其他写入操作，等它结束。锁文件存在是正常的，不要删除它。
+
+锁释放后执行 `onebox update-script && onebox`。这只更新管理脚本并打开菜单，不会重建节点或重启 sing-box。
 
 <a id="uninstall"></a>
 ## 🧹 卸载与清理

@@ -2,6 +2,12 @@
 
 本文件记录 OneBox 的正式版本变更。
 
+## [1.0.11] - 2026-11-20
+
+- Open the interactive menu without taking the operation lock, so an idle menu cannot block KNS or ACME renewal.
+- Lock each selected mutation until it completes or its configuration transaction rolls back. Report contention in the menu and leave inspection available.
+- Recheck the selected node under the lock before editing or deleting it. Preserve the shared lock file during uninstall.
+
 ## [1.0.10] - 2026-11-18
 
 - Replace the Microsoft `bing.com` default for self-signed TLS certificates with `www.python.org`, a non-Microsoft open-source endpoint that supports TLS 1.3, HTTP/2, and QUIC.
